@@ -199,7 +199,7 @@ The TRACE spec assigns `trust_tier` from the producer key class and collection p
 | Record assembly | Build the `AUTHORIZATION_DECISION` envelope from existing authorize inputs + decision result + token-validation results. | Off hot path |
 | Canonicalize + sign | RFC 8785 JCS + Ed25519 signature over the assertion. | Off hot path |
 | Transport | Reuse the existing Lock audit transport (SSA→DCR, buffered channel, retry), but with the TRACE ingestion scope `trace.write` (not `log.write`); POST TRACE records to the **bulk endpoint** `/api/v1/audit/trace/bulk` (buffered, periodic, per-record results, retry with backoff). | Off hot path |
-| Correlation propagation | Read `trace_execution_id` / `operation_ids` / session fields from context, token claims, or OTel baggage; never fabricate. | Read at call |
+| Correlation propagation | Read `trace_execution_id` / `operation_ids` / session fields as the **normalized values supplied through the authorization API** (the host/sidecar/PEP translates the underlying carrier — header, token claim, or OTel baggage — see Correlation); Cedarling never parses carriers itself and never fabricates. | Read at call |
 
 Cedar evaluation, the `AuthorizeResult` contract, and the decision returned to the caller are unchanged.
 
@@ -210,7 +210,7 @@ Following the existing `CEDARLING_*` naming (`cedarling-properties.md`), TRACE e
 | Property | Meaning | Default |
 |---|---|---|
 | `CEDARLING_TRACE` | `enabled` / `disabled` — master switch for TRACE `AUTHORIZATION_DECISION` emission. | `disabled` |
-| `CEDARLING_TRACE_PRODUCER_ID` | The `producer` / `producer_id` string for this fleet+version. | derived from app name + version |
+| `CEDARLING_TRACE_PRODUCER_ID` | The stable logical `producer` / `producer_id` for the fleet — **not** `name/semver`; software version travels as separate signed metadata, never folded in (see Signature, §7.1). | derived from app name |
 | `CEDARLING_TRACE_SIGNING_KEY` | Reference to the Ed25519 producer signing key (path or key store handle; never the raw key inline in logs). | — |
 | `CEDARLING_TRACE_CHAIN_GENESIS` | `pre_registered` / `first_observed` — whether the instance's chain genesis is pre-registered with Lock. | `first_observed` |
 | `CEDARLING_TRACE_INCLUDE_CLAIMS` | Whether `token_claims[].claims` carries raw claims or `claims_hash` only. | `hash_only` |
@@ -225,8 +225,8 @@ TRACE transport reuses the Lock integration machinery (`CEDARLING_LOCK_*`): the 
 The TRACE spec is explicitly incremental, and so is Cedarling's adoption of it.
 
 1. **Phase 0 — today.** Cedarling emits operational `Decision` logs to Lock `/audit`. No TRACE records, no signing, no chain. Fully functional; simply not TRACE evidence.
-2. **Phase 1 — signed, sequenced decisions.** Add the producer key, chain state, record assembly, JCS canonicalization, and signing. Emit `AUTHORIZATION_DECISION` records with `first_observed` genesis over the existing audit channel. This alone gives attributable, tamper-evident, sequenced decision evidence.
-3. **Phase 2 — full token and policy context.** Populate `validation_at_decision` (with `revocation_freshness`) and `token_claims[]` from Cedarling's own JWT-validation results, and compute `bundle_hash`. This makes the decision's token/policy basis part of the signed body.
+2. **Phase 1 — signed, sequenced decisions.** Add the producer key, chain state, record assembly, JCS canonicalization, and signing, and compute `bundle_hash` for the complete `trace.policy` block the MVP requires. Emit `AUTHORIZATION_DECISION` records with `first_observed` genesis over the existing audit channel. This alone gives attributable, tamper-evident, sequenced decision evidence.
+3. **Phase 2 — full token context.** Populate `validation_at_decision` (with `revocation_freshness`) and `token_claims[]` from Cedarling's own JWT-validation results. This makes the decision's token basis part of the signed body. (`bundle_hash` and the rest of `trace.policy` are already present from Phase 1.)
 4. **Phase 3 — high assurance.** Pre-register chain genesis (`history_complete`-capable lineage), enable operation-binding digests so decisions can be provably paired with downstream enforcement-point `CAPABILITY_INVOKED` records, and integrate with lineage checkpoints for collusion-resistant assurance.
 
 Each phase is additive over the same signed-record foundation and none requires changing the Cedar evaluation core — matching the TRACE design's own "begin with signed ingestion, add higher-assurance capabilities through profiles" philosophy.
