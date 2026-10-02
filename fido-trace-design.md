@@ -39,7 +39,7 @@ The FIDO Server's existing per-event metrics entry and a TRACE `FIDO_CEREMONY` r
 | **Authenticator detail** | `deviceInfo`, authenticator type. | `authenticator_attachment` (`platform`/`cross-platform`), `credential_id_hash` (a hash, since raw credential IDs may be sensitive). |
 | **Immutability** | Rows are swept after `fido2MetricsRetentionDays` (default 90). | The signed `assertion` is byte-immutable; Lock never rewrites it, and retention is governed by the TRACE store's checkpoint-bounded pruning, not a metrics sweep. |
 | **Event kind** | Implicit in `metricType`. | Explicit `trace.event_kind: "FIDO_CEREMONY"` acting as the schema discriminator. |
-| **Not-applicable fields** | N/A. | `decisions[]`/`invocations[]` and `trace.policy` MUST NOT be populated — a ceremony authorizes no capability and evaluates no policy; and no `capability_id` is ever producer-signed (it is Lock-derived). |
+| **Not-applicable fields** | N/A. | No `decision`/`decisions[]` or `invocation`/`invocations[]`, and no `trace.policy`, MUST be populated — a ceremony authorizes no capability and evaluates no policy; and no `capability_id` is ever producer-signed (it is Lock-derived). |
 
 Two FIDO-specific subtleties matter for TRACE fidelity, both drawn from `passkey-telemetry.md`:
 
@@ -112,7 +112,7 @@ The TRACE `history_complete: true` claim requires a `pre_registered_genesis` (or
 - **`ceremony_outcome`** — `SUCCESS` / `FAILURE` / `ABANDONED`, mapped directly from the ceremony's terminal state (the same `jansStatus` / metric status the server already assigns: `authenticated`→`SUCCESS`, `failed`→`FAILURE`, `abandoned`→`ABANDONED`). Preserve the honesty rules above: `FAILURE` is server-side rejection only.
 - **`authenticator_attachment`** — `platform` or `cross-platform`, from the credential response's `authenticatorAttachment` when reported (the docs already use this signal to distinguish built-in vs. security-key authenticators).
 - **`credential_id_hash`** — a hash of the WebAuthn credential ID, optional and hashed because raw credential IDs may be sensitive (the same reason the `allowList` cookie and metrics avoid storing PII).
-- **`decisions[]`/`invocations[]` and `trace.policy`** — MUST NOT be populated for this event kind (and no `capability_id` is producer-signed anywhere — it is Lock-derived; see `design.md`: Capability Resolution).
+- **capability-decision/invocation fields and `trace.policy`** — the `decision`/`decisions[]` and `invocation`/`invocations[]` payloads and `trace.policy` MUST NOT be populated for this event kind (and no `capability_id` is producer-signed anywhere — it is Lock-derived; see `design.md`: Capability Resolution).
 
 ### Optional attestation/trust context
 

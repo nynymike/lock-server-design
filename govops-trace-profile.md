@@ -132,19 +132,23 @@ The three MVP event payloads — all **[ADD]** (no v0.2 equivalent):
 **`AUTHORIZATION_DECISION`**
 | Field | Required | Notes |
 |---|---|---|
-| `outcome` | yes | `ALLOW`/`DENY`. |
-| `decisions[]` | yes | Each `{ action, resource_type, outcome }` — the **signed capability facts** (Cedar action + resource type, no resource id). Replaces any signed `capability_id`. |
+| `decision` | yes (singular form) | `{ action, resource_type, outcome }` — the **signed capability facts** (Cedar action + resource type, no resource id; `outcome` is `ALLOW`/`DENY`). The MVP default: one record per authorization call. Replaces any signed `capability_id` and any record-level `outcome`. |
+| `decisions[]` | only for batched evaluations | Present **instead of** `decision` when one record represents an atomic batch (e.g. Cedarling evaluating several `(action, resource_type)` requests together). Each entry adds a producer-assigned `decision_id` and its own `outcome`: `{ decision_id, action, resource_type, outcome }`. There is **no** record-level `outcome` in the batch form — a mixed ALLOW/DENY batch has no single outcome. |
 | `tokens[]` | optional | Token context (§8.1). |
 | (`trace.policy`, `trace.runtime.pdp_id`) | yes | Required at the `trace` level for this kind. |
 | `request_digest`/`input_digest`/`tool_call_digest` | optional | Operation-binding commitments. |
 
+A record carries **exactly one** of `decision` (default) or `decisions[]` (batch), never both. The batch form is used only when a producer has a concrete atomic batch-decision operation to represent; otherwise emit one record per call. Lock resolves `capability_id` **per decision** (§9) — never one capability from a whole array — so the `decision`↔`capability_id` association is never lost.
+
 **`CAPABILITY_INVOKED`**
 | Field | Required | Notes |
 |---|---|---|
-| `invocations[]` | yes | Each `{ action, resource_type }` — the same signed facts for what the enforcement point mediated. |
-| `outcome` | yes | `SUCCESS`/`FAILURE` (distinct from the decision's `ALLOW`/`DENY`). |
+| `invocation` | yes (singular form) | `{ action, resource_type, outcome }` — the signed facts for what the enforcement point mediated; `outcome` is `SUCCESS`/`FAILURE` (distinct from the decision's `ALLOW`/`DENY`). The MVP default: one record per mediated call. |
+| `invocations[]` | only for batched enforcement | Present **instead of** `invocation` when one record represents an atomic batch; each entry adds an `invocation_id` and its own `outcome`: `{ invocation_id, action, resource_type, outcome }`. No record-level `outcome` in the batch form. |
 | `enforcement_point_id` | yes | The PEP/gateway that mediated. Signed by the enforcement point's own key, never the PDP's. |
 | `request_digest`/`tool_call_digest`/`result_digest` | optional | Operation binding to the decision and the effect. |
+
+As with the decision kind, a record carries **exactly one** of `invocation` or `invocations[]`, and Lock resolves `capability_id` per invocation.
 
 **`RUNTIME_EFFECT`**
 | Field | Required | Notes |
@@ -162,7 +166,9 @@ The three MVP event payloads — all **[ADD]** (no v0.2 equivalent):
 
 `capability_id` is **not** a signed field and must not be added to the record schema. Producers sign `(action, resource_type)` (§8); **Lock MUST resolve `capability_id`** from `(policy_store_id, policy_store_version, action, resource_type)` against a **versioned capability mapping that lives in the policy store** and store the result as `capability_resolution` outside the signed assertion.
 
-**Capability resolution is an MVP requirement, not a deferred one.** The GovOps purpose — analyzing *what business capabilities* are being authorized and invoked, by whom, and at what rate — collapses without it: a raw `(action, resource_type)` pair like `(Acme::Action::"Pay", Acme::Payment)` is a Cedar implementation detail, not a governable business capability. Every MVP `AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED` record Lock ingests MUST have `capability_resolution` attempted; when the mapping has no entry for the signed facts, Lock records `capability_ids: []` with a `resolution_status` of `unmapped` (feeding the "deprecated/unmapped capabilities" metric in §14) rather than silently dropping it.
+**Capability resolution is an MVP requirement, not a deferred one.** The GovOps purpose — analyzing *what business capabilities* are being authorized and invoked, by whom, and at what rate — collapses without it: a raw `(action, resource_type)` pair like `(Acme::Action::"Pay", Acme::Payment)` is a Cedar implementation detail, not a governable business capability. Every MVP `AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED` record Lock ingests MUST have `capability_resolution` attempted; when the mapping has no entry for the signed facts, Lock records that decision's `capability_ids: []` with a `resolution_status` of `unmapped` (feeding the "deprecated/unmapped capabilities" metric in §14) rather than silently dropping it.
+
+**Resolution is per decision, never per record.** For a singular `decision`/`invocation`, `capability_resolution` holds one result. For a batched `decisions[]`/`invocations[]`, Lock resolves **each entry independently** and keys the result back to the producer's `decision_id`/`invocation_id` — it MUST NOT compute one `capability_id` from the whole array. The result shape is a `results[]` list of `{ decision_id, capability_ids, resolution_status }` plus a shared `mapping_version`, preserving the decision↔capability association that a record-level `capability_ids` would destroy.
 
 The one schema-adjacent artifact GovOps adds is that **capability mapping** (an entry list of `{ action, resource_type, capability_id }` with a `mapping_version`), which is policy-store data, not record data. The mapping is the join key into the **capability catalog** (§13.6), which is where the business meaning lives.
 
@@ -358,7 +364,7 @@ Metrics 1–3 and 11 may be reported with an **attribution-quality cut** (e.g. c
 | 5 | Add execution-correlation fields (`trace_execution_id`/`execution_authority`/epoch/parent/operation/session) | ADD | yes |
 | 6 | Extend `policy` (store id/version, language) ; `enforcement_mode` candidate | ADD | yes (mode: candidate) |
 | 7 | Add `producer_chain` + `parent_record_ids` (hash chain + causal edges) | ADD | yes |
-| 8 | MVP `event` payloads: `decisions[]`/`invocations[]`/effect outcome (signed `(action, resource_type)`) | ADD | yes |
+| 8 | MVP `event` payloads: singular `decision`/`invocation` (`{action, resource_type, outcome}`) by default, `decisions[]`/`invocations[]` with per-entry `decision_id` only for atomic batches | ADD | yes |
 | 9 | Full token context (`validation_at_decision`, `token_claims[]`, credential metadata) | ADD | later |
 | 10 | Lifecycle/identity/approval/signal event kinds (21 more) | ADD | later |
 | 11 | Capability resolution (policy-store mapping; `capability_id` Lock-derived, resolution MVP-required) | ADD / LOCK-DERIVED | yes |
@@ -424,10 +430,7 @@ The same decision as a GovOps record: claims nested under `trace`, an `event_kin
     "evidence_origin": "directly_observed",
     "measurement_point": "cedarling-pdp-in-process",
     "event": {
-      "outcome": "ALLOW",
-      "decisions": [
-        { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment", "outcome": "ALLOW" }
-      ],
+      "decision": { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment", "outcome": "ALLOW" },
       "tokens": [
         { "issuer": "https://accounts.example.org", "token_type": "access_token", "jti": "9c9f2e77-..." },
         { "issuer": "https://accounts.example.org", "token_type": "id_token", "jti": "a1b2c3d4-..." },
@@ -459,7 +462,7 @@ The same decision as a GovOps record: claims nested under `trace`, an `event_kin
 }
 ```
 
-Changes visible here, keyed to the sections above: envelope restructuring (§1), the `trace` object and `event_kind` (§2, §7), the `subject` object (§3), execution-correlation fields (§2/§5-correlation), the extended `policy` (§4), `producer_chain` (§5), `parent_record_ids` (§6), and the signed `decisions[]` capability facts (§8). No `cnf` (§1). No `capability_id` anywhere in the signed body (§9).
+Changes visible here, keyed to the sections above: envelope restructuring (§1), the `trace` object and `event_kind` (§2, §7), the `subject` object (§3), execution-correlation fields (§2/§5-correlation), the extended `policy` (§4), `producer_chain` (§5), `parent_record_ids` (§6), and the signed singular `decision` capability facts (§8) — one record per authorization call, with `outcome` on the decision itself and no record-level `outcome`. No `cnf` (§1). No `capability_id` anywhere in the signed body (§9).
 
 ### C. The Lock-derived data for that record (stored outside the signed assertion)
 
@@ -491,8 +494,9 @@ Everything Lock computes lives in the Stored Record Envelope's `verification`/`i
     "late_flag": false
   },
   "capability_resolution": {
-    "capability_ids": ["invoke:payment-authorization"],
-    "resolution_status": "resolved",
+    "results": [
+      { "capability_ids": ["invoke:payment-authorization"], "resolution_status": "resolved" }
+    ],
     "policy_store_id": "https://example.org/policy-stores/payments",
     "policy_store_version": "1.2.3",
     "mapping_version": "3",
@@ -566,11 +570,11 @@ Everything Lock computes lives in the Stored Record Envelope's `verification`/`i
 }
 ```
 
-This is the point of §9 and §12: `capability_id`, `trust_tier`, the admission results, the receipt metadata, **and every §13 enrichment** are all **here**, not in the producer's signed record. The token enrichment keeps both the producer-signed `claims_at_decision` and the later Lock-resolved `current_token_state` with their own provenance and timestamps (§13.1); the `sid` resolved from the token joins the action back through the session to the FIDO ceremony (§13.2); `actor_context` is *derived* from that evidence, not asserted by the workload (§13.3); organization, region, resource, and capability meaning come from versioned reference data (§13.4–§13.6); and each correlation carries an attribution quality (§13.8). A producer that tried to sign any of them would have the field ignored and the attempt flagged.
+The record above carries a singular `decision`, so `capability_resolution.results` has a single entry with no `decision_id`; a batched `decisions[]` record would instead carry one result per `decision_id`, each resolved independently (§9). This is the point of §9 and §12: `capability_id`, `trust_tier`, the admission results, the receipt metadata, **and every §13 enrichment** are all **here**, not in the producer's signed record. The token enrichment keeps both the producer-signed `claims_at_decision` and the later Lock-resolved `current_token_state` with their own provenance and timestamps (§13.1); the `sid` resolved from the token joins the action back through the session to the FIDO ceremony (§13.2); `actor_context` is *derived* from that evidence, not asserted by the workload (§13.3); organization, region, resource, and capability meaning come from versioned reference data (§13.4–§13.6); and each correlation carries an attribution quality (§13.8). A producer that tried to sign any of them would have the field ignored and the attempt flagged.
 
 ### D. The paired `CAPABILITY_INVOKED` (enforcement-point separation)
 
-The enforcement point — a **different producer** with its own key and chain, even if co-located with Cedarling — signs the invocation, carrying the same signed `(action, resource_type)` facts in `invocations[]` and an `authorized` edge back to the decision:
+The enforcement point — a **different producer** with its own key and chain, even if co-located with Cedarling — signs the invocation, carrying the same signed `(action, resource_type)` facts in a singular `invocation` and an `authorized` edge back to the decision:
 
 ```json
 {
@@ -585,8 +589,7 @@ The enforcement point — a **different producer** with its own key and chain, e
     "execution_authority": "spiffe://example.org/agent/planner",
     "subject": { "workload_id": "spiffe://example.org/agent/planner" },
     "event": {
-      "outcome": "SUCCESS",
-      "invocations": [ { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment" } ],
+      "invocation": { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment", "outcome": "SUCCESS" },
       "enforcement_point_id": "payments-gateway-01"
     }
   },

@@ -17,7 +17,7 @@ The essential TRACE foundation (the full scope of `Lock-Server-TRACE-MVP-Design.
 - **A Lock receipt hash chain** — the tamper-evident, per-evidence-domain ingestion ledger (`receipt_sequence` / `received_at` at millisecond precision / `prev_receipt_hash`), assigned atomically with each accepted record.
 - **Integrity flagging at ingestion** — **coverage-gap, chain-link-failure, equivocation, and late-arrival** flagging. Each is surfaced, never silently dropped or silently resolved.
 - **Correlation** by `(evidence_domain_id, execution_authority, trace_execution_id)`, required at ingestion (no unattributed-evidence/backfill path in the MVP).
-- **Signed capability facts** — `AUTHORIZATION_DECISION` signs `decisions[]` (`{action, resource_type, outcome}`) and `CAPABILITY_INVOKED` signs `invocations[]` (`{action, resource_type}`); the `capability_id` governance label is Lock-derived and its resolution/index are deferred.
+- **Signed capability facts** — `AUTHORIZATION_DECISION` signs a singular `decision` (`{action, resource_type, outcome}`) and `CAPABILITY_INVOKED` a singular `invocation` (`{action, resource_type, outcome}`), one record per call; an atomic batch MAY use `decisions[]`/`invocations[]` with per-entry `decision_id`/`invocation_id`. The `capability_id` governance label is Lock-derived and its resolution/index are deferred.
 - **Retrieval by record and execution.** Capability, workload, session, transaction, and token retrieval (and the corresponding indexes) are deferred.
 - **Structured errors and idempotent replay.**
 
