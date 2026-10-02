@@ -137,7 +137,7 @@ The MVP profile fixes the following algorithms:
 | Binary-to-text signature encoding | Unpadded base64url |
 | Digest text encoding | `sha256:` followed by 64 lowercase hexadecimal characters |
 
-Algorithm agility is deliberately deferred. Allowing record-selected algorithms in the MVP would add downgrade and interoperability risks. A future profile can introduce new algorithms with a new profile identifier and explicit verifier policy.
+Algorithm agility is deliberately deferred. Allowing record-selected algorithms in the MVP would add downgrade and interoperability risks. A future profile can introduce new algorithms with a new profile identifier and explicit verifier policy. (The TRACE standard — v0.2, `research/trace-spec.txt` — permits Ed25519, ES256, and ES384; the MVP's **Ed25519-only** choice is a deliberate subset of that set, not a divergence from it, and the broader set is one of the additions a future profile may enable.)
 
 ### 6.2 Strict JSON requirements
 
@@ -162,14 +162,14 @@ The producer signature covers the RFC 8785 canonical form of the complete top-le
 
 The following fields are therefore signed when present:
 
-- `producer`;
+- `producer` (the stable logical producer identifier — not a `name/semver` string; software version travels as a separate signed field such as `producer_version`, which is covered here as any other top-level member);
 - `kid`;
 - `record_id`;
 - `trace` and all nested fields;
 - `producer_chain` and all nested fields; and
 - `parent_record_ids` and all entries.
 
-No other field may be removed merely because it is unknown to the current library version. This preserves forward compatibility: extension fields remain protected by the signature.
+No other field may be removed merely because it is unknown to the current library version. This preserves forward compatibility: extension fields (for example `producer_version`, or any field a future profile adds) remain protected by the signature even though this crate does not interpret them.
 
 Conceptually:
 
@@ -550,6 +550,8 @@ The MVP uses:
 TRACE assertion profile: tag:jans.io,2026:trace-v1
 Lock receipt profile:    tag:jans.io,2026:lock-trace-receipt-v1
 ```
+
+The assertion profile `tag:jans.io,2026:trace-v1` is a **distinct Jans/Lock profile** that extends the TRACE standard (tracked at **v0.2**, `research/trace-spec.txt`, profile `tag:agentrust-io.com,2026:trace-v0.2`); it is intentionally a separate profile tag, not the standard's. See `design.md`: Alignment with TRACE v0.2 for the field mapping. This crate is profile-agnostic about *content* — it signs and hashes whatever assertion bytes it is given under the fixed cryptographic profile above — so a change of assertion profile does not change this crate's outputs, which are governed solely by the signature-scope, canonicalization, digest, and receipt rules in §6–§7.
 
 ## 16. Delivery phases
 
