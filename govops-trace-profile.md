@@ -217,3 +217,164 @@ A producer that places any of these in its signed body has that field ignored an
 - `Lock-Server-TRACE-MVP-Design.md` — the MVP wire shape and required/deferred boundary.
 - `jans-trace-core-mvp-design.md` — signing scope, canonicalization, and the receipt-commitment profile.
 - `research/trace-spec.txt` — the base TRACE v0.2 Trust Record schema this profile extends.
+
+---
+
+## Non-normative example
+
+> **Non-normative.** This section illustrates the schema changes above with a worked example. It adds no requirement; where it and `design.md` could differ, `design.md` governs. Values are illustrative and abbreviated (`...`).
+
+### A. Base TRACE v0.2 record (for contrast)
+
+The base schema is flat, model-centric, and has no event kind, execution correlation, or chaining:
+
+```json
+{
+  "eat_profile": "tag:agentrust-io.com,2026:trace-v0.2",
+  "iat": 1781138542,
+  "subject": "spiffe://trust.example.org/agent/payments-processor/prod",
+  "model": { "provider": "example-provider", "model_id": "example-model-1", "version": "20251001" },
+  "runtime": { "platform": "software-only", "measurement": "sha256:..." },
+  "policy": { "bundle_hash": "sha256:...", "enforcement_mode": "enforce" },
+  "data_class": "confidential",
+  "tool_transcript": { "hash": "sha256:...", "call_count": 3 },
+  "build_provenance": { "slsa_level": 2, "digest": "sha256:..." },
+  "appraisal": { "status": "none", "verifier": "https://verifier.example.org" },
+  "cnf": { "jwk": { "kty": "OKP", "crv": "Ed25519", "x": "..." } },
+  "signature": "base64url(...)"
+}
+```
+
+### B. GovOps `AUTHORIZATION_DECISION` (the profile applied)
+
+The same decision as a GovOps record: claims nested under `trace`, an `event_kind` discriminator, the signed capability **facts** in `decisions[]` (no `capability_id`), execution correlation, the producer-chain envelope, and a typed causal edge to the Auth Server's token-issuance record. The signing key is referenced by `kid` and resolved out-of-band — there is no `cnf` in the body.
+
+```json
+{
+  "producer": "cedarling-fleet-1",
+  "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
+  "kid": "key-2026-01",
+  "trace": {
+    "eat_profile": "tag:jans.io,2026:trace-v1",
+    "event_kind": "AUTHORIZATION_DECISION",
+    "signed_at": 1781138542,
+    "trace_execution_id": "exec-01JABCXYZQK8P5N9F2C7R3T4V6",
+    "execution_authority": "spiffe://example.org/agent/planner",
+    "subject": {
+      "workload_id": "spiffe://example.org/agent/planner",
+      "workload_instance_id": "04bbe9ef-a853-417c-a2b8-5328b62936e2"
+    },
+    "evidence_origin": "directly_observed",
+    "measurement_point": "cedarling-pdp-in-process",
+    "event": {
+      "outcome": "ALLOW",
+      "decisions": [
+        { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment", "outcome": "ALLOW" }
+      ],
+      "tokens": [
+        { "issuer": "https://accounts.example.org", "token_type": "access_token", "jti": "9c9f2e77-..." }
+      ]
+    },
+    "policy": {
+      "bundle_hash": "sha256:...",
+      "policy_store_id": "https://example.org/policy-stores/payments",
+      "policy_store_version": "1.2.3",
+      "policy_language": "cedar",
+      "policy_language_version": "4.4.0"
+    },
+    "runtime": { "pdp_id": "cedarling-001" }
+  },
+  "producer_chain": {
+    "producer_id": "cedarling-fleet-1",
+    "producer_instance_id": "cedarling-001",
+    "producer_chain_id": "chain-01JABC9Z0K",
+    "sequence_number": 4821,
+    "prev_record_hash": "sha256:..."
+  },
+  "parent_record_ids": [
+    { "producer_id": "jans-auth-server", "record_id": "R-token-issued-001", "relationship_type": "issued_token" }
+  ],
+  "signature": "base64url(Ed25519 over RFC 8785 JCS of all fields except signature)"
+}
+```
+
+Changes visible here, keyed to the sections above: envelope restructuring (§1), the `trace` object and `event_kind` (§2, §7), the `subject` object (§3), execution-correlation fields (§2/§5-correlation), the extended `policy` (§4), `producer_chain` (§5), `parent_record_ids` (§6), and the signed `decisions[]` capability facts (§8). No `cnf` (§1). No `capability_id` anywhere in the signed body (§9).
+
+### C. The Lock-derived data for that record (stored outside the signed assertion)
+
+Everything Lock computes lives in the Stored Record Envelope's `verification`/`ingestion` parts and the assessment store — **never** inside `trace`. For the record above:
+
+```json
+{
+  "verification": {
+    "signature_valid": true,
+    "key_id": "key-2026-01",
+    "key_thumbprint": "sha256:...",
+    "verified_at": "2026-06-11T00:41:02.123Z",
+    "algorithm": "Ed25519",
+    "key_resolved": "valid",
+    "key_temporally_valid": "valid",
+    "key_not_revoked": "valid",
+    "key_authorized_for_producer": "valid",
+    "producer_authorized_for_claim": "valid",
+    "key_authorization_ref": { "statement_id": "pkauth-01JABEF7Q2", "statement_version": 3, "public_key_thumbprint": "sha256:..." },
+    "trust_tier": "attested"
+  },
+  "ingestion": {
+    "receipt_sequence": 108422,
+    "received_at": "2026-06-11T00:41:02.123Z",
+    "prev_receipt_hash": "sha256:...",
+    "coverage_gap_flag": false,
+    "chain_link_failure_flag": false,
+    "equivocation_flag": false,
+    "late_flag": false
+  },
+  "capability_resolution": {
+    "capability_ids": ["invoke:payment-authorization"],
+    "policy_store_id": "https://example.org/policy-stores/payments",
+    "policy_store_version": "1.2.3",
+    "mapping_version": "3",
+    "resolved_at": "2026-06-11T00:41:02.123Z"
+  }
+}
+```
+
+This is the point of §9 and §12: `capability_id`, `trust_tier`, the admission results, and the receipt metadata are all **here**, not in the producer's signed record. A producer that tried to sign any of them would have the field ignored and the attempt flagged.
+
+### D. The paired `CAPABILITY_INVOKED` (enforcement-point separation)
+
+The enforcement point — a **different producer** with its own key and chain, even if co-located with Cedarling — signs the invocation, carrying the same signed `(action, resource_type)` facts in `invocations[]` and an `authorized` edge back to the decision:
+
+```json
+{
+  "producer": "payments-gateway",
+  "record_id": "R-capability-invoked-003",
+  "kid": "gw-key-2026-01",
+  "trace": {
+    "eat_profile": "tag:jans.io,2026:trace-v1",
+    "event_kind": "CAPABILITY_INVOKED",
+    "signed_at": 1781138543,
+    "trace_execution_id": "exec-01JABCXYZQK8P5N9F2C7R3T4V6",
+    "execution_authority": "spiffe://example.org/agent/planner",
+    "subject": { "workload_id": "spiffe://example.org/agent/planner" },
+    "event": {
+      "outcome": "SUCCESS",
+      "invocations": [ { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment" } ],
+      "enforcement_point_id": "payments-gateway-01"
+    }
+  },
+  "producer_chain": {
+    "producer_id": "payments-gateway",
+    "producer_instance_id": "gw-01",
+    "producer_chain_id": "chain-gw-01JABD",
+    "sequence_number": 991,
+    "prev_record_hash": "sha256:..."
+  },
+  "parent_record_ids": [
+    { "producer_id": "cedarling-fleet-1", "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41", "relationship_type": "authorized" }
+  ],
+  "signature": "base64url(...)"
+}
+```
+
+The decision (`cedarling-fleet-1`) and the invocation (`payments-gateway`) are **separate producers with separate keys**, correlated by the shared `trace_execution_id` and linked by the `authorized` edge — the enforcement-point separation of §8. Lock resolves `capability_id` for *both* records from their signed `(action, resource_type)` and can compare them across the edge; neither record carries a producer-signed `capability_id`.
