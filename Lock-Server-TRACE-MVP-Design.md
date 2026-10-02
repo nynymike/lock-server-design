@@ -67,8 +67,7 @@ The MVP does not implement:
 - cross-domain correlation or import;
 - privacy-preserving trust-boundary profiles;
 - signed receipt checkpoints or external transparency anchoring;
-- Evidence Packet export;
-- bulk ingestion; or
+- Evidence Packet export; or
 - graph traversal beyond direct execution membership.
 
 The MVP also defers the AIMS/WIMSE identity and lifecycle features the full design specifies:
@@ -438,7 +437,37 @@ Success response:
 
 Return `202 Accepted` only after verification and atomic persistence succeed. Use `400` for malformed or invalid signed content, `401`/`403` for OAuth failures, `409` for reuse of the same record identity with different content, and `500` when durable storage cannot complete. A deployment may use `503` instead when it deliberately exposes a retryable service-unavailable condition, but the OpenAPI contract must choose one behavior consistently.
 
-### 11.2 Retrieve one record
+### 11.2 Submit a batch of records
+
+```http
+POST /api/v1/audit/trace/bulk
+Authorization: Bearer <access-token>
+Content-Type: application/json
+```
+
+Required scope:
+
+`https://jans.io/oauth/lock/trace.write`
+
+Bulk ingestion is **in the MVP** because a high-throughput producer such as Cedarling can make thousands of decisions per second, and one HTTP request per record (§11.1) does not scale to that. The batch amortizes transport and lets a producer reuse its existing buffered, periodic shipping channel. The batch body is an array of signed TRACE records, **one producer per batch** (every record shares the same signed `producer`/`producer_chain.producer_id`; a batch mixing producers is rejected). A configurable maximum batch size applies (see §14).
+
+**Per-record, not all-or-nothing.** Lock verifies, correlates, and runs the first settlement pass for **each record independently**, exactly as for a single submission — a batch is N independent §11.1 ingestions sharing one request and one atomic-per-record write, not one transaction over the whole batch. A failure on one record (bad signature, unknown/unauthorized key, `409` identity conflict, storage failure) does **not** reject the other, independently-valid records. There is no batch-level settlement and no cross-record coupling; settlement remains per-record.
+
+Success response is a per-record result array in submission order:
+
+```json
+{
+  "results": [
+    { "accepted": true,  "producer_id": "cedarling-fleet-1", "record_id": "9f3e9e2a-...", "content_digest": "sha256:...", "receipt_sequence": 108422, "idempotent_replay": false, "coverage_gap_flag": false, "chain_link_failure_flag": false, "equivocation_flag": false, "late_flag": false },
+    { "accepted": false, "record_id": "1b2c3d4e-...", "error": { "code": "SIGNATURE_INVALID", "message": "..." } }
+  ]
+}
+```
+
+Return `207 Multi-Status` (or `200` with an all-accepted result array, per a consistently-chosen OpenAPI contract) when the batch was processed and each record carries its own result; `400` only when the **batch envelope** itself is malformed (not JSON, exceeds the size limit, or mixes producers), `401`/`403` for OAuth failures, and `500`/`503` only when Lock could not process the batch at all. Each accepted record's receipt is assigned exactly as in §11.1, and replay/`409`/gap/equivocation semantics are per-record and identical to the single-record path. Records within one batch MAY advance the producer chain across several `producer_chain_id` lanes (see §8), so batching never forces one serialized sequence allocator.
+
+
+### 11.3 Retrieve one record
 
 ```http
 GET /api/v1/audit/trace/records/{record_id}?producer_id={producer_id}
@@ -450,7 +479,7 @@ Required scope:
 
 `producer_id` SHOULD be supplied. If omitted, Lock may return the record only when the bare ID resolves to exactly one producer within the authenticated evidence domain; otherwise it returns an ambiguity error.
 
-### 11.3 Retrieve one execution
+### 11.4 Retrieve one execution
 
 ```http
 GET /api/v1/audit/trace/executions/{trace_execution_id}?execution_authority={execution_authority}
@@ -494,6 +523,7 @@ Capability resolution and the capability index (`(evidence_domain_id, capability
 - Enforce TLS and OAuth on every TRACE endpoint.
 - Derive the evidence domain before any key lookup or content-based routing.
 - Apply maximum request size, nesting depth, string length, and array length before expensive cryptographic processing.
+- Apply a maximum **batch size** (record count) and a maximum batch body size to `POST /api/v1/audit/trace/bulk` before cryptographic processing; a batch exceeding either is rejected with `400` at the envelope level, never partially processed past the limit.
 - Use constant-time cryptographic implementations and approved Ed25519 libraries.
 - Never log raw bearer tokens or sensitive token claims.
 - Preserve the original assertion and the exact verifying `kid` for historical verification.
@@ -522,6 +552,7 @@ The MVP is complete when all of the following tests pass:
 14. An unscoped record or execution lookup with several in-domain matches returns an ambiguity error rather than selecting one.
 15. A record signed by a key not authorized for its `producer_id`, or whose `event_kind` is outside the key's `authorized_event_kinds`, is rejected and never appears in normal retrieval — exactly as an unknown key is.
 16. A stored record's recorded admission decision (`signature_valid`, `key_thumbprint`, `key_authorized`) is fixed at `verified_at`: later re-scoping, revocation, or validity-window changes to the key never rewrite it for an already-stored record.
+17. A `POST /api/v1/audit/trace/bulk` batch with a mix of valid and invalid records accepts every valid record and rejects every invalid one on its own merits, each with its own per-record result and receipt; one record's failure never rejects an independently-valid record in the same batch, and a batch mixing producers is rejected at the envelope level.
 
 ## 16. Later phases
 

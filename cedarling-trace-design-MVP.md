@@ -91,9 +91,12 @@ Reusing the `CEDARLING_*` convention, the MVP needs the record-producing switch 
 | `CEDARLING_TRACE_PRODUCER_ID` | The stable logical `producer`/`producer_id` (not `name/semver`). | derived from app name |
 | `CEDARLING_TRACE_SIGNING_KEY` | Reference to the Ed25519 producer signing key (handle; never inline). | — |
 | `CEDARLING_TRACE_CHAIN_GENESIS` | `pre_registered`/`first_observed` — MVP accepts `first_observed`. | `first_observed` |
-| `CEDARLING_TRACE_ENDPOINT` | Lock TRACE ingestion endpoint (`/api/v1/audit/trace`); may default to the discovered Lock audit endpoint. | discovered |
+| `CEDARLING_TRACE_EMISSION` | `all` / `configured_capabilities` — which decisions become records (see Scaling below). | `configured_capabilities` |
+| `CEDARLING_TRACE_ENDPOINT` | Lock TRACE ingestion endpoint; the **bulk** path `/api/v1/audit/trace/bulk` by default, or the discovered Lock audit endpoint. | discovered |
 
 Deferred (full design only): `CEDARLING_TRACE_INCLUDE_CLAIMS` (token-claim enrichment) and `CEDARLING_TRACE_OPERATION_BINDING` (operation-binding digests). TRACE transport reuses the existing `CEDARLING_LOCK_*` machinery (SSA→DCR, `log.write` scope, buffered channel, retry).
+
+**Scaling (bulk + selective emission).** Cedarling can make thousands of decisions per second, so the MVP relies on two levers, both available in the Lock Server MVP. (1) **Bulk ingestion** — records ship to Lock's `POST /api/v1/audit/trace/bulk` endpoint (now in the MVP — see `Lock-Server-TRACE-MVP-Design.md` §11.2), one producer per batch, per-record accept/reject, over the existing buffered/periodic channel, rather than one request per decision. (2) **Selective emission** — `CEDARLING_TRACE_EMISSION` defaults to `configured_capabilities`, emitting records only for the operator-configured `(action, resource_type)` capabilities that matter for governance, rather than signing every decision; `all` emits for every decision at higher cost. The honesty rule holds either way: a decision not emitted is absent evidence (**"not captured," never "no decision occurred"**), and Lock's completeness profiles (deferred in the MVP but defined in the full design) mark an expected-but-absent capability as `expected_evidence_missing`, so a deployment that must prove a capability was evidenced configures it into the emit set. Emission policy never changes the decision returned to the caller.
 
 ## 7. Acceptance criteria (MVP)
 
