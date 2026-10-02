@@ -558,7 +558,6 @@ Shape follows the TRACE standard's Trust Record structure (TRACE **v0.2**; see A
 ```json
 {
   "producer": "cedarling-fleet-1",
-  "producer_version": "cedarling 1.0.0",
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
   "trace": {
     "eat_profile": "tag:jans.io,2026:trace-v1",

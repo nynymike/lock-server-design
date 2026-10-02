@@ -180,7 +180,6 @@ The following is the MVP wire shape. Fields shown as `null` may be omitted unles
 ```json
 {
   "producer": "cedarling-fleet-1",
-  "producer_version": "cedarling 1.0.0",
   "kid": "key-2026-01",
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
   "trace": {
