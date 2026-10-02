@@ -158,9 +158,13 @@ The three MVP event payloads — all **[ADD]** (no v0.2 equivalent):
 
 ---
 
-## 9. Capability resolution — **[LOCK-DERIVED]** (not a record-schema change)
+## 9. Capability resolution — **[LOCK-DERIVED, MVP-REQUIRED]**
 
-`capability_id` is **not** a signed field and must not be added to the record schema. Producers sign `(action, resource_type)` (§8); Lock resolves `capability_id` from `(policy_store_id, policy_store_version, action, resource_type)` against a **versioned capability mapping that lives in the policy store** and stores the result as `capability_resolution` outside the signed assertion. The one schema-adjacent artifact GovOps adds is that **capability mapping** (an entry list of `{ action, resource_type, capability_id }` with a `mapping_version`), which is policy-store data, not record data.
+`capability_id` is **not** a signed field and must not be added to the record schema. Producers sign `(action, resource_type)` (§8); **Lock MUST resolve `capability_id`** from `(policy_store_id, policy_store_version, action, resource_type)` against a **versioned capability mapping that lives in the policy store** and store the result as `capability_resolution` outside the signed assertion.
+
+**Capability resolution is an MVP requirement, not a deferred one.** The GovOps purpose — analyzing *what business capabilities* are being authorized and invoked, by whom, and at what rate — collapses without it: a raw `(action, resource_type)` pair like `(Acme::Action::"Pay", Acme::Payment)` is a Cedar implementation detail, not a governable business capability. Every MVP `AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED` record Lock ingests MUST have `capability_resolution` attempted; when the mapping has no entry for the signed facts, Lock records `capability_ids: []` with a `resolution_status` of `unmapped` (feeding the "deprecated/unmapped capabilities" metric in §14) rather than silently dropping it.
+
+The one schema-adjacent artifact GovOps adds is that **capability mapping** (an entry list of `{ action, resource_type, capability_id }` with a `mapping_version`), which is policy-store data, not record data. The mapping is the join key into the **capability catalog** (§13.6), which is where the business meaning lives.
 
 ---
 
@@ -193,6 +197,156 @@ A producer that places any of these in its signed body has that field ignored an
 
 ---
 
+## 13. Lock-derived analytics enrichment — **[LOCK-DERIVED]**
+
+GovOps is not only evidence preservation; it is **analytics over governed execution**. The signed records say what producers observed; the enrichment below is what Lock *derives* so the records can be aggregated into governance answers ("what share of high-risk capability use was autonomous, by business unit, last quarter?"). Everything in §13 is **[LOCK-DERIVED]** — computed and stored outside the signed assertion, in the assessment store — and must never be added to the producer record schema. Each derived value carries its own **provenance** (what evidence it came from) and, where correlation is involved, an **attribution quality** (§13.8).
+
+A governing principle runs through all of §13: **producers sign facts; Lock derives interpretations.** Token contents, organizational attributes, actor classification, region, and resource sensitivity are interpretations Lock assembles from reference data and correlation — not things a producer asserts about itself.
+
+### 13.1 Token enrichment — producer-signed vs Lock-resolved
+
+A `jti` in a signed record is **only a lookup key**. Lock uses `(issuer, jti)` to correlate against token information the Auth Server retained at issuance: `sub`, `sid`, `client_id`, `azp`, `aud`, `act`, `may_act`, `scope`, `cnf`, token type, issue time (`iat`), expiration (`exp`), and the authentication context. The resolved result is Lock-derived and stored separately from anything the producer signed.
+
+Token information reaches Lock through **two independent paths**, and both are retained with provenance and timestamps because neither is always available:
+
+| Field | Source | When present |
+|---|---|---|
+| `claims_at_decision` | **Producer-signed.** The subset of claims the PDP saw and signed into `tokens[].token_claims[]` at decision time. | When the producer chose to sign them (full-design `tokens[]`, §8.1). Authoritative for *what the PDP actually acted on*. |
+| `current_token_state` | **Lock-resolved.** Looked up later from the Auth Server via `(issuer, jti)`. | When the token is still resolvable (not purged/rotated) and the Auth Server exposes retained claims. Authoritative for *what the token actually was/became*. |
+
+Each path records `{ resolved_from, resolved_at, claims: {...} }` so an analyst can tell a producer-asserted claim from a Lock-correlated one, and can see staleness. When the two disagree (e.g. scope narrowed after issuance), both are kept; the divergence is itself a governance signal. Token lookup is **not** guaranteed — short-lived or purged tokens may be unresolvable — so a record with only `claims_at_decision`, or with neither, is valid and simply carries lower attribution quality (§13.8).
+
+### 13.2 Session and authentication correlation (the `sid` join)
+
+`sid` (resolved via §13.1) is the join key from a machine action back to a human authentication. Lock walks:
+
+```
+jti  →  token enrichment (§13.1)  →  sid  →  browser/session record
+     →  AUTHENTICATION_EVENT  →  FIDO_CEREMONY
+```
+
+The result is stored as a `session_correlation` object: `{ sid, session_issuer, authentication_event_ref, authentication_strength, fido_ceremony_ref, authenticated_human_ref, resolved_via, resolved_at }`. `AUTHENTICATION_EVENT` and `FIDO_CEREMONY` are full-design event kinds (§7); in the MVP the join may terminate at the session record with reduced strength and lower attribution quality. `authentication_strength` (e.g. `phishing_resistant_mfa`, `mfa`, `single_factor`, `unknown`) is derived from the ceremony/event, not asserted by the invoking workload.
+
+### 13.3 `actor_context` — derived, not a subject type
+
+GovOps does **not** model "human vs software" as a subject type on the record (a workload does not know, and must not assert, whether a human is behind it). Lock **derives** `actor_context` from the correlation evidence:
+
+| `actor_context` | Meaning |
+|---|---|
+| `human_direct` | A human authenticated and the action maps directly to that session. |
+| `human_delegated_to_workload` | A human authenticated and delegated to a workload that then acted (`act`/`may_act`, delegation records). |
+| `software_autonomous` | A workload acting on its own credential with no human session in the chain. |
+| `service_to_service` | One service acting on behalf of another via workload credentials, no human. |
+| `unknown` | Correlation evidence insufficient to classify. |
+
+The derivation stores the **evidence used**: `{ actor_context, evidence: [token act/may_act, session_correlation, delegation records, workload_authentication], attribution_quality }`. "Unknown" is a first-class, reportable value — never silently coerced to a human or software bucket.
+
+### 13.4 Organizational reference data (versioned, not copied from tokens)
+
+Organizational attributes (business unit, team, owner) are **never copied blindly from token claims**. Lock resolves the stable identifiers that *are* trustworthy — `sub`, `client_id`, `workload_id`, `resource_id` — through **versioned organizational reference data**, retaining the `mapping_version` and `resolved_at` for every resolution so historical records keep their *effective* classification.
+
+Subject-to-org mappings, each versioned:
+
+| Stable id | Resolves to |
+|---|---|
+| human `sub` | business unit, team |
+| `client_id` | owning application / service, service owner |
+| `workload_id` | owning application, team, business unit |
+| `capability_id` | capability owner, business function (via the catalog, §13.6) |
+| target `resource_id` | owning business unit, region |
+
+Stored as `org_resolution: { sub_ref → {business_unit, team}, client_id → {app, owner}, workload_id → {app, team, business_unit}, mapping_version, resolved_at }`. Exact identifiers that are sensitive are referenced by access-controlled hash, not value.
+
+### 13.5 The four meanings of "region"
+
+"Region" is ambiguous and GovOps separates it into four distinct dimensions, each with its own source and confidence/provenance:
+
+| Region dimension | Meaning | Typical source |
+|---|---|---|
+| `human_region` | Where the human / their session originated | `session_correlation`, auth event geo |
+| `workload_region` | Where the acting workload executed | workload attestation / runtime |
+| `enforcement_region` | Where the enforcement point (PEP) ran | `enforcement_point_id` → PEP registry |
+| `target_region` | Where the target resource / data lives | target-resource classification (§13.6) |
+
+Each is stored as `{ value, source, confidence }`. They are reported separately — "cross-region use" (§14) is defined over a *specific pair* of these, never a collapsed single "region".
+
+### 13.6 Target-resource classification and the capability catalog
+
+Two versioned reference datasets give business meaning to the signed facts:
+
+**Target-resource classification** (keyed by resolved `resource_id`): `{ resource_domain, resource_owner, business_unit, data_classification, deployment_region, criticality }`. Exact resource identifiers are hashed / access-controlled; the classification is what analytics use.
+
+**Capability catalog** (keyed by `capability_id` from §9): `{ business_owner, business_function, risk_tier, data_sensitivity, regulated_scope, allowed_regions, expected_producer_roles, lifecycle_status }`. This is where a resolved `capability_id` becomes a governable business capability — `lifecycle_status` (e.g. `active`/`deprecated`/`retired`) and `expected_producer_roles` feed the §14 hygiene metrics.
+
+### 13.7 Effective (versioned) vs current classification
+
+Trend analysis uses the classification that was **effective at event time** — the `mapping_version` resolved against the org/catalog/resource data as it stood then — **not** today's org chart. A capability moved between business units last month must still count under its *then-current* unit for any period before the move. Lock additionally MAY compute an optional **"current org" view** that re-resolves every historical event through today's reference data, for "where would this land under the current structure?" questions. Both are derived; the effective view is the default and the current view is explicitly labelled.
+
+### 13.8 Attribution quality
+
+Every derived correlation (token, session, actor_context, org, region) carries an **attribution quality** so aggregates can be filtered or confidence-weighted:
+
+| Quality | Meaning |
+|---|---|
+| `verified` | Backed by cryptographic/attested evidence (e.g. FIDO ceremony, attested token). |
+| `correlated` | Joined through a reliable key (e.g. `(issuer, jti)` → `sid` → session) with no contradiction. |
+| `asserted` | Taken from a producer-signed claim without independent corroboration. |
+| `ambiguous` | Multiple candidate resolutions; recorded with the alternatives. |
+| `unknown` | No usable evidence. |
+
+### 13.9 Per-invocation analytics projection
+
+For each `CAPABILITY_INVOKED`, Lock materializes a flat **analytics projection** combining the signed facts with all of §13's derivations, so GovOps queries do not re-walk the graph:
+
+```json
+{
+  "capability_id": "invoke:payment-authorization",
+  "invoked_at": "2026-06-11T00:41:03.004Z",
+  "actor_context": "human_delegated_to_workload",
+  "human_subject_ref": "sha256:...",
+  "workload_id": "spiffe://example.org/agent/planner",
+  "business_unit": "retail-payments",
+  "workload_region": "eu-west-1",
+  "target_region": "eu-west-1",
+  "resource_data_class": "confidential",
+  "authentication_strength": "phishing_resistant_mfa",
+  "attribution_quality": "correlated"
+}
+```
+
+The projection records the **effective** (§13.7) classification; its `attribution_quality` is the weakest of the correlations that fed it.
+
+---
+
+## 14. GovOps metrics — definitions and denominators — **[LOCK-DERIVED]**
+
+Metrics are computed over the §13.9 projections and the signed records. The central rule: **state the denominator explicitly, and never mix event kinds in one ratio.** Three families of events answer three different questions and MUST be reported separately:
+
+- **Authorization** metrics count `AUTHORIZATION_DECISION` records (what the PDP *allowed/denied*).
+- **Invocation** metrics count `CAPABILITY_INVOKED` records (what an enforcement point *actually mediated*).
+- **Observed-effect** metrics count `RUNTIME_EFFECT` records (what effect *actually followed*).
+
+"Percentage of actions by humans versus software" is an **invocation** metric: its denominator is the count of `CAPABILITY_INVOKED` records (optionally scoped to a capability/BU/period), **not** authorization decisions and **not** a blend. A decision that was allowed but never invoked does not count as an "action."
+
+Useful GovOps metrics (all over the invocation denominator unless noted), each filterable by effective BU/region/capability/period:
+
+1. **Human-direct share** — `actor_context = human_direct` ÷ invocations.
+2. **Human-delegated share** — `actor_context = human_delegated_to_workload` ÷ invocations.
+3. **Autonomous share** — `actor_context ∈ {software_autonomous, service_to_service}` ÷ invocations.
+4. **Invocations by business unit / by region** — counts grouped by effective `business_unit` and by each region dimension (§13.5), reported per-dimension.
+5. **Fastest-growing capabilities** — invocation-count growth per `capability_id` across periods.
+6. **Change in autonomous activity** — period-over-period delta of metric 3.
+7. **High-risk capability use without strong auth** — invocations where catalog `risk_tier` is high and `authentication_strength` is weak/`unknown` ÷ high-risk invocations.
+8. **Cross-region use** — invocations where a *named pair* of region dimensions differ (e.g. `human_region ≠ target_region`); reported per pair, never collapsed.
+9. **Authorized-but-never-invoked** — `AUTHORIZATION_DECISION`(ALLOW) with no correlated `CAPABILITY_INVOKED` ÷ allowed decisions. *(Authorization denominator.)*
+10. **Invocations lacking a runtime effect** — `CAPABILITY_INVOKED`(SUCCESS) with no correlated `RUNTIME_EFFECT` ÷ successful invocations.
+11. **Unknown sponsor / unknown owner** — invocations where `actor_context = unknown`, or `capability_id` has no catalog `business_owner` ÷ invocations.
+12. **Deprecated / unmapped capability use** — invocations whose `capability_id` is catalog-`deprecated`/`retired`, plus resolutions with `resolution_status = unmapped` (§9) ÷ invocations.
+
+Metrics 1–3 and 11 may be reported with an **attribution-quality cut** (e.g. counting only `verified`/`correlated`), and SHOULD state which quality threshold was applied so a reader knows whether an "autonomous share" is measured or inferred.
+
+---
+
 ## Summary of required schema changes
 
 | # | Change | Class | MVP? |
@@ -207,13 +361,16 @@ A producer that places any of these in its signed body has that field ignored an
 | 8 | MVP `event` payloads: `decisions[]`/`invocations[]`/effect outcome (signed `(action, resource_type)`) | ADD | yes |
 | 9 | Full token context (`validation_at_decision`, `token_claims[]`, credential metadata) | ADD | later |
 | 10 | Lifecycle/identity/approval/signal event kinds (21 more) | ADD | later |
-| 11 | Capability mapping (policy-store data; `capability_id` is Lock-derived, not a record field) | ADD / LOCK-DERIVED | later |
+| 11 | Capability resolution (policy-store mapping; `capability_id` Lock-derived, resolution MVP-required) | ADD / LOCK-DERIVED | yes |
 | 12 | Producer Key Registry entry + Producer-Key Authorization Statement schemas | ADD (out-of-band) | yes |
 | 13 | Receipt-commitment profile | ADD (Lock-side) | yes |
+| 14 | Capability resolution (every MVP decision/invocation record) | LOCK-DERIVED | **yes** |
+| 15 | Analytics enrichment: token (`claims_at_decision` vs `current_token_state`), `session_correlation`, `actor_context`, versioned org/resource/capability reference data, four region dimensions, attribution quality, per-invocation projection | LOCK-DERIVED | yes (full depth phased) |
+| 16 | GovOps metrics with explicit per-family denominators (authorization / invocation / observed-effect) | LOCK-DERIVED | yes |
 
 ## References
 
-- `design.md` — authoritative field semantics, event-kind schemas, and Alignment with TRACE v0.2.
+- `design.md` — authoritative field semantics, event-kind schemas, Lock-derived enrichment and assessment-store layout, GovOps analytics/metrics, and Alignment with TRACE v0.2.
 - `Lock-Server-TRACE-MVP-Design.md` — the MVP wire shape and required/deferred boundary.
 - `jans-trace-core-mvp-design.md` — signing scope, canonicalization, and the receipt-commitment profile.
 - `research/trace-spec.txt` — the base TRACE v0.2 Trust Record schema this profile extends.
@@ -272,7 +429,11 @@ The same decision as a GovOps record: claims nested under `trace`, an `event_kin
         { "action": "Acme::Action::\"Pay\"", "resource_type": "Acme::Payment", "outcome": "ALLOW" }
       ],
       "tokens": [
-        { "issuer": "https://accounts.example.org", "token_type": "access_token", "jti": "9c9f2e77-..." }
+        { "issuer": "https://accounts.example.org", "token_type": "access_token", "jti": "9c9f2e77-..." },
+        { "issuer": "https://accounts.example.org", "token_type": "id_token", "jti": "a1b2c3d4-..." },
+        { "issuer": "https://accounts.example.org", "token_type": "transaction_token", "jti": "7e5f0a21-..." },
+        { "issuer": "https://workload-ca.example.org", "token_type": "workload_credential", "fingerprint": "sha256:cert-..." },
+        { "issuer": "https://attestation.example.org", "token_type": "attestation_token", "jti": "c0ffee11-..." }
       ]
     },
     "policy": {
@@ -331,15 +492,81 @@ Everything Lock computes lives in the Stored Record Envelope's `verification`/`i
   },
   "capability_resolution": {
     "capability_ids": ["invoke:payment-authorization"],
+    "resolution_status": "resolved",
     "policy_store_id": "https://example.org/policy-stores/payments",
     "policy_store_version": "1.2.3",
     "mapping_version": "3",
     "resolved_at": "2026-06-11T00:41:02.123Z"
+  },
+  "token_enrichment": [
+    {
+      "issuer": "https://accounts.example.org",
+      "jti": "9c9f2e77-...",
+      "token_type": "access_token",
+      "claims_at_decision": {
+        "resolved_from": "producer_signed",
+        "resolved_at": "2026-06-11T00:41:02.000Z",
+        "claims": { "sub": "sha256:user-...", "sid": "sess-7f3a...", "client_id": "planner-app", "azp": "planner-app", "scope": "payments.write", "act": { "sub": "spiffe://example.org/agent/planner" } }
+      },
+      "current_token_state": {
+        "resolved_from": "auth_server_lookup",
+        "resolved_at": "2026-06-11T00:41:05.400Z",
+        "claims": { "sub": "sha256:user-...", "sid": "sess-7f3a...", "client_id": "planner-app", "aud": "payments-api", "scope": "payments.write", "iat": 1781138500, "exp": 1781142100, "cnf": { "jkt": "sha256:..." }, "may_act": { "sub": "spiffe://example.org/agent/planner" } }
+      }
+    }
+  ],
+  "session_correlation": {
+    "sid": "sess-7f3a...",
+    "session_issuer": "https://accounts.example.org",
+    "authentication_event_ref": "R-authn-event-88",
+    "authentication_strength": "phishing_resistant_mfa",
+    "fido_ceremony_ref": "R-fido-ceremony-88",
+    "authenticated_human_ref": "sha256:user-...",
+    "resolved_via": "jti->sid->session->authn_event->fido_ceremony",
+    "resolved_at": "2026-06-11T00:41:05.600Z"
+  },
+  "actor_classification": {
+    "actor_context": "human_delegated_to_workload",
+    "evidence": ["token.act", "token.may_act", "session_correlation", "fido_ceremony_ref"],
+    "attribution_quality": "correlated"
+  },
+  "org_resolution": {
+    "mapping_version": "org-2026-05",
+    "resolved_at": "2026-06-11T00:41:05.700Z",
+    "sub_ref": { "business_unit": "retail-payments", "team": "payments-core" },
+    "client_id": { "app": "planner-app", "owner": "sha256:owner-..." },
+    "workload_id": { "app": "planner", "team": "automation", "business_unit": "retail-payments" }
+  },
+  "region_resolution": {
+    "human_region": { "value": "eu-west-1", "source": "authn_event_geo", "confidence": "high" },
+    "workload_region": { "value": "eu-west-1", "source": "workload_attestation", "confidence": "high" },
+    "enforcement_region": { "value": "eu-west-1", "source": "pep_registry", "confidence": "high" },
+    "target_region": { "value": "eu-west-1", "source": "resource_classification", "confidence": "medium" }
+  },
+  "target_resource_classification": {
+    "resource_ref": "sha256:resource-...",
+    "resource_domain": "payments",
+    "resource_owner": "sha256:owner-...",
+    "business_unit": "retail-payments",
+    "data_classification": "confidential",
+    "deployment_region": "eu-west-1",
+    "criticality": "high"
+  },
+  "capability_catalog_resolution": {
+    "capability_id": "invoke:payment-authorization",
+    "business_owner": "sha256:owner-...",
+    "business_function": "payment-authorization",
+    "risk_tier": "high",
+    "data_sensitivity": "confidential",
+    "regulated_scope": ["PCI-DSS"],
+    "allowed_regions": ["eu-west-1"],
+    "expected_producer_roles": ["pdp", "payments-enforcement-point"],
+    "lifecycle_status": "active"
   }
 }
 ```
 
-This is the point of §9 and §12: `capability_id`, `trust_tier`, the admission results, and the receipt metadata are all **here**, not in the producer's signed record. A producer that tried to sign any of them would have the field ignored and the attempt flagged.
+This is the point of §9 and §12: `capability_id`, `trust_tier`, the admission results, the receipt metadata, **and every §13 enrichment** are all **here**, not in the producer's signed record. The token enrichment keeps both the producer-signed `claims_at_decision` and the later Lock-resolved `current_token_state` with their own provenance and timestamps (§13.1); the `sid` resolved from the token joins the action back through the session to the FIDO ceremony (§13.2); `actor_context` is *derived* from that evidence, not asserted by the workload (§13.3); organization, region, resource, and capability meaning come from versioned reference data (§13.4–§13.6); and each correlation carries an attribution quality (§13.8). A producer that tried to sign any of them would have the field ignored and the attempt flagged.
 
 ### D. The paired `CAPABILITY_INVOKED` (enforcement-point separation)
 
@@ -378,3 +605,28 @@ The enforcement point — a **different producer** with its own key and chain, e
 ```
 
 The decision (`cedarling-fleet-1`) and the invocation (`payments-gateway`) are **separate producers with separate keys**, correlated by the shared `trace_execution_id` and linked by the `authorized` edge — the enforcement-point separation of §8. Lock resolves `capability_id` for *both* records from their signed `(action, resource_type)` and can compare them across the edge; neither record carries a producer-signed `capability_id`.
+
+### E. The Lock-derived analytics projection and the GovOps view
+
+From the enrichment in C, Lock materializes the flat per-invocation projection (§13.9) for the `CAPABILITY_INVOKED` of D — the row GovOps queries actually aggregate:
+
+```json
+{
+  "capability_id": "invoke:payment-authorization",
+  "invoked_at": "2026-06-11T00:41:03.004Z",
+  "actor_context": "human_delegated_to_workload",
+  "human_subject_ref": "sha256:user-...",
+  "workload_id": "spiffe://example.org/agent/planner",
+  "business_unit": "retail-payments",
+  "workload_region": "eu-west-1",
+  "target_region": "eu-west-1",
+  "resource_data_class": "confidential",
+  "authentication_strength": "phishing_resistant_mfa",
+  "attribution_quality": "correlated"
+}
+```
+
+The classification here is the one **effective at `invoked_at`** (`org-2026-05`, catalog `active`), per §13.7 — if `retail-payments` is later reorganized, this invocation still counts under `retail-payments` for any period before the move. A separate, explicitly-labelled "current org" view may re-resolve it under today's structure.
+
+Reading this through §14: this one invocation contributes to the **invocation** denominator (not authorization), lands in the `human_delegated_to_workload` share (metric 2), the `retail-payments` BU and `eu-west-1` region cuts (metric 4), and — because catalog `risk_tier` is `high` and the authentication was `phishing_resistant_mfa` — it does **not** count toward "high-risk without strong auth" (metric 7). Its `attribution_quality` of `correlated` means it survives a `verified`/`correlated` quality cut. The paired decision in B is counted only in authorization metrics; the two are never blended into one ratio.
+
