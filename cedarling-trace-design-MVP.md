@@ -14,7 +14,7 @@ Scope of this document:
 - The one hard MVP constraint that differs from the full design: `trace_execution_id` is **required at ingestion** — there is no unattributed-evidence path in the MVP.
 - What is explicitly deferred to the post-MVP phases (token enrichment, operation binding, trust tiers, the authorization-statement artifact).
 
-Non-goals: this document does not redefine the TRACE record model or the Lock ingestion pipeline (owned by `.kiro/specs/lock-server-trace-records/design.md`, profiled by `Lock-Server-TRACE-MVP-Design.md`), and it does not restate the full Cedarling producer design (owned by `cedarling-trace-design.md`).
+Non-goals: this document does not redefine the TRACE record model or the Lock ingestion pipeline (owned by `design.md`, profiled by `Lock-Server-TRACE-MVP-Design.md`), and it does not restate the full Cedarling producer design (owned by `cedarling-trace-design.md`).
 
 ## 2. MVP scope check: what the MVP needs from Cedarling
 
@@ -123,5 +123,5 @@ Each step is additive over the same signed-record foundation and leaves the Ceda
 
 - `Lock-Server-TRACE-MVP-Design.md` — the Lock Server MVP profile: three-kind event catalog, required `(execution_authority, trace_execution_id)` at ingestion (no unattributed-evidence path), `AUTHORIZATION_DECISION` minimum event data, administrative key provisioning with `authorized_event_kinds`, producer-chain rules, and the deferred token-enrichment / operation-binding / settlement / trust-tier features.
 - `cedarling-trace-design.md` — the full Cedarling producer design this MVP subsets (token enrichment, operation binding, Producer-Key Authorization Statement, phased adoption).
-- `.kiro/specs/lock-server-trace-records/design.md` — the full TRACE design (record model, `AUTHORIZATION_DECISION` schema, correlation and propagation model).
+- `design.md` — the full TRACE design (record model, `AUTHORIZATION_DECISION` schema, correlation and propagation model).
 - `research/cedarling_docs.txt` — Cedarling authorization interfaces, decision logs, Lock integration, bootstrap properties, JWT validation.

@@ -360,7 +360,7 @@ None is a global event clock.
 For every accepted record, Lock atomically assigns:
 
 - `receipt_sequence`: monotonically increasing within the evidence domain's Lock receipt chain;
-- `received_at`: Lock's receipt timestamp; and
+- `received_at`: Lock's receipt timestamp — an RFC 3339 UTC timestamp normalized to `Z` with **millisecond precision** (e.g. `2026-06-11T00:41:02.123Z`), matching the receipt-commitment profile (`jans-trace-core` §7.1). Because `received_at` is part of the receipt-hash input, a value stored or displayed without millisecond precision would not reproduce the receipt hash; the stored value and any example MUST carry milliseconds; and
 - `prev_receipt_hash`: hash of the preceding receipt entry.
 
 The receipt-entry hash MUST bind at least:
@@ -383,13 +383,13 @@ Lock stores three clearly separated parts:
     "signature_valid": true,
     "key_id": "cedarling-fleet-1-2026-01",
     "key_thumbprint": "sha256:...",
-    "verified_at": "2026-06-11T00:41:02Z",
+    "verified_at": "2026-06-11T00:41:02.123Z",
     "algorithm": "Ed25519",
     "key_authorized": true
   },
   "ingestion": {
     "receipt_sequence": 108422,
-    "received_at": "2026-06-11T00:41:02Z",
+    "received_at": "2026-06-11T00:41:02.123Z",
     "prev_receipt_hash": "sha256:...",
     "coverage_gap_flag": false,
     "chain_link_failure_flag": false,

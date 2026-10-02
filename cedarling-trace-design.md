@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document specifies how the **Cedarling** — the embeddable, Rust-based Cedar Policy Decision Point (PDP) — participates as a **TRACE producer** for the Lock Server TRACE evidence system defined in `.kiro/specs/lock-server-trace-records/`.
+This document specifies how the **Cedarling** — the embeddable, Rust-based Cedar Policy Decision Point (PDP) — participates as a **TRACE producer** for the Lock Server TRACE evidence system defined in `the Lock Server TRACE design (`design.md`) at `.
 
 The TRACE design (`design.md`) treats Cedarling as the canonical source of `AUTHORIZATION_DECISION` records: "Cedarling records authorization decisions." Today Cedarling already emits a `Decision` log for every `authorize_*` call and can ship those logs to the Lock Server `/audit` endpoint. That existing decision log is **operational telemetry** — it is not a signed, sequenced, correlatable TRACE record. This document describes the gap between what Cedarling emits now and what the TRACE spec requires, and specifies the additions needed to close it.
 
@@ -238,7 +238,7 @@ Each phase is additive over the same signed-record foundation and none requires 
 
 ## References
 
-- Target spec: `.kiro/specs/lock-server-trace-records/design.md` (TRACE record model, `AUTHORIZATION_DECISION` schema, settlement, evidence graph).
+- Target spec: `design.md` (TRACE record model, `AUTHORIZATION_DECISION` schema, settlement, evidence graph).
 - `research/cedarling_docs.txt` — Cedarling authorization interfaces, decision logs, Lock Server integration, bootstrap properties, JWT validation.
 - `research/lock-docs.txt` — Lock Server audit endpoints, OAuth scopes, decision-log schema.
 - `research/trace-standard.txt` — TRACE registry, anchor format, signed-record/checkpoint model.

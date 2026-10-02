@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document specifies how the **Janssen FIDO2 Server** participates as a **TRACE producer** for the Lock Server TRACE evidence system defined in `.kiro/specs/lock-server-trace-records/`. It is the companion to `cedarling-trace-design.md` and follows the same structure: what the component produces today, where that falls short of a signed TRACE record, the additions required, and a phased adoption path.
+This document specifies how the **Janssen FIDO2 Server** participates as a **TRACE producer** for the Lock Server TRACE evidence system defined in the Lock Server TRACE design (`design.md`). It is the companion to `cedarling-trace-design.md` and follows the same structure: what the component produces today, where that falls short of a signed TRACE record, the additions required, and a phased adoption path.
 
 In the TRACE architecture, the FIDO Server is one of the two **Human Authentication Producers** (alongside the Jans Auth Server). The target design states plainly: "Auth Server and FIDO Server record authentication events." The FIDO Server's specific contribution is the **`FIDO_CEREMONY`** record — signed evidence that a WebAuthn registration or assertion ceremony resolved, and how. This is distinct from the Auth Server's `AUTHENTICATION_EVENT`: a FIDO ceremony is a lower-level, cryptographic event (an authenticator produced or verified an assertion) that a higher-level authentication flow may build on.
 
@@ -176,7 +176,7 @@ Each phase is additive over the same signed-record foundation and none changes W
 
 ## References
 
-- Target spec: `.kiro/specs/lock-server-trace-records/design.md` (TRACE record model, `FIDO_CEREMONY` and `AUTHENTICATION_EVENT` schemas, Human Authentication Producers, unattributed evidence, settlement).
+- Target spec: `design.md` (TRACE record model, `FIDO_CEREMONY` and `AUTHENTICATION_EVENT` schemas, Human Authentication Producers, unattributed evidence, settlement).
 - Companion: `cedarling-trace-design.md` (the Cedarling `AUTHORIZATION_DECISION` producer design this document parallels).
 - `research/fido-docs.txt` — FIDO2 server architecture, ceremony outcomes (incl. `ABANDONED`), passkey telemetry entry fields (`sessionId`, `deviceInfo`, `nodeId`), trust diagnostics, attestation modes, MDS.
 - `research/jans-fido-code.txt` — FIDO2 server packaging: attestation/assertion persistence branches (`fido2_register`, `fido2_auth`), config/secret backends, node/cluster deployment.

@@ -16,7 +16,7 @@ Scope of this document:
 - Why it has no fallback MVP role (no token-minting / correlation-propagation, unlike the Auth Server).
 - The one indirect touchpoint (a FIDO `session_id`, if later carried), and what is deferred to the post-MVP phases.
 
-Non-goals: this document does not redefine the TRACE record model or the Lock ingestion pipeline (owned by `.kiro/specs/lock-server-trace-records/design.md` and profiled by `Lock-Server-TRACE-MVP-Design.md`), and it does not restate the full FIDO producer design (owned by `fido-trace-design.md`).
+Non-goals: this document does not redefine the TRACE record model or the Lock ingestion pipeline (owned by `design.md` and profiled by `Lock-Server-TRACE-MVP-Design.md`), and it does not restate the full FIDO producer design (owned by `fido-trace-design.md`).
 
 ## 2. MVP scope check: what the MVP needs from the FIDO Server
 
@@ -86,5 +86,5 @@ Each step is additive over the same signed-record foundation and leaves WebAuthn
 - `Lock-Server-TRACE-MVP-Design.md` — the Lock Server MVP profile: three-kind event catalog (with authentication/FIDO events explicitly deferred), required `trace_execution_id` at ingestion with no unattributed-evidence path, and the deferred session index.
 - `fido-trace-design.md` — the full FIDO Server producer design this MVP subsets (`FIDO_CEREMONY`, producer key/chain/genesis, abandonment-sweep emission, phased adoption).
 - `auth-server-trace-design-MVP.md` — the Auth Server MVP companion, which (unlike this one) retains a small correlation-stamping role because the Auth Server mints tokens.
-- `.kiro/specs/lock-server-trace-records/design.md` — the full TRACE design (record model, `FIDO_CEREMONY` schema, correlation and unattributed-evidence model).
+- `design.md` — the full TRACE design (record model, `FIDO_CEREMONY` schema, correlation and unattributed-evidence model).
 - `research/fido-docs.txt` — FIDO2 server architecture, ceremony outcomes (incl. `ABANDONED`), passkey telemetry, trust diagnostics.

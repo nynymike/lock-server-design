@@ -16,7 +16,7 @@ Scope of this document:
 - The one MVP-relevant capability: carrying `(execution_authority, trace_execution_id)` in issued token claims so downstream producers can satisfy the MVP's required correlation fields.
 - What is explicitly deferred to the post-MVP phases (and lives in the full `auth-server-trace-design.md`).
 
-Non-goals: this document does not redefine the TRACE record model or the Lock ingestion pipeline (owned by `.kiro/specs/lock-server-trace-records/design.md` and profiled by `Lock-Server-TRACE-MVP-Design.md`), and it does not restate the full Auth Server producer design (owned by `auth-server-trace-design.md`).
+Non-goals: this document does not redefine the TRACE record model or the Lock ingestion pipeline (owned by `design.md` and profiled by `Lock-Server-TRACE-MVP-Design.md`), and it does not restate the full Auth Server producer design (owned by `auth-server-trace-design.md`).
 
 ## 2. MVP scope check: what the MVP needs from the Auth Server
 
@@ -110,5 +110,5 @@ Each step is additive over the same signed-record foundation and leaves the auth
 
 - `Lock-Server-TRACE-MVP-Design.md` — the Lock Server MVP profile: three-kind event catalog, required `(execution_authority, trace_execution_id)` at ingestion, canonical propagation wire profile (header / baggage / token-claim carriers), execution-initiator rule, and the explicit deferral of authentication/lifecycle/backfill events.
 - `auth-server-trace-design.md` — the full Auth Server producer design this MVP subsets (`AUTHENTICATION_EVENT`, token-exchange bootstrap `EXECUTION_STARTED`, producer key/chain/genesis, phased adoption).
-- `.kiro/specs/lock-server-trace-records/design.md` — the full TRACE design (record model, event-kind schemas, correlation and propagation model).
+- `design.md` — the full TRACE design (record model, event-kind schemas, correlation and propagation model).
 - `research/jans-auth-server-docs.txt` — Auth Server audit logging (`enabledOAuthAuditLogging`), Update Token interception script (`updateTokenScriptDns`), RFC 8693 token exchange, ACR/AMR, sessions, DPoP.

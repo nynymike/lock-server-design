@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document specifies how the **Janssen Auth Server** (the OpenID Provider) participates as a **TRACE producer** for the Lock Server TRACE evidence system defined in `.kiro/specs/lock-server-trace-records/`. It is the companion to `cedarling-trace-design.md` and `fido-trace-design.md` and follows the same structure: what the component produces today, where that falls short of a signed TRACE record, the additions required, and a phased adoption path.
+This document specifies how the **Janssen Auth Server** (the OpenID Provider) participates as a **TRACE producer** for the Lock Server TRACE evidence system defined in the Lock Server TRACE design (`design.md`). It is the companion to `cedarling-trace-design.md` and `fido-trace-design.md` and follows the same structure: what the component produces today, where that falls short of a signed TRACE record, the additions required, and a phased adoption path.
 
 In the TRACE architecture the Auth Server is the second **Human Authentication Producer** and, uniquely, the **owner of the human authentication session** — the target design labels it "Jans Auth Server / OP / session_id owner." Its primary TRACE contribution is the **`AUTHENTICATION_EVENT`** record: signed evidence that a human authentication resolved, by what method, at what assurance. Because it also mints tokens and can perform token exchange, the Auth Server is additionally the natural producer of the **token-exchange bootstrap** form of `EXECUTION_STARTED`, which anchors a governed execution to the exact credential that originated it.
 
@@ -189,7 +189,7 @@ Each phase is additive over the same signed-record foundation and none changes t
 
 ## References
 
-- Target spec: `.kiro/specs/lock-server-trace-records/design.md` (TRACE record model, `AUTHENTICATION_EVENT` schema, token-exchange bootstrap `EXECUTION_STARTED`, Human Authentication Producers, `trace_execution_id` propagation, unattributed evidence, settlement).
+- Target spec: `design.md` (TRACE record model, `AUTHENTICATION_EVENT` schema, token-exchange bootstrap `EXECUTION_STARTED`, Human Authentication Producers, `trace_execution_id` propagation, unattributed evidence, settlement).
 - Companions: `cedarling-trace-design.md` (the `AUTHORIZATION_DECISION` producer) and `fido-trace-design.md` (the `FIDO_CEREMONY` producer) this document parallels.
 - `research/jans-auth-server-docs.txt` — Auth Server audit events (`SESSION_AUTHENTICATED`, `USER_AUTHORIZATION`, `TOKEN_REQUEST`, …), ACR/AMR handling, sessions, interception scripts, token exchange (RFC 8693), DPoP.
 - `research/lock-docs.txt` — Lock Server audit endpoints, OAuth scopes.
