@@ -241,4 +241,4 @@ Each phase is additive over the same signed-record foundation and none requires 
 - Target spec: `design.md` (TRACE record model, `AUTHORIZATION_DECISION` schema, settlement, evidence graph).
 - `research/cedarling_docs.txt` — Cedarling authorization interfaces, decision logs, Lock Server integration, bootstrap properties, JWT validation.
 - `research/lock-docs.txt` — Lock Server audit endpoints, OAuth scopes, decision-log schema.
-- `research/trace-standard.txt` — TRACE registry, anchor format, signed-record/checkpoint model.
+- `research/trace-spec.txt` — the TRACE standard (tracked at **v0.2**): Trust Record schema, registry/anchor format (`registry-anchor-v1`), RFC 8785/Ed25519 signing, SCITT anchoring, RATS appraisal. Lock emits a distinct Jans profile that extends v0.2 — see `design.md`: Alignment with TRACE v0.2.

@@ -193,4 +193,4 @@ Each phase is additive over the same signed-record foundation and none changes t
 - Companions: `cedarling-trace-design.md` (the `AUTHORIZATION_DECISION` producer) and `fido-trace-design.md` (the `FIDO_CEREMONY` producer) this document parallels.
 - `research/jans-auth-server-docs.txt` — Auth Server audit events (`SESSION_AUTHENTICATED`, `USER_AUTHORIZATION`, `TOKEN_REQUEST`, …), ACR/AMR handling, sessions, interception scripts, token exchange (RFC 8693), DPoP.
 - `research/lock-docs.txt` — Lock Server audit endpoints, OAuth scopes.
-- `research/trace-standard.txt` — TRACE registry, anchor format, signed-record/checkpoint model.
+- `research/trace-spec.txt` — the TRACE standard (tracked at **v0.2**): Trust Record schema, registry/anchor format (`registry-anchor-v1`), RFC 8785/Ed25519 signing, SCITT anchoring, RATS appraisal. Lock emits a distinct Jans profile that extends v0.2 — see `design.md`: Alignment with TRACE v0.2.
