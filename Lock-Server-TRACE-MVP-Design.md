@@ -67,7 +67,8 @@ The MVP does not implement:
 - cross-domain correlation or import;
 - privacy-preserving trust-boundary profiles;
 - signed receipt checkpoints or external transparency anchoring;
-- Evidence Packet export; or
+- Evidence Packet export;
+- Lock emitting TRACE records for access to **its own** endpoints (Lock-as-PEP self-emission — Lock embeds Cedarling, so it *could* be a producer, but self-reference/recursion and settlement-key-vs-producer-key hygiene must be resolved first; see `design.md`: Lock as a TRACE producer for its own endpoints); or
 - graph traversal beyond direct execution membership.
 
 The MVP also defers the AIMS/WIMSE identity and lifecycle features the full design specifies:

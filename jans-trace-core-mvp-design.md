@@ -6,7 +6,7 @@
 
 The library is shared infrastructure, not a Lock Server or Cedarling subsystem:
 
-- **Cedarling and other producers** use it to sign TRACE assertions.
+- **Cedarling and other producers** use it to sign TRACE assertions. This includes an **application that embeds Cedarling and enforces its own decisions**: because the crate is a shared library and not a Cedarling subsystem, that application uses it **directly** to build and sign its own `CAPABILITY_INVOKED` as a *second* producer — with its own key, `producer_id`, and chain, distinct from the embedded Cedarling's — rather than asking Cedarling to sign the invocation (which would mix the PDP's and PEP's keys; see `cedarling-trace-design.md`: Embedded enforcement).
 - **Lock Server** uses it to verify assertions, compute content digests, and construct receipt-chain hashes.
 - **Independent tools** use it to reproduce the same results without trusting Lock.
 

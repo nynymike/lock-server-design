@@ -140,6 +140,23 @@ A few granularity and correlation questions that the `AUTHORIZATION_DECISION` sc
 
 Cedarling produces the **decision** half of the GovOps pairing; it never produces the `CAPABILITY_INVOKED`. The TRACE spec is emphatic that the enforcement-point record must be signed by the enforcement point's own key, not the agent's or the PDP's. Cedarling's role ends at the signed `AUTHORIZATION_DECISION`; the enforcement point links back to it via `parent_record_ids` (`relationship_type: "authorized"`).
 
+### Embedded enforcement: who signs `CAPABILITY_INVOKED`
+
+The rule above is unambiguous when the PEP and Cedarling are separate processes (an API gateway enforces; a Cedarling sidecar decides). The **common Cedarling deployment is embedded**: an application links Cedarling as a library and enforces the decision itself, so the PDP and the PEP live in one process. That does not change the rule — it just means **two logically distinct TRACE producers share an OS process**:
+
+- the **PDP** (Cedarling) signs `AUTHORIZATION_DECISION` with Cedarling's producer key, under Cedarling's `producer_id`/chain, scoped `authorized_event_kinds: ["AUTHORIZATION_DECISION"]`; and
+- the **PEP** (the embedding application) signs `CAPABILITY_INVOKED` with the **application's own** producer key, under the application's own `producer_id`/chain, scoped `authorized_event_kinds: ["CAPABILITY_INVOKED"]`.
+
+Co-location in one process is permitted; **key separation is mandatory**. "Signed by the enforcement point's own key, not the PDP's" means *not Cedarling's key* even when Cedarling is in the same binary — the two records are signed by two different registered producer keys. This is the whole reason **Cedarling exposes no "sign my invocation" API**: such an API would put the PDP's and the PEP's signing in one component (and tempt a single shared key), collapsing the two-producer separation into a self-attestation and **weakening the evidence** — a reader could no longer distinguish "the decider decided" from "the enforcer enforced." Instead the embedding application builds and signs its own `CAPABILITY_INVOKED` using **`jans-trace-core` directly** (the shared signing/chain library every producer uses — it is not a Cedarling subsystem), as a second producer alongside Cedarling.
+
+**The `authorized` edge is derivable here (the one exception).** Because the embedding application made the `authorize_*` call in-process, it already holds the decision's `{producer_id, record_id}` (Cedarling returns them alongside the `AuthorizeResult`). So the embedded PEP *can* populate the cross-producer `parent_record_ids` edge (`relationship_type: "authorized"`) from the decision to its invocation without any host-supplied reference — the exception to the general rule (see One decision, one record) that Cedarling cannot learn another producer's `record_id`. Here the PEP and PDP share the process, so the reference is simply in hand.
+
+**Assurance of the co-located case.** Co-located PEP and PDP are the same party operationally, so this posture is adjacent to the recorder/actor-co-location the design's trust-tier rules already treat as lower-assurance (see `design.md`: Evidence Origin and Trust Tier). It is allowed and is still materially stronger than an agent self-report — two distinct registered keys, two attributable records, a provable `authorized` edge — but a deployment that wants the strongest enforcement assurance separates the PEP (gateway/sidecar) from the PDP. Lock classifies on key custody and collection path as usual; embedded enforcement is a legitimate but not-maximal posture, not silently equal to a separated PEP.
+
+**No enforcement point ⇒ no `CAPABILITY_INVOKED`.** If an embedding application calls `authorize` but does **not** mediate the action through an enforcement step, there is no PEP and therefore no `CAPABILITY_INVOKED` — only the `AUTHORIZATION_DECISION` exists, and Lock's completeness profiles surface the absent invocation as `expected_evidence_missing` (see `design.md`: Evidence Completeness Expectations). "Embedded" never means "the decision implies enforcement"; an invocation record exists only when something actually mediated the action and signed for it.
+
+**Lock itself is such an application.** Lock protects its own endpoints with an embedded Cedarling, so Lock-as-PEP is this same embedded case with Lock as the application. Whether Lock emits TRACE records for access to its *own* endpoints is treated separately (it carries extra hazards — self-reference and key hygiene) and is out of scope for the MVP; see `design.md`: Lock as a TRACE producer for its own endpoints.
+
 ### Signature
 
 The signature is `base64url(Ed25519 over RFC 8785 JCS bytes of all fields except signature)`. Cedarling must:
