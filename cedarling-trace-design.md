@@ -23,7 +23,7 @@ Non-goals: this document does not redefine the TRACE record model, the Lock inge
 
 **Lock Server** (see `research/lock-docs.txt`) is the Policy Retrieval Point and audit collector. Cedarling already registers with it via SSA→DCR, obtains the `https://jans.io/oauth/lock/log.write` scope, and periodically POSTs decision logs to `/audit`. That path is governed by the `CEDARLING_LOCK_*` bootstrap properties (`cedarling-lock-server.md`, `cedarling-properties.md`).
 
-The TRACE spec sits **on top of** that audit relationship. It reuses the same OAuth-protected transport and the same `pdp_id`/`policy_store` vocabulary, but it demands that the payload be a **signed, immutable, sequenced TRACE record** — not a best-effort log line. The TRACE `AUTHORIZATION_DECISION` example in `design.md` (the `"producer": "cedarling-fleet-1/1.0.0"` record) is precisely the target artifact this document tells Cedarling how to produce.
+The TRACE spec sits **on top of** that audit relationship. It reuses the same OAuth-protected transport and the same `pdp_id`/`policy_store` vocabulary, but it demands that the payload be a **signed, immutable, sequenced TRACE record** — not a best-effort log line. The TRACE `AUTHORIZATION_DECISION` example in `design.md` (the `"producer": "cedarling-fleet-1"` record) is precisely the target artifact this document tells Cedarling how to produce.
 
 ## Gap analysis: decision log vs. TRACE `AUTHORIZATION_DECISION`
 

@@ -557,7 +557,8 @@ Shape follows the TRACE standard's Trust Record structure (TRACE **v0.2**; see A
 
 ```json
 {
-  "producer": "cedarling-fleet-1/1.0.0",
+  "producer": "cedarling-fleet-1",
+  "producer_version": "cedarling 1.0.0",
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
   "trace": {
     "eat_profile": "tag:jans.io,2026:trace-v1",
@@ -623,7 +624,7 @@ Shape follows the TRACE standard's Trust Record structure (TRACE **v0.2**; see A
     "measurement_point": "cedarling-pdp-in-process"
   },
   "producer_chain": {
-    "producer_id": "cedarling-fleet-1/1.0.0",
+    "producer_id": "cedarling-fleet-1",
     "producer_instance_id": "cedarling-001",
     "producer_chain_id": "chain-01JABC9Z0K...",
     "sequence_number": 4821,
@@ -892,7 +893,7 @@ A producer cannot append a `trace_execution_id` to a record it already signed â€
 
 ```json
 {
-  "producer": "cedarling-fleet-1/1.0.0",
+  "producer": "cedarling-fleet-1",
   "record_id": "3b8e0f5b-6d2a-4c39-9c1e-2a8f0a6f1e02",
   "trace": {
     "eat_profile": "tag:jans.io,2026:trace-v1",
@@ -902,23 +903,23 @@ A producer cannot append a `trace_execution_id` to a record it already signed â€
     "execution_authority": "spiffe://example.org/agent/planner",
     "event": {
       "correlates_record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
-      "correlates_producer_id": "cedarling-fleet-1/1.0.0",
+      "correlates_producer_id": "cedarling-fleet-1",
       "confidence": "certain",
       "reason": "execution_id_recovered_from_downstream_token_claim",
       "supporting_evidence_record_ids": [
-        { "producer_id": "cedarling-fleet-1/1.0.0", "record_id": "R-authz-decision-002" }
+        { "producer_id": "cedarling-fleet-1", "record_id": "R-authz-decision-002" }
       ]
     }
   },
   "producer_chain": {
-    "producer_id": "cedarling-fleet-1/1.0.0",
+    "producer_id": "cedarling-fleet-1",
     "producer_instance_id": "cedarling-001",
     "producer_chain_id": "chain-01JABC9Z0K...",
     "sequence_number": 4830,
     "prev_record_hash": "sha256:..."
   },
   "parent_record_ids": [
-    { "producer_id": "cedarling-fleet-1/1.0.0", "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41", "relationship_type": "correlates_with" }
+    { "producer_id": "cedarling-fleet-1", "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41", "relationship_type": "correlates_with" }
   ],
   "signature": "base64url(Ed25519 signature over RFC 8785 JCS bytes of all fields above except 'signature')"
 }
@@ -1491,10 +1492,10 @@ Settlement is surfaced on a retrieved envelope as a **derived `current_settlemen
 ```json
 {
   "assertion": {
-    "producer": "cedarling-fleet-1/1.0.0",
+    "producer": "cedarling-fleet-1",
     "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
     "trace": { "...": "see TRACE Record example above (event_kind, trace_execution_id, subject, event, policy, runtime, etc.)" },
-    "producer_chain": { "producer_id": "cedarling-fleet-1/1.0.0", "producer_instance_id": "cedarling-001", "producer_chain_id": "chain-01JABC9Z0K...", "sequence_number": 4821, "prev_record_hash": "sha256:..." },
+    "producer_chain": { "producer_id": "cedarling-fleet-1", "producer_instance_id": "cedarling-001", "producer_chain_id": "chain-01JABC9Z0K...", "sequence_number": 4821, "prev_record_hash": "sha256:..." },
     "parent_record_ids": [],
     "signature": "base64url(...)"
   },
@@ -1603,7 +1604,7 @@ A producer-signed record that Lock has merely received and signature-checked is 
   "receipt_id": "settle-01JABDCE9K...",
   "evidence_domain_id": "01JANS8YQ...",
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
-  "producer_id": "cedarling-fleet-1/1.0.0",
+  "producer_id": "cedarling-fleet-1",
   "content_digest": "sha256:...",
   "status": "settled",
   "checks": {
@@ -2128,7 +2129,7 @@ The Evidence Completeness Evaluator (Component 7) compares the records actually 
   "evaluated_at": "2026-06-11T02:20:00Z",
   "supersedes": "asmt-complete-01JABCPQ...",
   "present": [
-    { "event_kind": "AUTHORIZATION_DECISION", "producer_role": "pdp", "record_id": "R-authz-decision-002", "producer_id": "cedarling-fleet-1/1.0.0" }
+    { "event_kind": "AUTHORIZATION_DECISION", "producer_role": "pdp", "record_id": "R-authz-decision-002", "producer_id": "cedarling-fleet-1" }
   ],
   "missing": [
     { "event_kind": "CAPABILITY_INVOKED", "producer_role": "enforcement_point", "requirement": "required" }
@@ -2205,7 +2206,7 @@ Lineage coverage is tracked **per producer chain** within an execution â€” one `
   "execution_authority": "spiffe://example.org/agent/planner",
   "chains": [
     {
-      "producer_id": "cedarling-fleet-1/1.0.0",
+      "producer_id": "cedarling-fleet-1",
       "producer_instance_id": "cedarling-001",
       "lineage_start": 4001,
       "lineage_end": 4830,
@@ -2237,7 +2238,7 @@ Lineage coverage is tracked **per producer chain** within an execution â€” one `
   "artifact": "lineage_checkpoint",
   "lineage_checkpoint_id": "lineage-ckpt-01JABDA7C3Q9",
   "evidence_domain_id": "01JANS8YQ...",
-  "producer_id": "cedarling-fleet-1/1.0.0",
+  "producer_id": "cedarling-fleet-1",
   "producer_instance_id": "cedarling-001",
   "trace_execution_id": "exec-01JABCXYZQK8P5N9F2C7R3T4V6",
   "chain_head_hash": "sha256:...",

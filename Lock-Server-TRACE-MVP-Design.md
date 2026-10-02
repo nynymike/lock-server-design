@@ -179,8 +179,9 @@ The following is the MVP wire shape. Fields shown as `null` may be omitted unles
 
 ```json
 {
-  "producer": "cedarling-fleet-1/1.0.0",
-  "kid": "cedarling-fleet-1-2026-01",
+  "producer": "cedarling-fleet-1",
+  "producer_version": "cedarling 1.0.0",
+  "kid": "key-2026-01",
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
   "trace": {
     "eat_profile": "tag:jans.io,2026:trace-v1",
@@ -218,7 +219,7 @@ The following is the MVP wire shape. Fields shown as `null` may be omitted unles
     }
   },
   "producer_chain": {
-    "producer_id": "cedarling-fleet-1/1.0.0",
+    "producer_id": "cedarling-fleet-1",
     "producer_instance_id": "cedarling-001",
     "producer_chain_id": "chain-01JABC9Z0K",
     "sequence_number": 4821,
@@ -226,7 +227,7 @@ The following is the MVP wire shape. Fields shown as `null` may be omitted unles
   },
   "parent_record_ids": [
     {
-      "producer_id": "jans-auth-server/1.0.0",
+      "producer_id": "jans-auth-server",
       "record_id": "R-token-issued-001",
       "relationship_type": "issued_token"
     }
@@ -378,7 +379,7 @@ Lock stores three clearly separated parts:
   "content_digest": "sha256:...",
   "verification": {
     "signature_valid": true,
-    "key_id": "cedarling-fleet-1-2026-01",
+    "key_id": "key-2026-01",
     "key_thumbprint": "sha256:...",
     "verified_at": "2026-06-11T00:41:02.123Z",
     "algorithm": "Ed25519",
@@ -421,7 +422,7 @@ Success response:
 ```json
 {
   "accepted": true,
-  "producer_id": "cedarling-fleet-1/1.0.0",
+  "producer_id": "cedarling-fleet-1",
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
   "content_digest": "sha256:...",
   "receipt_sequence": 108422,
