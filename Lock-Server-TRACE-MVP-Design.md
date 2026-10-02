@@ -37,6 +37,7 @@ The authorization decision and capability invocation should come from different 
 ### Required in the MVP
 
 - OAuth-protected single-record ingestion.
+- OAuth-protected bulk ingestion (`POST /api/v1/audit/trace/bulk`), one producer per batch, with per-record accept/reject — required because a high-throughput producer such as Cedarling cannot scale with one request per record (see §11.2).
 - Per-evidence-domain producer-key registration through an administrative path (configuration or an admin API under a separate scope), never implicitly from a submitted record.
 - Ed25519 signatures selected by signed `kid`.
 - RFC 8785 JSON Canonicalization Scheme (JCS).
