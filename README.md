@@ -21,6 +21,7 @@ This repository is **design documentation only** — there is no implementation 
 | [design.md](design.md) | **The full TRACE design.** The authoritative record model, verification/settlement pipeline, evidence graph, correlation, trust tiers and the per-dimension verification vector, capability resolution, evidence-domain isolation, lineage/anchoring, correctness properties, and alignment with the TRACE standard (v0.2). |
 | [Lock-Server-TRACE-MVP-Design.md](Lock-Server-TRACE-MVP-Design.md) | **The MVP profile** — the smallest useful implementation (a strict subset of the full design): signed single/bulk ingestion, evidence-domain isolation, producer-key registration, the receipt hash chain, correlation, and ingestion-time integrity flagging. |
 | [phased-implementation-plan.md](phased-implementation-plan.md) | How the full design is delivered incrementally. Phase 1 = the MVP; later phases add settlement, completeness/context, and full cross-domain assurance. |
+| [govops-trace-profile.md](govops-trace-profile.md) | The **GovOps schema-change profile** — the record-schema delta the Lock Server deployment requires on top of the base TRACE v0.2 Trust Record (the nested `trace` envelope, the `event_kind` catalog, producer-chain and causal-edge fields, signed capability facts), and what is deliberately *not* a signed-schema change (Lock-derived fields). |
 | [jans-trace-core-mvp-design.md](jans-trace-core-mvp-design.md) | The reusable **`jans-trace-core`** Rust library for the deterministic cryptographic operations (JCS canonicalization, Ed25519 signing/verification, content-digest, receipt-chain hashing) shared by producers, Lock, and independent verifiers. |
 
 ## Producer integrations
@@ -48,6 +49,7 @@ Each TRACE producer signs its own records with its own key. These companion docs
 design.md                          Full TRACE design (authoritative)
 Lock-Server-TRACE-MVP-Design.md    MVP profile (Phase 1)
 phased-implementation-plan.md      Phased delivery plan
+govops-trace-profile.md            GovOps schema-change profile (delta from TRACE v0.2)
 jans-trace-core-mvp-design.md      Shared Rust crypto library design
 cedarling-trace-design*.md         Cedarling producer (full + MVP)
 auth-server-trace-design*.md       Auth Server producer (full + MVP)
