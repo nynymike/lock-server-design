@@ -194,9 +194,10 @@ The following is the MVP wire shape. Fields shown as `null` may be omitted unles
     },
     "event": {
       "outcome": "ALLOW",
-      "capability_ids": [
+      "decisions": [
         {
-          "capability_id": "invoke:payment-authorization",
+          "action": "Acme::Action::\"Pay\"",
+          "resource_type": "Acme::Payment",
           "outcome": "ALLOW"
         }
       ],
@@ -291,13 +292,13 @@ The MVP recognizes only the three event kinds needed for the capability-evidence
 
 | Event kind | Producer | Minimum event data |
 |---|---|---|
-| `AUTHORIZATION_DECISION` | Cedarling or another PDP | `outcome`; non-empty `capability_ids[]`; complete `trace.policy` block; and `trace.runtime.pdp_id`. |
-| `CAPABILITY_INVOKED` | PEP, agent gateway, or tool gateway | non-empty `capability_ids[]`, `enforcement_point_id`, and invocation `outcome`. |
+| `AUTHORIZATION_DECISION` | Cedarling or another PDP | `outcome`; non-empty `decisions[]` (each `{action, resource_type, outcome}` — the signed Cedar action and resource type, no resource id); complete `trace.policy` block; and `trace.runtime.pdp_id`. |
+| `CAPABILITY_INVOKED` | PEP, agent gateway, or tool gateway | non-empty `invocations[]` (each `{action, resource_type}`), `enforcement_point_id`, and invocation `outcome`. |
 | `RUNTIME_EFFECT` | Target system or trusted observer | effect `outcome` (the only hard requirement, matching the full design); normally a `produced_effect` parent edge to the originating invocation, and SHOULD carry a result/target identifier or `result_digest` when available so the effect is useful evidence rather than a bare outcome. |
 
 `AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED` are required for the primary capability-governance flow. `RUNTIME_EFFECT` is optional. Authentication, FIDO, lifecycle, correlation-backfill, delegation, intent, approval, and transition events are deferred to later phases.
 
-These requirements intentionally match the corresponding event-kind schemas in the full design. The MVP narrows the catalog; it does not define weaker versions of the retained event kinds. Where `capability_ids[]` is present (`AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED`), each entry uses the same `{capability_id, outcome}` shape shown in the §7 example — the per-entry `outcome` is that capability's own result and is distinct from any event-level `outcome`. In particular, `RUNTIME_EFFECT` does not repeat `capability_ids[]`; its causal link to the invocation is expressed by `parent_record_ids`.
+These requirements intentionally match the corresponding event-kind schemas in the full design. The MVP narrows the catalog; it does not define weaker versions of the retained event kinds. **Producers sign the capability *facts*, not the governance label.** An `AUTHORIZATION_DECISION` signs `decisions[]` (`{action, resource_type, outcome}`) and a `CAPABILITY_INVOKED` signs `invocations[]` (`{action, resource_type}`) — the concrete Cedar action and resource *type* (never a resource id). The governance label **`capability_id` is Lock-derived in the full design** (resolved from the signed `(action, resource_type)` plus `policy_store_id`/`policy_store_version` against a versioned mapping in the policy store, stored as `capability_resolution` outside the signed assertion — see `.kiro/specs/lock-server-trace-records/design.md`: Capability Resolution). The **MVP defers that resolution and the capability index** (see §13): the MVP records the signed facts so they are forward-compatible, but does not require Lock to resolve `capability_id` or to serve capability-keyed retrieval. `RUNTIME_EFFECT` carries neither `decisions[]` nor `invocations[]`; its causal link to the invocation is expressed by `parent_record_ids`.
 
 Lock MUST validate the schema for the declared `event_kind` and reject fields that contradict that kind. Lock records evidence; it does not infer that an authorization caused an invocation merely because their timestamps are close. Producers express causal relationships with `parent_record_ids`.
 
@@ -483,11 +484,10 @@ The implementation needs only these keys and indexes:
 - primary record key: `(evidence_domain_id, producer_id, record_id)`;
 - execution index: `(evidence_domain_id, execution_authority, trace_execution_id)`;
 - producer-chain position: `(evidence_domain_id, producer_id, producer_instance_id, producer_chain_id, sequence_number)`;
-- capability index: `(evidence_domain_id, capability_id)`;
 - token index: `(evidence_domain_id, issuer, jti-or-fingerprint)`; and
 - receipt-chain position: `(evidence_domain_id, receipt_sequence)`.
 
-Session, workload, transaction, assessment, checkpoint, and graph-traversal indexes may be added in later phases.
+Capability resolution and the capability index (`(evidence_domain_id, capability_id)`), and session, workload, transaction, assessment, checkpoint, and graph-traversal indexes, may be added in later phases. The signed `(action, resource_type)` facts the MVP records make the capability index addable later without re-emitting records.
 
 ## 14. Security requirements
 

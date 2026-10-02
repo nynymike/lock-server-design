@@ -39,7 +39,7 @@ The Auth Server's existing `SESSION_AUTHENTICATED` / `USER_AUTHORIZATION` audit 
 | **Outcome** | Implied by the event type (`SESSION_AUTHENTICATED` vs `SESSION_UNAUTHENTICATED`). | `outcome` (required, `SUCCESS`/`FAILURE`) as an explicit signed field. |
 | **Immutability** | Log files roll and are retained by operational policy; no immutability contract. | The signed `assertion` is byte-immutable; Lock never rewrites it. |
 | **Event kind** | Implicit in the audit event name. | Explicit `trace.event_kind: "AUTHENTICATION_EVENT"` acting as the schema discriminator. |
-| **Not-applicable fields** | N/A. | `capability_ids[]` and `trace.policy` MUST NOT be populated — an authentication event authorizes no capability and evaluates no policy. |
+| **Not-applicable fields** | N/A. | `decisions[]`/`invocations[]` and `trace.policy` MUST NOT be populated — an authentication event authorizes no capability and evaluates no policy; and no `capability_id` is ever producer-signed (it is Lock-derived). |
 
 A defining difference from the FIDO Server: where a `FIDO_CEREMONY` records a single cryptographic ceremony, an `AUTHENTICATION_EVENT` records the **resolution of a whole authentication flow** — which may itself have consumed one or more FIDO ceremonies, a password step, an OTP, etc. The `amr[]` on the `AUTHENTICATION_EVENT` is where those satisfied methods are named, and the FIDO Server's own `FIDO_CEREMONY` records are the lower-level, separately-signed evidence that a passkey step in that `amr[]` actually occurred. The two producers' records correlate on the shared `session_id`; neither substitutes for the other.
 
@@ -107,7 +107,7 @@ Like the other producers, the Auth Server must maintain, per node, an append-onl
 - **`auth_method`** — required, the method/mechanism used (`password`, `otp`, `passkey`, `social`, …), derivable from the `acr` flow that ran.
 - **`acr`** — optional, the *achieved* Authentication Context Class Reference. The Auth Server already resolves an effective `acr` per flow (`acr_values` request param, client `defaultAcrValues`, or the configured default); the TRACE record carries the one actually achieved, not merely requested.
 - **`amr[]`** — optional, the Authentication Methods References actually satisfied. This is where a multi-step flow names each method (and where a `passkey` entry cross-references the FIDO Server's separately-signed `FIDO_CEREMONY` evidence for the same session).
-- **`capability_ids[]` and `trace.policy`** — MUST NOT be populated for this event kind.
+- **`decisions[]`/`invocations[]` and `trace.policy`** — MUST NOT be populated for this event kind (and no `capability_id` is producer-signed anywhere — it is Lock-derived; see `design.md`: Capability Resolution).
 
 ### Signature
 
