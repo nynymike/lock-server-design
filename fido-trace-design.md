@@ -65,7 +65,7 @@ sequenceDiagram
     Note over FIDO,Trace: TRACE path runs after the ceremony resolves
     FIDO->>Trace: build FIDO_CEREMONY from ceremony outcome + session
     Trace->>Trace: canonicalize (JCS) + assign chain seq + sign
-    Trace->>Lock: buffered, periodic POST (log.write scope)
+    Trace->>Lock: buffered, periodic POST (trace.write scope)
     alt accepted
         Lock-->>Trace: 202 + current_settlement (usually submitted, unattributed until correlated)
     else transport failure
@@ -136,7 +136,7 @@ The TRACE spec assigns `trust_tier` from the producer key class and collection p
 | Record assembly | Build the `FIDO_CEREMONY` envelope from the resolved ceremony (type, outcome, attachment, credential hash, session). | Off hot path |
 | Canonicalize + sign | RFC 8785 JCS + Ed25519 over the assertion. | Off hot path |
 | Abandonment emission | Emit `ABANDONED` records from the existing abandonment sweep, not a request thread; skip usernameless-unengaged ceremonies. | Sweep (async) |
-| Transport | Reuse the SSA→DCR + `log.write`-scope audit channel; POST TRACE records (buffered, periodic, retry with backoff). | Off hot path |
+| Transport | Reuse the SSA→DCR audit channel (buffered, periodic, retry with backoff) with the TRACE ingestion scope `trace.write` (not `log.write`, per Lock MVP §11); POST TRACE records. | Off hot path |
 | Session capture | Ensure `session_id`/`session_issuer` are captured and non-empty for emittable ceremonies. | Read at ceremony |
 
 WebAuthn verification, the ceremony response returned to the browser/RP, and the existing metrics/telemetry pipeline are unchanged. TRACE emission runs alongside metrics, not instead of it.
@@ -155,7 +155,7 @@ Following the FIDO Server's existing `fido2*` dynamic-configuration convention, 
 | `fido2TraceIncludeAttestationDetail` | Whether to include optional signed attestation/MDS-trust detail in `trace.event`. | `false` |
 | `fido2TraceEndpoint` | Lock TRACE ingestion endpoint (`/api/v1/audit/trace`); may default to the discovered Lock audit endpoint. | discovered |
 
-TRACE transport reuses the same Lock integration machinery the design assigns to all producers: the SSA→DCR client-credentials flow, a `log.write`-style scope, a buffered channel, and retry with backoff. The FIDO Server needs a new payload and emission path, not a new transport. These are separate from the `fido2Metrics*` telemetry properties — TRACE and metrics coexist.
+TRACE transport reuses the same Lock integration machinery the design assigns to all producers: the SSA→DCR client-credentials flow, a buffered channel, and retry with backoff. It differs in scope — the TRACE ingestion endpoint requires `https://jans.io/oauth/lock/trace.write` (Lock MVP §11), so the FIDO Server requests `trace.write` at DCR, not `log.write`. The FIDO Server needs a new scope, payload, and emission path, not a new transport. These are separate from the `fido2Metrics*` telemetry properties — TRACE and metrics coexist.
 
 ## Phased adoption
 

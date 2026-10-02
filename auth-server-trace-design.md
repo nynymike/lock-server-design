@@ -64,7 +64,7 @@ sequenceDiagram
     Note over AS,Trace: AUTHENTICATION_EVENT emitted after the flow resolves
     AS->>Trace: build AUTHENTICATION_EVENT (outcome, auth_method, acr, amr, session_id)
     Trace->>Trace: canonicalize (JCS) + assign chain seq + sign
-    Trace->>Lock: buffered, periodic POST (log.write scope)
+    Trace->>Lock: buffered, periodic POST (trace.write scope)
 
     User->>AS: token exchange (RFC 8693) presenting a source token
     AS->>AS: mint/settle trace_execution_id, bind to source token
@@ -150,7 +150,7 @@ The TRACE spec assigns `trust_tier` from the producer key class and collection p
 | Token `trace_execution_id` stamping | When an execution context is known, stamp `trace_execution_id` into issued token claims for downstream propagation. | Token issuance |
 | `EXECUTION_STARTED` bootstrap | On RFC 8693 token exchange, emit the bootstrap record (source_token_fingerprint, initial_capability_constraints, exchange_context). | Off hot path |
 | Canonicalize + sign | RFC 8785 JCS + Ed25519 over the assertion. | Off hot path |
-| Transport | Reuse the SSA→DCR + `log.write`-scope audit channel; POST TRACE records (buffered, periodic, retry with backoff). | Off hot path |
+| Transport | Reuse the SSA→DCR audit channel (buffered, periodic, retry with backoff) with the TRACE ingestion scope `trace.write` (not `log.write`, per Lock MVP §11); POST TRACE records. | Off hot path |
 
 The authentication flow, session establishment, token issuance response, and the existing audit-log pipeline are unchanged. TRACE emission runs alongside the audit log, not instead of it.
 
@@ -168,7 +168,7 @@ Following the Auth Server's existing configuration-property convention (e.g. `en
 | `traceEmitTokenExchangeBootstrap` | Whether token exchange emits the bootstrap `EXECUTION_STARTED` record. | `false` |
 | `traceEndpoint` | Lock TRACE ingestion endpoint (`/api/v1/audit/trace`); may default to the discovered Lock audit endpoint. | discovered |
 
-TRACE transport reuses the SSA→DCR client-credentials flow, a `log.write`-style scope, a buffered channel, and retry with backoff — the same machinery the design assigns to all producers. These are separate from `enabledOAuthAuditLogging`; TRACE and the existing audit log coexist.
+TRACE transport reuses the SSA→DCR client-credentials flow, a buffered channel, and retry with backoff — the same machinery the design assigns to all producers — but requests the TRACE ingestion scope `https://jans.io/oauth/lock/trace.write` (Lock MVP §11), not the `log.write` scope the existing audit log uses. These are separate from `enabledOAuthAuditLogging`; TRACE and the existing audit log coexist.
 
 ## Phased adoption
 

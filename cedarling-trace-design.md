@@ -21,7 +21,7 @@ Non-goals: this document does not redefine the TRACE record model, the Lock inge
 - an `AuthorizeResult` (`decision`, `request_id`, Cedar `diagnostics` with the `reason` policy IDs), and
 - a `Decision` log entry (see `cedarling-logs.md`) carrying `pdp_id`, `policystore_id`, `policystore_version`, `principal`, `action`, `resource`, `decision`, `tokens` (jti only), and `decision_time_micro_sec`.
 
-**Lock Server** (see `research/lock-docs.txt`) is the Policy Retrieval Point and audit collector. Cedarling already registers with it via SSA→DCR, obtains the `https://jans.io/oauth/lock/log.write` scope, and periodically POSTs decision logs to `/audit`. That path is governed by the `CEDARLING_LOCK_*` bootstrap properties (`cedarling-lock-server.md`, `cedarling-properties.md`).
+**Lock Server** (see `research/lock-docs.txt`) is the Policy Retrieval Point and audit collector. Cedarling already registers with it via SSA→DCR, obtains the `https://jans.io/oauth/lock/log.write` scope, and periodically POSTs decision logs to `/audit`. That path is governed by the `CEDARLING_LOCK_*` bootstrap properties (`cedarling-lock-server.md`, `cedarling-properties.md`). TRACE reuses that same SSA→DCR transport but targets the Lock TRACE ingestion endpoint, which requires the distinct **`https://jans.io/oauth/lock/trace.write`** scope (Lock MVP §11) — so Cedarling requests `trace.write` (alongside `log.write`) at DCR, not `log.write` alone.
 
 The TRACE spec sits **on top of** that audit relationship. It reuses the same OAuth-protected transport and the same `pdp_id`/`policy_store` vocabulary, but it demands that the payload be a **signed, immutable, sequenced TRACE record** — not a best-effort log line. The TRACE `AUTHORIZATION_DECISION` example in `design.md` (the `"producer": "cedarling-fleet-1"` record) is precisely the target artifact this document tells Cedarling how to produce.
 
@@ -62,7 +62,7 @@ sequenceDiagram
     Note over Ced,Trace: TRACE path runs after the decision is returned
     Ced->>Trace: build AUTHORIZATION_DECISION from inputs + result
     Trace->>Trace: canonicalize (JCS) + assign chain seq + sign
-    Trace->>Lock: buffered, periodic POST (log.write scope)
+    Trace->>Lock: buffered, periodic POST (trace.write scope)
     alt accepted
         Lock-->>Trace: 202 + current_settlement (usually submitted)
     else transport failure
@@ -196,7 +196,7 @@ The TRACE spec assigns `trust_tier` from the producer key class and collection p
 | Bundle hash | Compute `bundle_hash` once per loaded policy store; cache it. | No (on load) |
 | Record assembly | Build the `AUTHORIZATION_DECISION` envelope from existing authorize inputs + decision result + token-validation results. | Off hot path |
 | Canonicalize + sign | RFC 8785 JCS + Ed25519 signature over the assertion. | Off hot path |
-| Transport | Reuse the existing Lock `log.write` audit channel; POST TRACE records to the **bulk endpoint** `/api/v1/audit/trace/bulk` (buffered, periodic, per-record results, retry with backoff). | Off hot path |
+| Transport | Reuse the existing Lock audit transport (SSA→DCR, buffered channel, retry), but with the TRACE ingestion scope `trace.write` (not `log.write`); POST TRACE records to the **bulk endpoint** `/api/v1/audit/trace/bulk` (buffered, periodic, per-record results, retry with backoff). | Off hot path |
 | Correlation propagation | Read `trace_execution_id` / `operation_ids` / session fields from context, token claims, or OTel baggage; never fabricate. | Read at call |
 
 Cedar evaluation, the `AuthorizeResult` contract, and the decision returned to the caller are unchanged.
@@ -216,7 +216,7 @@ Following the existing `CEDARLING_*` naming (`cedarling-properties.md`), TRACE e
 | `CEDARLING_TRACE_EMISSION` | `all` / `configured_capabilities` (optionally with a sampling rate for the rest) — which decisions become TRACE records. | `configured_capabilities` |
 | `CEDARLING_TRACE_ENDPOINT` | Lock TRACE ingestion endpoint; bulk `/api/v1/audit/trace/bulk` by default, may default to the discovered Lock audit endpoint. | discovered |
 
-TRACE transport reuses the Lock integration machinery (`CEDARLING_LOCK_*`): the SSA→DCR flow, the `log.write` scope, the buffered channel (`CEDARLING_LOCK_LOG_CHANNEL_CAPACITY`), and retry (`CEDARLING_LOCK_LOG_MAX_RETRIES`). TRACE does not need a new transport, only a new payload and a distinct emission path.
+TRACE transport reuses the Lock integration machinery (`CEDARLING_LOCK_*`): the SSA→DCR flow, the buffered channel (`CEDARLING_LOCK_LOG_CHANNEL_CAPACITY`), and retry (`CEDARLING_LOCK_LOG_MAX_RETRIES`). It differs in the OAuth scope: the TRACE ingestion endpoint requires `https://jans.io/oauth/lock/trace.write` (Lock MVP §11), so Cedarling requests `trace.write` at DCR rather than relying on `log.write`. TRACE does not need a new transport, only a new scope, a new payload, and a distinct emission path.
 
 ## Phased adoption
 
