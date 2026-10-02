@@ -64,11 +64,13 @@ sequenceDiagram
     Trace->>Trace: canonicalize (JCS) + assign chain seq + sign
     Trace->>Lock: buffered, periodic POST (trace.write scope)
     alt accepted
-        Lock-->>Trace: 202 + current_settlement (usually submitted)
+        Lock-->>Trace: 202 + current_settlement (full design; MVP returns 202 + ingestion flags only)
     else transport failure
         Trace->>Trace: retain in producer buffer, retry w/ backoff
     end
 ```
+
+The `current_settlement` on the acceptance response is a **full-design** feature: Lock runs settlement and returns the record's `current_settlement` view. The **MVP Lock Server runs no settlement** (Lock MVP §3, §16), so under the MVP the `202 Accepted` carries only the receipt/ingestion result (`receipt_sequence`, `content_digest`, and flags such as `coverage_gap_flag`) and no settlement status — see `cedarling-trace-design-MVP.md`.
 
 The decision returned to the caller must never wait on signing or transmission. This mirrors the existing decision-log model, which is already buffered and shipped on `CEDARLING_LOCK_LOG_INTERVAL`.
 

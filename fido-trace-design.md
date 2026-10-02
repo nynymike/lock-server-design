@@ -67,12 +67,14 @@ sequenceDiagram
     Trace->>Trace: canonicalize (JCS) + assign chain seq + sign
     Trace->>Lock: buffered, periodic POST (trace.write scope)
     alt accepted
-        Lock-->>Trace: 202 + current_settlement (usually submitted, unattributed until correlated)
+        Lock-->>Trace: 202 + current_settlement (full design; MVP returns 202 + ingestion flags only)
     else transport failure
         Trace->>Trace: retain in producer buffer, retry w/ backoff
     end
     Note over FIDO,Trace: ABANDONED ceremonies: emitted by the abandonment sweep, not the request path
 ```
+
+The `current_settlement` on the acceptance response is a **full-design** feature; the **MVP Lock Server runs no settlement** (Lock MVP §3, §16), so under the MVP the `202 Accepted` carries only the receipt/ingestion result and flags (e.g. the ceremony stays `unattributed` until correlated), not a settlement status.
 
 The `ABANDONED` case is special: no result is ever posted back, so there is no request to hang emission off. The FIDO Server already detects abandonment asynchronously — a sweep every `abandonedRequestSweepInterval` seconds relabels named-user ceremonies still `pending` past `unfinishedRequestExpiration`. A `FIDO_CEREMONY` record with `ceremony_outcome: "ABANDONED"` is emitted from that same sweep, not from a request thread. Usernameless (conditional-UI) ceremonies that are never engaged are **not** swept (the server cannot tell an untouched autofill prompt from a genuine drop-off), so — consistent with the metrics behavior — they yield no `ABANDONED` TRACE record either.
 
