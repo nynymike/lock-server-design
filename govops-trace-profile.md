@@ -153,8 +153,9 @@ As with the decision kind, a record carries **exactly one** of `invocation` or `
 **`RUNTIME_EFFECT`**
 | Field | Required | Notes |
 |---|---|---|
-| `outcome` | yes | The observed effect outcome. |
-| result/target id or `result_digest` | SHOULD | So the effect is useful evidence, bound to its invocation. |
+| `effect_status` | yes | The five-state discriminator for what actually crossed the effect boundary: `planned` / `dispatched` / `confirmed` / `failed` / `reverted`. Distinct from `outcome` and from the invocation's `SUCCESS`/`FAILURE` — it encodes the may/did split (a dispatched attempt is not a confirmed result). |
+| `outcome` | conditional | Required for every `effect_status` except `planned` (nothing dispatched, nothing to grade); the observed effect outcome. |
+| `result_digest` | conditional / SHOULD | **Required when `effect_status` is `confirmed`** — a `confirmed` effect MUST carry a `result_digest` over the *actually observed* result bytes (the **confirmed-effect invariant**; a `confirmed` record without it is rejected — a bytes-only check Lock enforces even in the MVP). Otherwise SHOULD be present (with a result/target id) so the effect is useful evidence, bound to its invocation. |
 
 ### 8.1 `tokens[]` entry — **[ADD]**
 
