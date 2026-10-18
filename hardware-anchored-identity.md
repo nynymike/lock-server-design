@@ -36,7 +36,10 @@ at enrollment. jans-auth-server publishes its signing keys as a **SPIFFE trust b
 relying party, SPIRE or plain JWT verifier, checks the token offline. When a human stands behind the
 agent, the human's identity enters through an ID-JAG and is carried into the SVID. Every step the
 server takes (appraisal, enrollment, delegation, issuance) is emitted as a signed, hash-chained
-**TRACE record** under one execution identifier, so a third party can later correlate the human,
+**TRACE record**. Appraisal and enrollment are **lifecycle** records that precede, and serve many,
+executions, so they keep their own identifiers; delegation and issuance carry the execution's
+`(trace_execution_id, execution_authority)` pair, and the lifecycle records are linked in by
+`parent_record_ids` (see §3). Correlated that way, a third party can later tie together the human,
 the agent, the hardware key, the authorization decision and the invocation of a governed
 capability. The SVID itself is checkable offline against the published bundle; correlating a full
 execution view is an online query against jans-lock in the initial (Phase-1) integration, and
