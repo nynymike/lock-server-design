@@ -240,7 +240,7 @@ sequenceDiagram
     Agent->>TEE: fresh DPoP proof for the PEP
     TEE-->>Agent: proof
     Agent->>PEP: request + JWT-SVID + DPoP proof
-    Note over PEP: local: signature via bundle, sub, aud, exp<br/>full RFC 9449 DPoP proof (htm, htu, iat/age, jti-replay,<br/>nonce when used) · proof key ↔ cnf.jkt · PDP decision<br/>· copy the pair (trace_execution_id + execution_authority)
+    Note over PEP: Authorization: DPoP <SVID> + DPoP: <proof><br/>local: signature via bundle, sub, aud, exp<br/>full RFC 9449 DPoP proof (htm, htu, iat/age, jti-replay,<br/>required ath==hash(SVID), nonce when used) · proof key ↔ cnf.jkt<br/>· PDP decision · copy the pair (trace_execution_id + execution_authority)
     PEP-->>Lock: CAPABILITY_INVOKED / RUNTIME_EFFECT
     PEP-->>Agent: 200
 ```
@@ -311,16 +311,28 @@ necessary but far from sufficient:
 | `iat` / proof age | Within a small configured window (seconds–low minutes) of now, rejecting both stale proofs and proofs from the future beyond allowed clock skew |
 | `jti` + replay cache | Unique; the PEP keeps a **replay cache** of recently-seen `jti`s (at least the proof-age window) and rejects a repeat, so a single proof cannot be reused |
 | `nonce` (when used) | When the PEP issues a DPoP nonce (`DPoP-Nonce` / `use_dpop_nonce` challenge), the proof's `nonce` MUST equal the most recently issued value; a missing/stale nonce is rejected with a fresh challenge. A PEP under replay pressure SHOULD require a server-provided nonce rather than rely on `iat`/`jti` alone |
-| `ath` (when present) | If the proof carries an access-token hash (`ath`), it MUST equal the base64url SHA-256 of the presented SVID, binding the proof to this exact token |
+| `ath` (**required** at the resource) | The proof **MUST** contain `ath`, and its value **MUST** equal the base64url-encoded SHA-256 of the presented access token (the SVID), binding this proof to this exact token. This is mandatory when a DPoP-bound access token is presented to a resource server (RFC 9449 §7.1), **not** optional: a proof with a missing or mismatched `ath` is rejected. (`ath` is absent only in the *token-request* proof at `/token`, where there is no access token yet — not here at the resource.) |
 | audience | The SVID's `aud` MUST equal this PEP/resource (the ordinary JWT-SVID check), so a token minted for another resource is refused regardless of a valid proof |
 
+The SVID is presented with the **DPoP** authorization scheme, not `Bearer`, so the resource sees
+both the token and its bound proof on the request:
+
+```text
+POST /payments/transfer HTTP/1.1
+Host: payments.example.com
+Authorization: DPoP <JWT-SVID>
+DPoP: <proof JWT: typ=dpop+jwt, htm=POST, htu=https://payments.example.com/payments/transfer,
+       iat, jti, ath=base64url(SHA-256(JWT-SVID)), nonce when challenged>
+```
+
 A PEP that performs only the `cnf.jkt` thumbprint comparison and skips `htm`/`htu`/age/`jti`-replay/
-`nonce` is **not** sender-constrained in practice: a captured proof could be replayed against a
-different method, a different endpoint, or more than once. These requirements are the same RFC 9449
-checks jans already applies at its own DPoP-protected endpoints (`DpopService`), restated here as
-the PEP's obligation; a PEP SHOULD reuse an RFC 9449 library rather than re-implement them. The
-demo gateway's PEP implements the full table, and `JwtSvidRoundTripHttpTest` exercises the negative
-cases (wrong `htu`, wrong `htm`, stale `iat`, replayed `jti`, missing required `nonce`).
+`ath`/`nonce` is **not** sender-constrained in practice: a captured proof could be replayed against
+a different method, a different endpoint, with a different token, or more than once. These
+requirements are the same RFC 9449 checks jans already applies at its own DPoP-protected endpoints
+(`DpopService`), restated here as the PEP's obligation; a PEP SHOULD reuse an RFC 9449 library
+rather than re-implement them. The demo gateway's PEP implements the full table, and
+`JwtSvidRoundTripHttpTest` exercises the negative cases (wrong `htu`, wrong `htm`, stale `iat`,
+replayed `jti`, **missing `ath`, wrong `ath`**, and missing required `nonce`).
 
 ![JWT-SVID verification anatomy](../../../assets/agent-identity-jwt-svid-verification.svg)
 
@@ -330,7 +342,7 @@ cases (wrong `htu`, wrong `htm`, stale `iat`, replayed `jti`, missing required `
 | `sub` | `spiffe://op.example.org/agent/3f9c` authorised here? | relying party's identity policy |
 | `aud` | equals this service | the service's own identifier |
 | `iat`/`exp` | fresh (≤ 15 min) | clock |
-| `cnf.jkt` | Full RFC 9449 DPoP presentation: proof signature, `htm`, `htu`, `iat`/age, unique `jti` against a replay cache, `nonce` when used, `ath` when present, **and** the proof-key thumbprint equals `cnf.jkt` (see "Normative PEP DPoP-presentation requirements" above) — not the thumbprint comparison alone | the hardware key, attested |
+| `cnf.jkt` | Full RFC 9449 DPoP presentation: proof signature, `htm`, `htu`, `iat`/age, unique `jti` against a replay cache, `nonce` when used, a **required** `ath` matching the presented SVID, **and** the proof-key thumbprint equals `cnf.jkt` (see "Normative PEP DPoP-presentation requirements" above) — not the thumbprint comparison alone | the hardware key, attested |
 | `attestation` | `status=affirming`, `appraised_at` recent, `measurement` acceptable to *this* verifier | the appraisal, re-checkable in Lock |
 | `delegation` | which human delegated, through which credential, at what authentication strength (`acr`/`amr`) and in which session (`sid`) | ID-JAG, recorded in Lock; the `sid` resolves to the Auth Server `AUTHENTICATION_EVENT` / FIDO `FIDO_CEREMONY` (§10.9) |
 
@@ -2621,7 +2633,8 @@ resolution.
 - **The hardware guarantee requires the full RFC 9449 PEP check, not a thumbprint comparison.** A
   PEP that relies on the `cnf` binding MUST verify every DPoP presentation completely —
   `htm`, `htu`, `iat`/proof-age, a unique `jti` against a replay cache, `nonce` when the PEP issues
-  one, `ath` when present, and the proof-key thumbprint equal to `cnf.jkt` (§6). A plain JWT-SVID
+  one, a **required** `ath` matching the presented SVID (RFC 9449 §7.1, mandatory at the resource),
+  and the proof-key thumbprint equal to `cnf.jkt` (§6). A plain JWT-SVID
   validator that ignores `cnf` is bearer-only and gains no hardware guarantee, so a high-value RP
   MUST be `cnf`-checking and require DPoP.
 - **Privacy: the SVID is minimized and disclosed per audience.** The default SVID carries only the
