@@ -517,9 +517,38 @@ should use the explicit endpoint.
 ### 9.3 Request and response definitions
 
 Base path `/jans-auth/restv1/attestation`. Gated by new `FeatureFlagType.ATTESTATION`
-(`attestation`). Both operations are `POST` with `application/json`, need no OAuth client
-authentication (the caller may not be registered yet), and are rate-limited per source IP and per
-`jkt` like `/register`.
+(`attestation`). Both operations are `POST` with `application/json` and are rate-limited per source
+IP and per `jkt` like `/register`.
+
+**Authentication requirement, and why it is conditional.** A first-time attestation (no
+`client_id`, `purpose=enroll`) needs **no** OAuth client authentication — the caller is not yet
+registered, which is the whole point. But a submission that names an existing `client_id` must not
+be allowed to affect that client's standing on anonymous input: an authenticated-negative verdict
+(`measurement_not_allowed`, `nonce_mismatch`, `key_not_certified`, …) **supersedes** the client's
+valid approvals (section 10.4), so if anyone who merely knows the public `client_id` and `K.public`
+could drive a `contraindicated` result, replaying stale evidence would be a **denial-of-service**
+against the agent. Therefore:
+
+- **Proof of possession of `K` gates supersession.** A submission carrying a `client_id` MUST
+  include a **DPoP proof signed by the attested key** (`htm=POST`, `htu=<attestation endpoint>`,
+  fresh `iat`, unseen `jti`; validated by the existing `DpopService`), with the proof-key
+  thumbprint equal to `attested_key`'s `jkt` and to a registered key of that `client_id` — the same
+  proof the DCR gate already requires (section 9.5). Possession of `K` is what distinguishes the
+  legitimate agent from a third party who only learned its public identifiers.
+- A submission with a `client_id` but **no valid proof of possession** is still processed and its
+  verdict is still **recorded as evidence** (negative verdicts are evidence), but it is marked
+  **non-superseding**: it is stored with `supersedesEligible=false` and can **never** invalidate a
+  standing `affirming` assessment or block issuance for that client. The `attestationChallenge`'s
+  `client_id` binding plus this proof requirement together mean "only the holder of `K` can cause a
+  negative verdict to count against this client."
+- A submission with **no** `client_id` (pre-enrollment) binds only to the key it attests; it has no
+  client whose approvals it could supersede, so it needs no client authentication. It still cannot
+  affect any *other* client, because an assessment is keyed to the `(client_id, jkt)` it was
+  actually bound to (section 10.4, `key_mismatch` row).
+
+Rate limiting (per source IP, per `jkt`) remains, but it is a throughput control, not an
+authorization control — it does not decide whose approvals a verdict may invalidate; proof of
+possession of `K` does.
 
 #### `POST /attestation/challenge`
 
@@ -903,9 +932,11 @@ New entity `AttestationAssessment` (`ou=attestations`, `jansAttest`): `attestati
 stored when `attestationStoreVerifierResult=true`, default), `verifierResultDigest`,
 `evidenceFormat`, `evidenceDigest`, raw evidence only when `attestationStoreEvidence=true`,
 `keyCertified` (core-computed, 9.3b), `challengeId`, `appraisedAt`, `expiresAt` (ORM TTL
-attribute, as tokens), `supersededBy`, `supersededAt`, `consumed`, `consumedByJti`, `version`,
-`traceRecordId`, `reasons`. Schema in `jans-linux-setup`, ORM entries for all backends. Lookups:
-`latestRelevant(clientId, jkt)` (section 10.4), `byId`.
+attribute, as tokens), `supersededBy`, `supersededAt`, `supersedesEligible` (whether this verdict
+may invalidate a standing approval for its `clientId` — `true` only when the submission carried a
+valid DPoP proof of possession of the attested key, section 9.3), `consumed`, `consumedByJti`,
+`version`, `traceRecordId`, `reasons`. Schema in `jans-linux-setup`, ORM entries for all backends.
+Lookups: `latestRelevant(clientId, jkt)` (section 10.4), `byId`.
 
 Three fields carry the concurrency state, and they are not maintained with a multi-entry
 transaction (which LDAP and Couchbase do not offer) but with **per-entry optimistic
@@ -1032,15 +1063,21 @@ and either closing is sufficient to require re-attestation.
 for `(client_id, jkt)` whose status is a real verdict (ordered by `(appraisedAt, version)` so ties
 are deterministic), and that verdict decides. An agent that was just refused cannot fall back to an
 older approval that is still inside the age window: a `contraindicated` appraisal **invalidates**
-every earlier approval for that key. This is implemented **without** a multi-entry transaction
-(LDAP and Couchbase have none): when a new `contraindicated`/`warning` verdict is stored, the
-writer marks each still-live earlier `affirming` assessment for that key
-`supersededBy = <new id>`, `supersededAt = now` with a **per-entry CAS on `version`** (section
-9.7). `latestRelevant` filters `supersededBy == null`, so a concurrent `/token` on another node
-either sees the new verdict as newest or sees the older approval already marked superseded; it can
-never settle on an approval the system has invalidated. A CAS that loses to a racing writer is
-retried against the re-read entry, so supersession converges without a transaction. Which outcomes
-invalidate prior approval:
+every earlier approval for that key — **but only when the new verdict is supersession-eligible**
+(`supersedesEligible == true`, i.e. the submission that produced it carried a valid DPoP proof of
+possession of `K`; section 9.3). A `contraindicated` verdict with `supersedesEligible == false`
+(an anonymous submission naming someone else's `client_id`) is recorded as evidence but marks
+nothing superseded and blocks no issuance — closing the denial-of-service path where a third party
+who knows only the public `client_id`/`K.public` replays stale evidence to knock the agent offline.
+Supersession is implemented **without** a multi-entry transaction (LDAP and Couchbase have none):
+when a new supersession-eligible `contraindicated`/`warning` verdict is stored, the writer marks
+each still-live earlier `affirming` assessment for that key `supersededBy = <new id>`,
+`supersededAt = now` with a **per-entry CAS on `version`** (section 9.7). `latestRelevant` filters
+`supersededBy == null`, so a concurrent `/token` on another node either sees the new verdict as
+newest or sees the older approval already marked superseded; it can never settle on an approval the
+system has invalidated. A CAS that loses to a racing writer is retried against the re-read entry,
+so supersession converges without a transaction. Which outcomes invalidate prior approval (all
+conditional on `supersedesEligible == true`):
 
 | Outcome of a new attestation attempt | Authenticated? | Effect on earlier `affirming` assessments for the same key |
 |--------------------------------------|----------------|-----------------------------------------------------------|
@@ -1674,8 +1711,8 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `SpiffeBundleRestWebServiceImplTest` | flag disabled; headers |
 | `SpiffeTrustDomainServiceTest` | pin on first start; adopt another node's value; invalid domain → `ERROR`, no exception |
 | `SpiffeIdUtilTest` (extend) | `buildAgentSpiffeId`; trust domain with `/` rejected |
-| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; `latestRelevant` picks the newest **non-superseded** real verdict and breaks `appraisedAt` ties by `version`; an assessment past its own `expiresAt` is rejected even inside `maxAge`, and one past `maxAge` is rejected even before `expiresAt`; a newer `contraindicated` supersedes an older fresh `affirming` via per-entry CAS (no multi-entry transaction); a lost supersession CAS is retried and still converges; `attestationRequireFreshPerIssuance` consume is a CAS on `consumed` that succeeds for exactly one of two concurrent `/token` calls and the loser gets `attestation_required`; `none` neither supersedes nor extends; `key_mismatch` stored against the other key |
-| `AttestationRestWebServiceImplTest` | flag disabled; `invalid_challenge` carries a fresh challenge; no `500` for a verdict; `503 verifier_unavailable` keeps the challenge |
+| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; `latestRelevant` picks the newest **non-superseded** real verdict and breaks `appraisedAt` ties by `version`; an assessment past its own `expiresAt` is rejected even inside `maxAge`, and one past `maxAge` is rejected even before `expiresAt`; a supersession-eligible `contraindicated` (submission carried a valid DPoP proof of `K`) supersedes an older fresh `affirming` via per-entry CAS (no multi-entry transaction); a `contraindicated` **without** proof of possession is recorded with `supersedesEligible=false` and supersedes nothing / blocks no issuance (the DoS guard); a lost supersession CAS is retried and still converges; `attestationRequireFreshPerIssuance` consume is a CAS on `consumed` that succeeds for exactly one of two concurrent `/token` calls and the loser gets `attestation_required`; `none` neither supersedes nor extends; `key_mismatch` stored against the other key |
+| `AttestationRestWebServiceImplTest` | flag disabled; `invalid_challenge` carries a fresh challenge; no `500` for a verdict; `503 verifier_unavailable` keeps the challenge; a submission with a `client_id` and no/invalid DPoP proof is accepted-and-recorded but `supersedesEligible=false`; a `client_id` submission with a valid proof over `K` is `supersedesEligible=true`; pre-enrollment (no `client_id`) needs no proof |
 | `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
 | `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
 | `RegisterValidatorTest` (extend) | `validateAttestation` by id; expired; wrong purpose; key not in `jwks`; missing DPoP proof on `/register`; proof key ≠ attested key; `allowed_resources` empty for `JWT-SVID`; `stale_evidence` has `challenge_id` |
@@ -1771,6 +1808,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | JWT-SVID stolen in transit or from a log | Replay fails at any `cnf`-checking verifier: no DPoP proof without the hardware key. At bearer-only verifiers it works until `exp`, which is why the TTL is minutes and high-value RPs should check `cnf` |
 | Agent host compromised, key exfiltration attempted | Key is non-exportable; the attacker can only ask the hardware to sign while resident. Proof freshness windows and short SVID TTLs bound the abuse; disabling the client ends it. **Re-attestation does not by itself detect this**: a compromised process can keep calling the vTPM while the VM's launch measurement stays acceptable (see the guarantee statement below). Detection needs something that measures the agent runtime (PCR extension of the agent image, IMA, confidential containers) included in `allowed_measurements`, or behavioural evidence in the TRACE chain |
 | Evidence replayed from an earlier session | Challenge is single-use and bound to `jkt`; `nonce_mismatch` → `contraindicated`; the negative appraisal is itself recorded |
+| Attacker submits stale/forged evidence under a victim's `client_id` to force a `contraindicated` and knock the agent offline | Blocked: a submission naming a `client_id` only supersedes that client's approvals when it carries a valid DPoP proof of possession of `K` (section 9.3). Without the proof the verdict is recorded (`supersedesEligible=false`) but invalidates nothing and blocks no issuance, so knowing the public `client_id`/`K.public` is not enough to deny service; only the holder of `K` can drive a counting negative verdict |
 | Evidence about a different key than the DPoP / registration key | Core extracts the attested key from the verifier result and the certify structure, compares it to the challenge `jkt` and to the registered keys; `key_mismatch`; the script has no input into this comparison |
 | Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **supersedes** any earlier approval at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
 | Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked `supersededBy` by per-entry CAS (10.4), so a racing `/token` on another node cannot settle on them. The agent must obtain a new `affirming` appraisal |
@@ -1816,6 +1854,12 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   a follow-up.
 - **`accessTokenType` and `attestation` live in `ClientAttributes`** (`jansAttrs`), no client
   schema change.
+- **Proof of possession of `K` gates negative-verdict supersession.** `/attestation` needs no OAuth
+  auth for a pre-enrollment caller, but a submission naming an existing `client_id` only
+  invalidates that client's standing approvals (section 10.4) when it carries a valid DPoP proof of
+  possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
+  evidence but marked `supersedesEligible=false`, so knowing a victim's public `client_id`/`K.public`
+  cannot deny it service.
 - **Two TRACE producer roles, two keys.** jans-auth-server registers a `jans-auth` producer
   (`["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]`, matching `auth-server-trace-design.md` exactly)
   and a separate `jans-svid-issuer` credential-provisioning producer (`["CREDENTIAL_PROVISIONED"]`,
