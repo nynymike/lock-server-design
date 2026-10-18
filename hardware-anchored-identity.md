@@ -2343,11 +2343,11 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Evidence about a different key than the DPoP / registration key | Core extracts the attested key from the verifier result and the certify structure, compares it to the challenge `jkt` and to the registered keys; `key_mismatch`; the script has no input into this comparison |
 | Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **supersedes** any earlier approval at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
 | Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked `supersededBy` by per-entry CAS (10.4), so a racing `/token` on another node cannot settle on them. The agent must obtain a new `affirming` appraisal |
-| Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side |
+| Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side. **How this resolves is the capability-risk tier's choice (§16.9):** `critical` fails closed once no fresh appraisal remains; `low` MAY proceed under a recorded degraded posture if its policy opts in |
 | Agent suspended, decommissioned, or expired | The client's `agentLifecycleState` gates issuance (§9.9): `suspended` refuses `/token` reversibly (`403 client_suspended`), `decommissioned` refuses permanently and removes the keys, and reaching `agentExpiresAt` does one or the other per `agentExpiryAction`. In all cases outstanding SVIDs die within the TTL and introspection reports `active: false`. The `client_id` is never recycled; a decommissioned client becomes a `tombstoned` identity after `clientTombstoneAfterSeconds`, with its evidence retained |
 | Agent's hardware key `K` destroyed, lost, or compromised | No old-key-authorized rotation is possible, so recovery is the administrative path (section 9.9): an operator authorizes re-enrollment of a fresh attested key (destroyed/lost) or revokes `K` and enrolls a replacement (compromise). Issuance under `K` stops at once; a VM rebuild additionally changes `workload_instance_id`, which stays visible in the evidence. Recorded as `IDENTITY_ROTATED` (`key_lost` / `emergency`) |
 | Agent VM cloned or snapshotted | A clone cannot export the non-exportable `K`, so it holds no usable key and must enroll its own through the gate; detecting two live runtimes sharing one `jkt` (vTPM-in-snapshot case) is a Phase-4 instance-binding concern, out of scope here and stated so (section 9.9) |
-| Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out |
+| Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out. **SLO:** bundle reachable at least once per `spiffeBundleRefreshHintSeconds`; a `critical`-tier RP MAY cap the accepted cached-bundle age tighter (§16.9) |
 | Signing key rotated | Bundle serves old + new for an overlap window and bumps `spiffe_sequence`; only an emergency rotation that drops the old key immediately invalidates in-flight tokens, by design |
 | Client registers its own SPIFFE ID or a foreign trust domain | Impossible by construction: `sub` is derived from `client_id` under jans's own trust domain; the inbound `spiffe_id` attribute plays no role in issuance |
 | jans-lock unreachable | Records queue in the outbox; auth continues. In `inline` mode the request fails, which is correct for a demo of accountability |
@@ -2503,15 +2503,70 @@ The deployment SHOULD expose metrics so the honest-failure paths are observable 
 | Revocation-to-remediation lag | Time from a key/client revocation to issuance actually stopping — the window an attacker still has |
 | Native `jans-trace-core` self-test / load failures | Fails closed for ingestion (11.3); must be alerted, not silent |
 
-### 16.9 Availability posture (fail-open vs fail-closed)
+### 16.9 Availability posture: SLOs and fail-open/closed per capability-risk tier
 
-A verifier or Lock outage must not silently turn accountability or posture into stale trust. The
-default is fail-closed for `JWT-SVID` issuance (no committed TRACE record → no SVID, section 11.3;
-no fresh appraisal → `attestation_required`, 10.4). Whether a given capability tolerates fail-open
-is a **per-capability-risk-tier** decision the operator makes, not a global switch: a low-risk
-logging capability MAY accept `warning`/degraded posture, a payments capability MUST fail closed.
-The verifier-unavailable and bundle-unavailable behaviors (section 15) are the mechanism; the
-risk-tier policy chooses which way they resolve.
+A verifier, bundle, or Lock outage must not silently turn accountability or posture into stale
+trust. The failure mechanisms are defined in section 15 (verifier-unavailable → `503`, status
+`none`; bundle-unavailable → cached-bundle serving; Lock-unavailable → outbox backlog); **which way
+each resolves is not global — it is a per-capability-risk-tier policy.** This subsection makes that
+policy concrete.
+
+**Capability-risk tiers.** Each governed capability is assigned a risk tier (the operator's
+classification, the same tier the PDP/PEP already reason about). A convenient default set:
+
+| Tier | Example | Posture requirement |
+|------|---------|---------------------|
+| `critical` | payments, privilege changes, data exfiltration-capable tools | Strictest: only a currently-fresh `affirming` appraisal and a live, `cnf`-checking PEP; no degraded path |
+| `standard` | ordinary business actions | Fresh appraisal required; bounded tolerance for a transient verifier outage within the assessment's own window |
+| `low` | read-only / logging / telemetry | May proceed under a degraded posture (e.g. `warning`, or a recently-expired-but-not-stale appraisal) if the operator opts in |
+
+**Availability SLOs (the budget the windows encode).** The freshness windows already *are* an
+availability budget, and the tier chooses how much of it may be spent:
+
+- The **attestation verifier** may be unreachable for up to the assessment's remaining validity
+  without blocking issuance — existing `affirming` assessments stay usable until `expiresAt` /
+  `attestationMaxAgeForIssuanceSeconds`, so a verifier outage shorter than that window is invisible
+  to issuance (section 15, "Platform verifier unreachable"). A `critical` capability MAY set a
+  *tighter* per-issuance max age (even `attestationRequireFreshPerIssuance`), spending less of the
+  budget and tolerating a shorter outage, in exchange for stronger freshness.
+- The **bundle** may be unreachable for up to the relying party's cache lifetime / refresh hint
+  (`spiffeBundleRefreshHintSeconds`); SPIRE and jans's own `SpiffeBundleService` serve the stale
+  bundle with a negative cache, so verification degrades only after cached keys rotate out (section
+  15, "Bundle endpoint unreachable"). The SLO is therefore "bundle reachable at least once per
+  refresh-hint interval," not per request.
+- **Lock** may be unreachable for up to the outbox bound (`traceOutboxMaxEntries` /
+  `traceOutboxMaxAgeSeconds`); records queue and deliver at-least-once on recovery (section 11.3).
+
+**How each outage resolves per tier.** The operator's tier policy picks a column:
+
+| Outage | `low` (fail-open allowed) | `standard` | `critical` (fail-closed) |
+|--------|---------------------------|------------|--------------------------|
+| **Verifier unavailable**, existing appraisal still inside its window | Issue | Issue | Issue (unless a tighter max age has already expired it) |
+| **Verifier unavailable**, no fresh appraisal left | MAY issue under `warning`/degraded **only if** the capability's policy opts in; recorded as degraded | `attestation_required` (fail closed) | `attestation_required` (fail closed) |
+| **Bundle unreachable** at the RP | Accept a stale-but-cached bundle within the refresh hint | Accept within the refresh hint | Accept within the refresh hint; reject once cached keys are older than a tier-set max bundle age |
+| **Lock (TRACE) unavailable** | Proceed; record queues in the outbox | Proceed; outbox | **Fail closed**: no committed evidence record → no SVID (`503 evidence_unavailable`), because a `critical` action must be accountable before it happens (section 11.3 `fail-closed`, the default for `JWT-SVID`) |
+
+Two rules keep this honest:
+
+- **The default is fail-closed; fail-open is an explicit per-capability opt-in, never a global
+  switch.** A capability with no tier assigned is treated as `critical`.
+- **A degraded issuance is recorded as degraded.** When a `low`-tier capability proceeds under a
+  `warning` posture or a bundle/Lock outage, the condition is visible in the evidence (the SVID's
+  `attestation.status`, a `coverage_gap` marker on the next record, section 11.3), never silently
+  upgraded to a clean result — so "we proceeded despite an outage" is an auditable fact, not a
+  hidden one.
+
+Configuration:
+
+| Property | Default | Meaning |
+|----------|---------|---------|
+| `capabilityRiskTierDefault` | `critical` | Tier applied to a capability with no explicit assignment — fail-closed by default |
+| `capabilityRiskTiers` | — | Per-capability (or per-`allowed_resources` audience) tier assignments and whether each may fail open on a verifier/bundle/Lock outage |
+| `bundleMaxCachedAgeSeconds` (per tier) | — | For a `critical`-tier RP, the maximum age of a cached bundle it will still verify against before rejecting (tighter than the refresh hint) |
+
+The availability tier reuses the capability-risk classification the PDP/PEP already hold; this plan
+does not introduce a second risk taxonomy, it consumes the existing one to choose the outage
+resolution.
 
 ## 17. Specs to follow
 
@@ -2641,6 +2696,12 @@ risk-tier policy chooses which way they resolve.
 - **Evidence before action**: the outbox entry is the durable commitment and allocates the chain
   position; the action's own entity is written after it; `JWT-SVID` issuance fails closed when
   evidence cannot be committed.
+- **Availability posture is per-capability-risk tier, fail-closed by default.** A verifier, bundle,
+  or Lock outage resolves per the capability's risk tier (`critical` / `standard` / `low`): the
+  default is fail-closed, fail-open is an explicit per-capability opt-in, an untiered capability is
+  treated as `critical`, and any degraded issuance is recorded as degraded rather than silently
+  upgraded. The freshness windows (assessment max age, bundle refresh hint, outbox bound) are the
+  availability budget each tier spends (§16.9).
 - **Trust domain is pinned** on first start and never derived again.
 - **Update-token script may add but not remove** the SVID's identity, binding and correlation
   claims.
