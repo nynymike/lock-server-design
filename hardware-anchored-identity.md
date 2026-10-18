@@ -1877,7 +1877,7 @@ that gap: (1) each producer emits a **checkpoint record** at a fixed cadence
 missing checkpoint that Lock's lateness check flags; (2) the fail-closed rule in 11.3 makes
 `JWT-SVID` issuance impossible without a committed record, so "event without record" cannot
 happen for the actions this plan governs. Proving completeness against a dishonest producer
-beyond that requires an external anchor (SCITT, section 18), which is out of scope.
+beyond that requires an external anchor (SCITT, section 19), which is out of scope.
 
 ### 11.2 Records emitted
 
@@ -2358,7 +2358,134 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Crash between record commit and token persistence | A `CREDENTIAL_PROVISIONED` record exists for a credential `jti` introspection does not know; the reconciliation job emits a compensating, superseding `CREDENTIAL_PROVISIONED` linked to it (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
-## 16. Specs to follow
+## 16. Operational requirements
+
+The sections above specify the protocol; this one collects the **deployment and operational
+requirements** a production rollout must satisfy. They are gathered here so they are not scattered
+or implied. Each is normative for a production deployment; a demo MAY relax the ones marked
+*demo-relaxable*.
+
+### 16.1 Key sets, rotation, and compromise
+
+- **Dedicated key sets, never the OIDC keys.** The SVID *signing* keys (the bundle's `jwt-svid`
+  keys) and the two TRACE *producer* keys (`jans-auth`, `jans-svid-issuer`, section 11.1) are
+  distinct key sets from each other and from the OP's OIDC token-signing keys. v1 relabels the OIDC
+  signing keys in the bundle output for expedience (section 8), but a production deployment SHOULD
+  provision a **dedicated SVID key set** so SVID and OIDC rotation are decoupled and a compromise of
+  one does not implicate the other. The agent hardware key `K` is a fourth, separate thing (the
+  credential, not a signing key).
+- **Rotation.** Bundle/SVID signing keys rotate with an overlap window (old + new served, section
+  8); TRACE producer keys rotate via Lock's producer-key admin path with an `IDENTITY_ROTATED`
+  record; the agent key `K` rotates old-key-authorized (section 9.9). Each rotation is independent.
+- **Compromise response.** A compromised SVID signing key is removed from the bundle immediately
+  (emergency rotation, which invalidates in-flight SVIDs by design); a compromised TRACE producer
+  key is revoked in Lock's registry so later records under it are rejected while historical records
+  stay verifiable; a compromised agent key is revoked administratively (section 9.9). Each path is
+  specified in its own section; this is the index.
+
+### 16.2 Cryptographic agility and canonicalization migration
+
+- Every digest and signature carries an explicit algorithm (`sha256:`/`sha384:` prefixes; Ed25519
+  for producer keys; the SVID's `alg`). A migration to a new hash or signature algorithm, or a new
+  canonicalization, is a **new TRACE protocol profile** (a new `eat_profile` tag), never an
+  in-place change to `tag:jans.io,2026:trace-v1` — the `jans-trace-core` versioning rule (section
+  11.3) governs this, so existing records keep verifying under the profile they were signed with.
+- Historical verification material (retired keys, old profile vectors) is retained per section 9.9,
+  so records signed under a superseded algorithm remain checkable after migration.
+
+### 16.3 Verifier egress hardening
+
+The attestation script is the only component that calls a platform verifier (section 9.2). A
+production deployment MUST bound that outbound path:
+
+- **Egress allowlist.** Outbound calls go only to the verifier URLs named in the configured
+  `attestationVerifierProfiles` (section 9.3b); the script's HTTP client refuses other hosts, with
+  no redirects (DNS-rebinding / SSRF containment).
+- **Circuit breaker + timeouts.** `verifier_timeout_ms` bounds each call; repeated verifier
+  failures trip a circuit breaker so a slow/flapping verifier does not exhaust attestation threads —
+  a tripped breaker surfaces as `503 verifier_unavailable` (status `none`), the same honest-outage
+  path as a single failure (section 9.3).
+- **Quotas and cost control.** Per-source-IP and per-`jkt` rate limits (section 9.3) plus a
+  global/tenant quota bound verifier call volume and cost; the unauthenticated challenge/attestation
+  endpoints additionally enforce body-size limits before parse.
+
+### 16.4 Clock-skew policy (first-class)
+
+Several freshness windows depend on time agreement: the challenge TTL (9.3c), assessment
+`appraisedAt`/`expiresAt` and `maxAge` (10.4), the DPoP `iat`/proof-age (section 6), the SVID
+`iat`/`exp`, and verifier-result `exp`. A single configured **`allowedClockSkewSeconds`** (default
+small, e.g. 30–60 s) applies to every "within a window of now" comparison on both sides (past and
+future), and the attestation challenge nonce — not a timestamp — is what actually establishes
+freshness for the hardware evidence, so clock skew never weakens the replay guarantee, only the
+acceptance windows. Producers and verifiers SHOULD run NTP; a deployment with untrusted clocks
+tightens the windows rather than widening them.
+
+### 16.5 Cedarling / PDP integration
+
+When Cedarling is the PDP, the deployment MUST configure:
+
+- **Trusted issuers.** The Jans SVID issuer and the ID-JAG issuer are registered as trusted issuers
+  in Cedarling's policy store, so an SVID/ID-JAG is validated (signature, `exp`, status) before its
+  claims become policy input.
+- **Claim-to-entity mapping.** A mapping from the SVID/ID-JAG claims this plan mints — the SPIFFE
+  `sub`, `delegation`/`human_sponsor`, `attestation`/`posture_assessment_ref`, `cnf`, the
+  `(action, resource_type)` of the request, and the execution pair — to the Cedar entities and
+  context the policies evaluate. Unknown additive claims are **not** automatically policy input;
+  only mapped claims are.
+- **DPoP handling.** Whether the PEP validates the DPoP presentation (section 6) and passes an
+  already-authenticated principal to Cedarling, or Cedarling is handed the verified thumbprint, is
+  fixed per deployment; either way the full RFC 9449 check (section 6) happens at the PEP, not
+  inside policy evaluation.
+
+### 16.6 Policy-store lifecycle
+
+The issuance-policy inputs digested into `bundle_hash` (section 11.2) and any Cedarling policy
+store MUST have a defined **activation, rollback, and stale-policy** behavior: a policy/bundle
+change is staged and activated atomically (a version bump, not a mutate-in-place), a rollback
+re-activates a prior version, and a producer/PDP that cannot confirm it loaded the current version
+records the version it *did* use (so a decision is always attributable to a concrete policy
+version) and fails closed for high-risk capabilities rather than evaluating against a stale store.
+This plan owns only the jans-auth-server issuance ruleset (expressed as `bundle_hash`); the
+Cedarling/AuthZEN policy-store lifecycle is the PDP's, referenced here so the requirement is not
+lost.
+
+### 16.7 Per-backend durability and fault tests
+
+The CAS/lease mechanisms (challenge state 9.3c, assessment supersession/consume 9.7/10.4) and the
+outbox-before-action commit (11.3) MUST be validated on **every supported backend** — SQL, LDAP,
+Couchbase, and clustered deployments — because their transactional semantics differ (SQL has
+multi-entry transactions; LDAP/Couchbase use per-entry CAS). Fault tests MUST cover: a node crash
+between the outbox write and entity persistence (reconciliation emits the compensating record,
+11.3); a lost supersession/consume CAS under concurrency (retry converges, 10.4); a node crash
+mid-`processing` on a challenge (lease repair, 9.3c); and Lock unreachable (outbox backlog, then
+at-least-once delivery, 11.3).
+
+### 16.8 Operational metrics
+
+The deployment SHOULD expose metrics so the honest-failure paths are observable rather than silent:
+
+| Metric | Why it matters |
+|--------|----------------|
+| Verifier call latency and error class (timeout / 5xx / TLS / breaker-open) | Detects a failing platform verifier before it starves issuance |
+| Stale-appraisal use / `attestation_required` rate | How often agents hit the freshness wall; a spike signals a verifier or policy problem |
+| DPoP replay-cache rejections | Replayed proofs at the PEP — an attack or a buggy client |
+| Bundle age at verifiers / `spiffe_sequence` skew | A relying party verifying against an aged bundle after rotation |
+| Outbox depth and oldest-entry age | TRACE delivery falling behind; approaching `traceOutboxFullPolicy` |
+| Coverage-gap / chain-link-failure / equivocation counts | Chain-integrity findings surfaced by Lock |
+| Revocation-to-remediation lag | Time from a key/client revocation to issuance actually stopping — the window an attacker still has |
+| Native `jans-trace-core` self-test / load failures | Fails closed for ingestion (11.3); must be alerted, not silent |
+
+### 16.9 Availability posture (fail-open vs fail-closed)
+
+A verifier or Lock outage must not silently turn accountability or posture into stale trust. The
+default is fail-closed for `JWT-SVID` issuance (no committed TRACE record → no SVID, section 11.3;
+no fresh appraisal → `attestation_required`, 10.4). Whether a given capability tolerates fail-open
+is a **per-capability-risk-tier** decision the operator makes, not a global switch: a low-risk
+logging capability MAY accept `warning`/degraded posture, a payments capability MUST fail closed.
+The verifier-unavailable and bundle-unavailable behaviors (section 15) are the mechanism; the
+risk-tier policy chooses which way they resolve.
+
+## 17. Specs to follow
 
 | Spec | Role | Status in jans |
 |------|------|----------------|
@@ -2378,7 +2505,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | `jans-trace-core` | Shared canonicalization / Ed25519 signing / `content_digest` library and its **normative cross-language vectors** | Producer path depends on it (JNI) or passes its vectors byte-for-byte (section 11.3); one canonical implementation, no jans-local fork |
 | OWASP GovOps | Vendor-neutral sibling profile `tag:govops.owasp.org,2026:trace-v1` (same shape: `subject.workload_id`, signed `(action, resource_type)` facts, collector-derived `capability_id`), capability-catalogue naming | This plan emits the Jans/Lock profile, **not** the GovOps tag (section 11.1); the two are schema-compatible, and records carry exactly one profile |
 
-## 17. Resolved decisions and open questions
+## 18. Resolved decisions and open questions
 
 ### Resolved
 
@@ -2511,7 +2638,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   administrative key revocation / re-enrollment path for a compromised or lost **key** (section
   9.9). Confirm this is acceptable before promising anything stronger (e.g. SSF/CAEP push).
 
-## 18. What this plan deliberately excludes
+## 19. What this plan deliberately excludes
 
 - **X.509-SVID issuance / a CA.** JWT-SVIDs cover the agent use case. Revisit only with a concrete
   mTLS-between-agents requirement.
@@ -2529,7 +2656,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 - **SCITT transparency logging.** Lock's receipt chain is the anchor for now; a receipt URI can be
   added to records later without changing producers.
 
-## 19. FAQ: review questions and how the plan answers them
+## 20. FAQ: review questions and how the plan answers them
 
 Questions raised in review, each with the change made in this document.
 
