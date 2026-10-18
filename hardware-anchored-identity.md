@@ -94,6 +94,22 @@ baggage are correlation hints; the signed token claims are the authoritative bin
 is then structural: an auditor queries one `(execution_authority, trace_execution_id)` and gets the
 whole chain.
 
+**What the shared execution id proves — and what it does not.** The pair groups records into one
+execution; it is a **correlation** key, not an **operation** binding. Records that share a
+`trace_execution_id` are asserted to belong to the same unit of work, but sharing it does **not**
+prove that two records describe the *same operation*: an `AUTHORIZATION_DECISION` permitting
+"transfer $50 to A", a `CAPABILITY_INVOKED` mediating "transfer $5000 to B", and a `RUNTIME_EFFECT`
+confirming some transfer can all carry the same execution id and still be three different
+operations. Proving *same-operation* requires the operation-binding commitments
+(`request_digest` / `input_digest` / `tool_call_digest` / `result_digest`) and proof-of-possession
+binding that `design.md` defines — which are a **Phase-3** feature (see the §11.1 phase mapping),
+not delivered by this plan. Until then a consumer MUST treat a shared execution id as "these
+records are claimed to belong to one execution," never as "these records provably refer to one
+operation"; Lock does not infer causation from a shared id or close timestamps, and producers
+express a causal relationship explicitly with `parent_record_ids`. This plan emits the signed
+`(action, resource_type)` facts and the `parent_record_ids` edges that the Phase-3 binding check
+consumes, but the binding assessment itself is deferred.
+
 Execution scope is defined independently of credential lifetime:
 
 | Scope | Identifier | Opened by | Closed by |
@@ -1847,7 +1863,9 @@ Reading the diagram: **solid** arrows are the per-producer hash chain (`prev_rec
 Lock verifies; **dashed** arrows are `parent_record_ids` cross-references between producers,
 which Lock stores and shows but which carry no ordering guarantee of their own. Everything
 sharing one `(trace_execution_id, execution_authority)` pair (the `trace_execution_id` aliased by
-`txn`) is one execution.
+`txn`) is claimed to belong to one execution — a *correlation*, not a proof that any two of those
+records describe the same *operation* (that needs the Phase-3 operation-binding commitments; see
+the same-operation caveat in §3).
 
 What the hash chain does and does not prove: within the records Lock holds, it detects any
 reordering, removal or insertion between two retained records (`chain_link_failure`) and any
@@ -2376,6 +2394,13 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
   evidence but marked `supersedesEligible=false`, so knowing a victim's public `client_id`/`K.public`
   cannot deny it service.
+- **A shared execution id is correlation, not same-operation proof.** Records sharing
+  `(trace_execution_id, execution_authority)` are claimed to belong to one execution; this does
+  **not** prove two of them describe the same operation. Same-operation proof is the Phase-3
+  operation-binding commitments (`request_digest`/`input_digest`/`tool_call_digest`/`result_digest`
+  + proof-of-possession) in `design.md`, not delivered here; this plan emits the signed
+  `(action, resource_type)` facts and `parent_record_ids` edges those checks consume, and Lock
+  never infers causation from a shared id or close timestamps (§3).
 - **Profile and canonical implementation are fixed.** Records are emitted under the Lock/Jans
   profile `tag:jans.io,2026:trace-v1` only — an extension of agentrust v0.2, and a deliberate
   sibling of (not the same tag as) the vendor-neutral GovOps profile `tag:govops.owasp.org,2026:trace-v1`;
