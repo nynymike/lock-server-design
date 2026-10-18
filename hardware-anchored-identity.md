@@ -134,7 +134,7 @@ attestation reference rather than a signed capability label.
 
 | Identity | Carried in | Bound by | Recorded as |
 |----------|-----------|----------|-------------|
-| Human | ID-JAG (`sub`, `email`, `acr`, `auth_time`) | OIDC login at the IdP; token exchange at jans | `subject.human_sponsor`; `tokens[]` entry `token_type=id-jag` |
+| Human | ID-JAG (`sub`, `email`, `acr`, `amr`, `auth_time`, `sid`) | OIDC login at the IdP (gated phishing-resistant by default, §10.9); token exchange at jans | `subject.human_sponsor` with achieved `acr`/`amr`; `sid` ties the execution to the browser session a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` resolves; `tokens[]` entry `token_type=id-jag` |
 | Agent | JWT-SVID `sub` | Derived from `client_id` under the server's trust domain; never client-supplied | `subject.workload_id` (the SPIFFE ID); `tokens[]`/`credential_fingerprint` entry for the `jwt-svid` |
 | Hardware key | JWT-SVID `cnf.jkt`; DPoP proof on every request | Attestation assessment binds `jkt` to platform + measurement | `attestation_ref` (verifier, `result_status`, `appraised_at`) and `posture_assessment_ref` (`jkt`, `attestation_id`, `platform`, `measurement`) |
 | Policy decision | AuthZEN response | PDP evaluates agent + principal against the action/resource | `AUTHORIZATION_DECISION` signing `decision { action, resource_type, outcome }` (never a `capability_id`) by the PDP |
@@ -286,7 +286,7 @@ both audiences.
 | `iat`/`exp` | fresh (≤ 15 min) | clock |
 | `cnf.jkt` | DPoP proof verifies **and** proof key thumbprint matches | the hardware key, attested |
 | `attestation` | `status=affirming`, `appraised_at` recent, `measurement` acceptable to *this* verifier | the appraisal, re-checkable in Lock |
-| `delegation` | which human delegated, through which credential | ID-JAG, recorded in Lock |
+| `delegation` | which human delegated, through which credential, at what authentication strength (`acr`/`amr`) and in which session (`sid`) | ID-JAG, recorded in Lock; the `sid` resolves to the Auth Server `AUTHENTICATION_EVENT` / FIDO `FIDO_CEREMONY` (§10.9) |
 
 Checks 1 to 4 are standard SPIFFE JWT-SVID validation. Check 5 is the hardware binding. Checks 6
 and 7 are optional and give a verifier the hardware state and the human behind the request without
@@ -1302,9 +1302,70 @@ the human's login at the root of the execution: the ID-JAG `jti` appears in `tok
 `sub` in `subject.human_sponsor` of every later record.
 
 Open executions are tracked in a small persistent registry (`jansTraceExecution`: `txn`,
-`clientId`, `principal`, `openedAt`, `expiresAt`, `closed`) so that `/token` can validate a
-presented `txn` (same client, not closed, not expired) and so that an auditor can list executions
-per client. Entries expire by ORM TTL at `traceExecutionMaxAgeSeconds`.
+`clientId`, `principal`, `sid`, `sessionIssuer`, `acr`, `amr`, `openedAt`, `expiresAt`, `closed`)
+so that `/token` can validate a presented `txn` (same client, not closed, not expired) and so that
+an auditor can list executions per client. Entries expire by ORM TTL at
+`traceExecutionMaxAgeSeconds`.
+
+### 10.9 Human assurance: establish it, don't just correlate it
+
+The ID-JAG names a human (`sub`), but naming is not assurance: a `sub` claim alone does not say
+*how* that human authenticated, and nothing in the agent flow re-verifies it. The agent's hardware
+posture (sections 9, 15) and the human's authentication strength are **independent** assurances,
+and this plan must not let a strong hardware binding paper over a weak human login. Three things
+make the human side explicit.
+
+**1. A configurable human-assurance policy, phishing-resistant by default.** The ID-JAG is only
+issued when the subject token's authentication meets a configured bar. Following AIMS §10.4.1
+("Users SHOULD be authenticated using phishing-resistant authentication mechanisms such as a
+passkey"), the default bar requires a phishing-resistant `amr` (a WebAuthn/passkey method), and an
+operator may set a minimum `acr` and an allowed `amr` set per deployment or per capability risk
+tier:
+
+| Property | Default | Meaning |
+|----------|---------|---------|
+| `idJagRequirePhishingResistant` | `true` | The subject token's `amr` must include a phishing-resistant method (passkey / WebAuthn) for the ID-JAG to issue |
+| `idJagMinAcr` | — | Minimum achieved `acr` the subject authentication must carry |
+| `idJagAllowedAmr` | — | Allowed `amr` values; empty means "any that satisfies `idJagRequirePhishingResistant`" |
+
+A subject token that does not meet the bar is refused the ID-JAG (`invalid_grant`,
+`human_assurance_insufficient`), so a human-delegated execution cannot start under an authentication
+weaker than policy — the gate is at delegation time, not discovered later at audit.
+
+**2. The achieved assurance is carried and recorded, not inferred.** The ID-JAG carries the
+subject authentication's `acr`, `amr`, and `auth_time`, and the `sid` (OIDC session id) and session
+issuer of the browser session the human authenticated in. These travel into `subject.human_sponsor`
+and the execution registry (`sid`, `sessionIssuer`, `acr`, `amr` above), and the `EXECUTION_STARTED`
+bootstrap records them, so an auditor sees the *strength and session* of the human login behind an
+execution, not merely that some `sub` was present. The `sid` is the join key: it is the same
+session identifier an `id_token` carries, so the execution ties to a **specific web-browser
+session**, and a later `AUTHENTICATION_EVENT` / `FIDO_CEREMONY` for that `sid` (the Auth Server and
+FIDO Server producers) resolves *which ceremony, with which authenticator* established it.
+
+**3. Synced vs device-bound passkeys are materially different, and the distinction is preserved.**
+Jans FIDO supports hardware security keys, platform authenticators, and **synchronized** passkeys
+(`research/fido-docs.txt`), and a synced passkey (copied across a vendor cloud) carries weaker
+device-binding assurance than a device-bound authenticator. This plan does not collapse them: the
+`amr`/`acr` and the referenced `FIDO_CEREMONY` carry the authenticator properties
+(`authenticator_attachment`, and — in the FIDO full design — attestation/MDS trust detail), so a
+high-risk capability's policy can demand a device-bound or enterprise-attested authenticator while a
+low-risk one accepts a synced passkey. The grading is the verifier's / PDP's to apply from the
+recorded facts; this plan's job is to carry them honestly, never to assert "MFA" generically.
+
+**What is in scope here vs. deferred to the companions.** This plan establishes and records the
+human-assurance *inputs* at delegation: the policy gate, the `acr`/`amr`/`auth_time`, and the
+`sid`/`sessionIssuer` that tie the execution to a browser session. It does **not** itself produce
+the signed human-authentication evidence — the `AUTHENTICATION_EVENT` is the Auth Server producer's
+record (`auth-server-trace-design.md`) and the `FIDO_CEREMONY` is the FIDO Server producer's record
+(`fido-trace-design.md` / `fido-trace-design-MVP.md`), both **deferred past the Lock MVP** (the MVP
+catalog is three kinds and defers authentication/FIDO events). Likewise, **human credential
+recovery and revocation** — lost/replaced passkey, backup authenticator, synced-vs-device-bound
+policy, and the effect of revoking a human credential on in-flight ID-JAGs and executions — are the
+FIDO/Auth Server lifecycle concern, not this plan's; this plan bounds the blast radius only through
+the ID-JAG's short lifetime and the execution's `traceExecutionMaxAgeSeconds`. The honest statement
+is: this plan makes the human assurance *checkable and recorded*, and gates delegation on it; the
+*signed ceremony evidence* and *credential-lifecycle* for the human are the companion producers'
+deferred work, correlated back to this execution by `sid`.
 
 ## 11. TRACE evidence from jans-auth-server
 
@@ -1748,6 +1809,7 @@ SDKs.
 | jans-linux-setup | Schema for `jansAttest`, `jansTraceChain`, `jansTraceOutbox`; register **both** producer keys + chains in Lock when enabled — `jans-auth` scoped `["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]` and `jans-svid-issuer` scoped `["CREDENTIAL_PROVISIONED"]`, each with its own Producer-Key Authorization Statement; ship the reference script | PR 1, PR 6 |
 | jans-config-api, jans-cli-tui, Admin UI | `access_token_type`, attestation and trace properties | after PR 2 |
 | PDP / PEP (Cedarling, demo gateway) | Copy the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s into their records, and sign `(action, resource_type)` facts — **never** a `capability_id` (Lock resolves it, section 11.5); PEP validates SVID + DPoP via the bundle | demo |
+| Auth Server / FIDO Server human-authentication evidence | The signed `AUTHENTICATION_EVENT` (`auth-server-trace-design.md`) and `FIDO_CEREMONY` (`fido-trace-design.md` / `fido-trace-design-MVP.md`) that resolve the human login behind an execution, correlated by `sid` (§10.9). **Deferred past the Lock MVP** (authentication/FIDO events are not in the three-kind MVP catalog); this plan only carries the `acr`/`amr`/`sid` inputs and gates delegation on them | later phase |
 
 ## 13. Implementation phases and pull requests
 
@@ -1810,7 +1872,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `TraceExecutionRegistryTest` | open / validate / close; foreign `client_id` refused; expiry |
 | `AbstractAuthorizationGrantTest` (extend) | SVID lifetime source, cap, key-regeneration interaction |
 | `IntrospectionWebServiceTest` (extend) | SPIFFE `sub`, `cnf`, `txn`, `attestation`, `delegation` |
-| `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag |
+| `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or when `acr` is below `idJagMinAcr`, or `amr` is outside `idJagAllowedAmr`; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry |
 | `TraceRecordBuilderTest` | envelope; canonical bytes stable; signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
 | `TraceChainStateTest` | sequence allocated by outbox insert; `prev_record_hash` links; zero hash first; tail re-read after restart; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
 | `TraceEmitterTest` | outbox retry; `202` and idempotent-replay acceptance both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; inline ordering; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
@@ -1946,6 +2008,13 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
   evidence but marked `supersedesEligible=false`, so knowing a victim's public `client_id`/`K.public`
   cannot deny it service.
+- **Human assurance is gated and recorded, not just correlated.** The ID-JAG issues only when the
+  subject authentication meets a configurable bar — phishing-resistant (passkey/WebAuthn) by
+  default per AIMS §10.4.1, with optional `acr`/`amr` floors (`idJagRequirePhishingResistant`,
+  `idJagMinAcr`, `idJagAllowedAmr`). The achieved `acr`/`amr`/`auth_time` and the `sid` are carried
+  into `human_sponsor` and the execution, so the execution ties to a specific browser session; the
+  signed `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` evidence and human credential recovery/revocation
+  are the Auth/FIDO companion producers' deferred work, correlated back by `sid` (section 10.9).
 - **A client may hold more than one attested key, and key lifecycle is specified.** "Exactly one
   key" is the common runtime state, not an enforced invariant; `jwks` MAY hold up to
   `clientMaxAttestedKeys` (default 2) for a rollover overlap, each key independently attested and
