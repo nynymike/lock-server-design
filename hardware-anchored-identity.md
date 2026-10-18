@@ -1530,7 +1530,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag |
 | `TraceRecordBuilderTest` | envelope; canonical bytes stable; signature verifies; no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
 | `TraceChainStateTest` | sequence allocated by outbox insert; `prev_record_hash` links; zero hash first; tail re-read after restart |
-| `TraceEmitterTest` | outbox retry; `409` treated as delivered; inline ordering; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
+| `TraceEmitterTest` | outbox retry; `202` and idempotent-replay acceptance both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; inline ordering; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
 
 Integration tests (`jans-auth-server/client`, disabled by default in `testng.xml` like the SPIFFE
 client-auth suite, enabled in the CI profile that provisions the prerequisites): the hardware is
@@ -1814,9 +1814,13 @@ the record, insert the outbox entry (which is also what allocates the chain sequ
 there is no separate chain state to keep consistent), then persist the action's entity, then
 respond. SQL backends do the two writes in one transaction; LDAP / Couchbase write in that order,
 and the only possible inconsistency (a record for an action that failed afterwards) is detectable
-by `jti` and repaired by a reconciliation job that emits a compensating `DENY` record linked to
-the orphan. Delivery to Lock is at-least-once with `409` treated as delivered (Lock is keyed by
-`record_id`). Crash recovery resends `pending` entries in sequence order from the outbox tail.
+by `jti` and repaired by a reconciliation job that emits a compensating, superseding
+`CREDENTIAL_PROVISIONED` record linked to the orphan. Delivery to Lock is at-least-once: the
+emitter marks an entry delivered on a `202` acceptance or on an idempotent-replay acceptance of the
+same `record_id` (Lock's store is keyed by `record_id`, so a re-POST after a crash is idempotent);
+a `409` — same `record_id`, *different* content — is never expected on the emission path and is
+surfaced as an error for investigation, never silently treated as delivered. Crash recovery resends
+`pending` entries in sequence order from the outbox tail.
 The outbox is bounded (`traceOutboxMaxEntries`, `traceOutboxMaxAgeSeconds`) and a full outbox
 fails `JWT-SVID` issuance closed (`503 evidence_unavailable`) or, under `fail-open`, marks the
 next record with a `coverage_gap` so the chain is visibly incomplete. Two failure-mode rows and
