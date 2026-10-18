@@ -903,10 +903,24 @@ New entity `AttestationAssessment` (`ou=attestations`, `jansAttest`): `attestati
 stored when `attestationStoreVerifierResult=true`, default), `verifierResultDigest`,
 `evidenceFormat`, `evidenceDigest`, raw evidence only when `attestationStoreEvidence=true`,
 `keyCertified` (core-computed, 9.3b), `challengeId`, `appraisedAt`, `expiresAt` (ORM TTL
-attribute, as tokens), `supersededBy`
-(id of the later `contraindicated` or `warning` assessment that replaced this one; set in the
-same transaction that stores the newer verdict), `traceRecordId`, `reasons`. Schema in `jans-linux-setup`, ORM entries for all backends. Lookups:
+attribute, as tokens), `supersededBy`, `supersededAt`, `consumed`, `consumedByJti`, `version`,
+`traceRecordId`, `reasons`. Schema in `jans-linux-setup`, ORM entries for all backends. Lookups:
 `latestRelevant(clientId, jkt)` (section 10.4), `byId`.
+
+Three fields carry the concurrency state, and they are not maintained with a multi-entry
+transaction (which LDAP and Couchbase do not offer) but with **per-entry optimistic
+compare-and-set (CAS)** on `version` — the same mechanism the challenge state machine already uses
+(section 9.3c):
+
+| Field | Meaning | How it is written |
+|-------|---------|-------------------|
+| `version` | A monotonic revision counter on the entry | Every mutation is a CAS: read `version = v`, write the change **conditioned on `version` still being `v`**, incrementing it to `v+1`. All supported backends expose this: a SQL `UPDATE … WHERE version = :v`, an LDAP modify with a `version`-assertion control (RFC 4528) or delete-old/add-new value edit, or a Couchbase mutate with the document CAS token. A lost CAS means another node changed the entry first; the loser re-reads and re-evaluates rather than overwriting. |
+| `supersededBy` / `supersededAt` | The id of the later `contraindicated` / `warning` assessment that invalidated this one, and when | Set by that later verdict's write (section 10.4), one entry at a time under CAS — never a transaction spanning several assessment entries |
+| `consumed` / `consumedByJti` | Whether this assessment has already backed an issuance, and which SVID `jti` consumed it (for `attestationRequireFreshPerIssuance`) | Set by a **conditional claim** at issuance (section 10.4): CAS `consumed=false → true` succeeds for exactly one concurrent `/token`; the losers get `attestation_required` and re-attest |
+
+`version` is also what makes "newest by `appraised_at`" unambiguous under a tie: two assessments
+with the same `appraisedAt` are ordered by `(appraisedAt, version)`, so `latestRelevant` is
+deterministic.
 
 ### 9.8 Configuration and discovery
 
@@ -988,22 +1002,45 @@ lives in hardware.
 ### 10.4 Attestation freshness rule
 
 ```text
-assessment = attestationService.latestRelevant(client_id, dpopJkt)   // newest by appraised_at, status != none
+assessment = attestationService.latestRelevant(client_id, dpopJkt)
+             // newest by (appraisedAt, version) among entries with status != none AND supersededBy == null
 maxAge     = min(attestationMaxAgeForIssuanceSeconds, client.attestationMaxAgeSeconds)
 if assessment == null
-   or assessment.status == contraindicated                              // a newer rejection wins over any older approval
+   or assessment.status == contraindicated                 // a newer rejection wins over any older approval
    or (assessment.status == warning && !attestationAcceptWarning)
-   or assessment.appraisedAt < now - maxAge
-   or (attestationRequireFreshPerIssuance && assessment already consumed by an issuance)
-then 400 attestation_required
+   or assessment.expiresAt <= now                          // the assessment's own validity window has closed
+   or assessment.appraisedAt < now - maxAge                // older than the issuance freshness bound
+   or (attestationRequireFreshPerIssuance && assessment.consumed)
+then
+   return 400 attestation_required
+
+if attestationRequireFreshPerIssuance:
+   // claim the assessment for exactly one issuance via per-entry CAS on `version`
+   ok = attestationService.compareAndConsume(assessment.id, assessment.version, svidJti)
+        // atomic: WHERE id = :id AND version = :v AND consumed = false
+        //         SET consumed = true, consumedByJti = :svidJti, version = v + 1
+   if not ok:
+      return 400 attestation_required                      // another /token consumed it first; re-attest
 ```
 
-**Latest relevant, not latest affirming.** The lookup takes the newest assessment for
-`(client_id, jkt)` whose status is a real verdict, and that verdict decides. An agent that was
-just refused cannot fall back to an older approval that is still inside the age window: a
-`contraindicated` appraisal **invalidates** every earlier approval for that key (implemented by
-marking them `superseded_by = <new id>` in the same transaction, so a concurrent `/token` on
-another node cannot race it). Which outcomes invalidate prior approval:
+Both an expired assessment (`expiresAt <= now`) and one older than the issuance freshness bound
+(`appraisedAt < now - maxAge`) are rejected — the two are distinct: `expiresAt` is the validity
+window the appraisal was stored with (section 9.7), `maxAge` is the stricter per-issuance bound,
+and either closing is sufficient to require re-attestation.
+
+**Latest relevant, not latest affirming.** The lookup takes the newest non-superseded assessment
+for `(client_id, jkt)` whose status is a real verdict (ordered by `(appraisedAt, version)` so ties
+are deterministic), and that verdict decides. An agent that was just refused cannot fall back to an
+older approval that is still inside the age window: a `contraindicated` appraisal **invalidates**
+every earlier approval for that key. This is implemented **without** a multi-entry transaction
+(LDAP and Couchbase have none): when a new `contraindicated`/`warning` verdict is stored, the
+writer marks each still-live earlier `affirming` assessment for that key
+`supersededBy = <new id>`, `supersededAt = now` with a **per-entry CAS on `version`** (section
+9.7). `latestRelevant` filters `supersededBy == null`, so a concurrent `/token` on another node
+either sees the new verdict as newest or sees the older approval already marked superseded; it can
+never settle on an approval the system has invalidated. A CAS that loses to a racing writer is
+retried against the re-read entry, so supersession converges without a transaction. Which outcomes
+invalidate prior approval:
 
 | Outcome of a new attestation attempt | Authenticated? | Effect on earlier `affirming` assessments for the same key |
 |--------------------------------------|----------------|-----------------------------------------------------------|
@@ -1637,7 +1674,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `SpiffeBundleRestWebServiceImplTest` | flag disabled; headers |
 | `SpiffeTrustDomainServiceTest` | pin on first start; adopt another node's value; invalid domain → `ERROR`, no exception |
 | `SpiffeIdUtilTest` (extend) | `buildAgentSpiffeId`; trust domain with `/` rejected |
-| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; `latestRelevant` picks the newest real verdict; a newer `contraindicated` supersedes an older fresh `affirming`; `none` neither supersedes nor extends; `key_mismatch` stored against the other key |
+| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; `latestRelevant` picks the newest **non-superseded** real verdict and breaks `appraisedAt` ties by `version`; an assessment past its own `expiresAt` is rejected even inside `maxAge`, and one past `maxAge` is rejected even before `expiresAt`; a newer `contraindicated` supersedes an older fresh `affirming` via per-entry CAS (no multi-entry transaction); a lost supersession CAS is retried and still converges; `attestationRequireFreshPerIssuance` consume is a CAS on `consumed` that succeeds for exactly one of two concurrent `/token` calls and the loser gets `attestation_required`; `none` neither supersedes nor extends; `key_mismatch` stored against the other key |
 | `AttestationRestWebServiceImplTest` | flag disabled; `invalid_challenge` carries a fresh challenge; no `500` for a verdict; `503 verifier_unavailable` keeps the challenge |
 | `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
 | `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
@@ -1736,7 +1773,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Evidence replayed from an earlier session | Challenge is single-use and bound to `jkt`; `nonce_mismatch` → `contraindicated`; the negative appraisal is itself recorded |
 | Evidence about a different key than the DPoP / registration key | Core extracts the attested key from the verifier result and the certify structure, compares it to the challenge `jkt` and to the registered keys; `key_mismatch`; the script has no input into this comparison |
 | Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **supersedes** any earlier approval at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
-| Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked superseded in the same transaction. The agent must obtain a new `affirming` appraisal |
+| Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked `supersededBy` by per-entry CAS (10.4), so a racing `/token` on another node cannot settle on them. The agent must obtain a new `affirming` appraisal |
 | Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side |
 | Agent decommissioned or compromised | Admin disables the client: issuance stops; tokens die within the TTL; introspection reports `active: false` |
 | Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out |
@@ -1900,9 +1937,14 @@ relevant assessment and define which failures invalidate prior approval; a verif
 have different semantics from an authenticated measurement failure.**
 
 Accepted. `latestAffirming` is replaced everywhere by `latestRelevant(client_id, jkt)`: the newest
-assessment with a real verdict (`status != none`) decides, and a `contraindicated` verdict
-supersedes every earlier approval for that key in the same transaction (`supersededBy` column in
-the assessment entity, section 9.7). Section 10.4 contains the rule and a table of outcomes:
+non-superseded assessment with a real verdict (`status != none`, ordered by `(appraisedAt, version)`)
+decides, and a `contraindicated` verdict supersedes every earlier approval for that key by setting
+`supersededBy`/`supersededAt` via **per-entry optimistic CAS on `version`** — not a multi-entry
+transaction, which LDAP and Couchbase do not provide (`supersededBy`/`version` columns in the
+assessment entity, section 9.7). The freshness check also rejects an assessment whose own
+`expiresAt` has passed, independently of the per-issuance `maxAge` bound, and
+`attestationRequireFreshPerIssuance` claims an assessment for exactly one issuance with a CAS on
+`consumed` (section 10.4). Section 10.4 contains the rule and a table of outcomes:
 
 - authenticated platform rejections (`measurement_not_allowed`, `debug_enabled`,
   `untrusted_verifier`, `key_not_certified`) and replay signals (`nonce_mismatch`,
