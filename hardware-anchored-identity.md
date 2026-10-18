@@ -1194,6 +1194,13 @@ Consequences this plan honours:
   checkpoints), not what the Phase-1 integration produces. Until then, verifying a full execution
   view is an online query against Lock, and only the **SVID itself** is offline-verifiable (against
   the SPIFFE bundle, section 6).
+- The agent's hardware attestation is about the agent's **credential**, not about the **producers**
+  that sign the evidence (`jans-auth`, `jans-svid-issuer`, Cedarling, the PEP — all different keys
+  from the agent's `K`). Attested-tier assurance for a *record* is the Phase-4 **instance-binding
+  assessment** (`design.md`: Deployment-Instance Binding Assessment), which requires an
+  instance-bound producer key and Lock confirming the attested-instance ↔ `workload_instance_id` ↔
+  producer-key ↔ record chain. This plan emits the `attestation_ref`/`posture_assessment_ref`
+  inputs but does not deliver that assessment; see the guarantee statement in section 15.
 
 The target Lock profile is `tag:jans.io,2026:trace-v1`; event kinds `AUTHORIZATION_DECISION`,
 `CAPABILITY_INVOKED`, `RUNTIME_EFFECT`, `CREDENTIAL_PROVISIONED`, `EXECUTION_STARTED`; envelope
@@ -1683,6 +1690,44 @@ It does **not** prove that the process invoking the signing operation is the int
 that the agent's memory or prompts are intact, or that no other process on the same platform can
 use `K`. Those need runtime measurement of the agent itself or behavioural evidence, which this
 plan records (TRACE) but does not attest.
+
+**A hardware-bound credential is not an attested TRACE producer.** The hardware binding proved
+above is a property of the agent's *credential*: the agent's key `K` lives in a secure element,
+and DPoP proofs and the SVID presentation demonstrate possession of it. The TRACE **evidence
+records**, by contrast, are signed by entirely different keys — the `jans-auth` and
+`jans-svid-issuer` producer keys, Cedarling's producer key, the PEP's enforcement-point key — none
+of which is `K`, and none of which the agent's attestation says anything about. So the SVID's
+`attestation` claim and a record's `attestation_ref` describe the *agent runtime*, not the runtime
+of the producer that signed the record. By itself that gives those records **no** attested-producer
+assurance: per `design.md`'s **Deployment-Instance Binding Assessment**, attested-tier uplift
+requires Lock to confirm the full four-way chain
+
+```text
+attested instance  ↔  subject.workload_instance_id  ↔  producer signing key  ↔  the record
+```
+
+— i.e. that the *attested* instance is the one the record *names*, that the *producer signing key*
+is bound to *that instance* (not merely to the logical producer), and that the record verified
+under that key. Until an instance-bound producer-key registration and that Lock-side
+`instance_binding` assessment exist, the chain's `producer signing key ↔ instance` link is
+`indeterminate`, Lock grants no attestation-derived uplift, and the records carry only the
+`trust_tier` their producer key class and collection path already justify. Concretely:
+
+- The attestation this plan produces establishes the **agent's** platform posture and the
+  **credential's** hardware binding; it does **not** establish that the Auth Server, the PDP, or
+  the PEP ran in an attested runtime when they signed their evidence.
+- Making the evidence itself attested-tier is the Phase-4 **RATS attestation binding +
+  instance-binding assessment** (see the §11.1 phase mapping and `design.md`: Attestation Binding
+  (RATS) / Deployment-Instance Binding Assessment). It needs each producer to attest *its own*
+  runtime and register an **instance-bound** signing key, so Lock can tie that key to the
+  `workload_instance_id` the record names. This plan does not deliver that; it emits the
+  `attestation_ref`/`posture_assessment_ref` fields that a later phase's instance-binding
+  assessment consumes, nothing more.
+- Where this plan wants the *agent's* attestation to raise assurance for a *producer's* record, the
+  producer and the agent would have to be the same attested runtime holding an instance-bound
+  producer key — which, for the Auth Server and a separate PEP/PDP, they are not. Treat the
+  hardware posture as assurance about the credential, and the record's trust tier as a separate,
+  producer-key-and-instance-binding question.
 
 | Event | Outcome |
 |-------|---------|
