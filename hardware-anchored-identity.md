@@ -92,7 +92,7 @@ flowchart LR
         A["Agent identity<br/>spiffe://td/agent/&lt;client_id&gt;"]
         K["Hardware key<br/>cnf.jkt (DPoP key in TPM / TEE)"]
         P["Policy decision<br/>AuthZEN / Cedarling · ALLOW or DENY"]
-        C["Governed capability<br/>capability_id at the PEP"]
+        C["Governed capability<br/>(action, resource_type) at the PEP;<br/>capability_id Lock-derived"]
     end
     X(("trace_execution_id<br/>= txn claim"))
     H -- "ID-JAG jti" --> X
@@ -103,16 +103,24 @@ flowchart LR
     X --> L["jans-lock TRACE store<br/>one execution view"]
 ```
 
+All five rows use the authoritative record schema: identities live in the `subject` object
+(`workload_id`, `workload_instance_id`, `human_sponsor`) and in `attestation_ref`, never in ad-hoc
+`agent` / `principal` / `hardware` sub-objects, and the hardware binding is carried as an
+attestation reference rather than a signed capability label.
+
 | Identity | Carried in | Bound by | Recorded as |
 |----------|-----------|----------|-------------|
-| Human | ID-JAG (`sub`, `email`, `acr`, `auth_time`) | OIDC login at the IdP; token exchange at jans | `subject.principal`; `tokens[]` entry `token_type=id-jag` |
-| Agent | JWT-SVID `sub` | Derived from `client_id` under the server's trust domain; never client-supplied | `subject.agent`; `tokens[]` entry `token_type=jwt-svid` |
-| Hardware key | JWT-SVID `cnf.jkt`; DPoP proof on every request | Attestation assessment binds `jkt` to platform + measurement | `subject.hardware` (`jkt`, `attestation_id`, `platform`, `measurement`) |
-| Policy decision | AuthZEN response | PDP evaluates agent + principal against capability | `AUTHORIZATION_DECISION` by the PDP |
-| Capability invocation | PEP log | PEP validates SVID + DPoP, checks decision, invokes | `CAPABILITY_INVOKED` by the PEP; `RUNTIME_EFFECT` by the capability |
+| Human | ID-JAG (`sub`, `email`, `acr`, `auth_time`) | OIDC login at the IdP; token exchange at jans | `subject.human_sponsor`; `tokens[]` entry `token_type=id-jag` |
+| Agent | JWT-SVID `sub` | Derived from `client_id` under the server's trust domain; never client-supplied | `subject.workload_id` (the SPIFFE ID); `tokens[]`/`credential_fingerprint` entry for the `jwt-svid` |
+| Hardware key | JWT-SVID `cnf.jkt`; DPoP proof on every request | Attestation assessment binds `jkt` to platform + measurement | `attestation_ref` (verifier, `result_status`, `appraised_at`) and `posture_assessment_ref` (`jkt`, `attestation_id`, `platform`, `measurement`) |
+| Policy decision | AuthZEN response | PDP evaluates agent + principal against the action/resource | `AUTHORIZATION_DECISION` signing `decision { action, resource_type, outcome }` (never a `capability_id`) by the PDP |
+| Capability invocation | PEP log | PEP validates SVID + DPoP, checks decision, invokes | `CAPABILITY_INVOKED` signing `invocation { action, resource_type, outcome }` by the PEP; `RUNTIME_EFFECT` by the capability |
 
 jans-auth-server produces the records for the first three rows. The last two are produced by the
-PDP and the PEP; this plan only fixes what they must copy (`txn`, token `jti`s, `capability_id`).
+PDP and the PEP; this plan only fixes what they must copy — the correlation pair
+(`trace_execution_id` + `execution_authority`, carried as the `txn`-derived execution id) and
+token `jti`s. Neither producer signs a `capability_id`: both sign `(action, resource_type)` facts,
+and Lock resolves the governance label from them (section 11.5).
 
 ## 4. What jans-auth-server already has
 
@@ -160,11 +168,11 @@ sequenceDiagram
     Verifier-->>AS: AttestationResultJWT
     Note over Verifier: platform verifier CREATES AttestationResultJWT<br/>(its signed appraisal of the raw evidence · echoes nonce + K.public)
     Note over AS: core: AttestationResultJWT signature + issuer under the verifier profile,<br/>nonce echoed, key bound, TPM2_Certify chain · script: measurement policy<br/>core: persist assessment
-    AS-->>Lock: ATTESTATION_APPRAISED
+    AS-->>Lock: CREDENTIAL_PROVISIONED (attestation verdict as posture_assessment_ref)
     AS-->>Agent: { attestation_id, status: affirming, expires_at }
     Agent->>AS: DCR /register { jwks: key, access_token_type: JWT-SVID, attestation: attestation_id }
     Note over AS: bind client_id ↔ jkt ↔ attestation_id<br/>assign spiffe://td/agent/#lt;client_id#gt;
-    AS-->>Lock: AUTHORIZATION_DECISION (register-client)
+    AS-->>Lock: CREDENTIAL_PROVISIONED (enrolled key · register-client)
     AS-->>Agent: client_id
 
     Note over AS,PEP: ② PUBLISH — on the bundle's own clock
@@ -173,7 +181,7 @@ sequenceDiagram
 
     Note over Human,AS: ③ DELEGATE — when a human starts an execution
     Human->>AS: token exchange: ID token → requested_token_type=id-jag, audience=AS
-    AS-->>Lock: AUTHORIZATION_DECISION (issue-id-jag)
+    AS-->>Lock: EXECUTION_STARTED (token-exchange bootstrap · ID-JAG issued)
     AS-->>Human: ID-JAG { sub: alice, client_id: agent, txn }
     Human->>Agent: hand ID-JAG to the agent
 
@@ -182,8 +190,8 @@ sequenceDiagram
     TEE-->>Agent: signatures (key never leaves)
     Agent->>AS: POST /token grant=jwt-bearer assertion=ID-JAG (or client_credentials)<br/>DPoP proof · resource=#lt;PEP#gt;
     Note over AS: jkt = thumbprint of the DPoP proof public key (K.public)<br/>jkt must be a registered key of client_id<br/>assessment looked up by latestRelevant(client_id, jkt)<br/>status must be affirming and appraised_at within max age,<br/>else 400 attestation_required { nonce }
-    AS-->>Lock: AUTHORIZATION_DECISION (issue-jwt-svid)
-    AS-->>Agent: JWT-SVID { sub: spiffe id, aud, exp +10m, cnf.jkt, txn, attestation, act }
+    AS-->>Lock: CREDENTIAL_PROVISIONED (SVID issued · posture_assessment_ref)
+    AS-->>Agent: JWT-SVID { sub: spiffe id, aud, exp +10m, cnf.jkt, txn, attestation, delegation }
 
     Note over TEE,PEP: ⑤ PRESENT & VERIFY — per request
     Agent->>TEE: fresh DPoP proof for the PEP
@@ -379,7 +387,7 @@ sequenceDiagram
     end
     Script-->>AS: status · platform · measurement · policy_version · AttestationResultJWT
     Note over AS: core verifies binding itself: AttestationResultJWT signature + issuer,<br/>nonce claim == challenge nonce, key claim == challenge jkt, TPM2_Certify chain<br/>status = min(core binding, script policy) · persist assessment
-    AS-->>Lock: ATTESTATION_APPRAISED (outbox)
+    AS-->>Lock: CREDENTIAL_PROVISIONED (posture_assessment_ref · outbox)
     AS-->>Agent: 200 { attestation_id, status, expires_at, … }
 ```
 
@@ -594,15 +602,15 @@ Response `200` (also for negative verdicts; the verdict is the payload):
 | `verifier` | URI of the party that appraised the raw evidence: the platform verifier the script called, or this issuer for in-process appraisal |
 | `verifier_result_digest` | SHA-256 of the `AttestationResultJWT` the script received (absent for in-process appraisal). The JWT itself is stored with the assessment (`attestationStoreVerifierResult`, default `true`) and is not returned to the agent unless `attestationEchoVerifierResult=true` |
 | `reasons` | Stable codes for `warning` / `contraindicated` / `none`: `measurement_not_allowed`, `evidence_expired`, `nonce_mismatch`, `key_mismatch`, `untrusted_verifier`, `debug_enabled`, `verifier_unavailable`, … |
-| `trace_record_id` | `record_id` of the `ATTESTATION_APPRAISED` TRACE record when emission is enabled |
+| `trace_record_id` | `record_id` of the `CREDENTIAL_PROVISIONED` TRACE record (carrying this verdict as its `posture_assessment_ref`) when emission is enabled |
 
 Errors (`400`): `invalid_challenge` (unknown / expired / used; body carries a fresh `challenge_id`
 + `nonce` for a one-round-trip retry), `invalid_request`, `unsupported_evidence_format`,
 `evidence_too_large`. `503 verifier_unavailable` when the script could not reach the platform
 verifier (timeout, 5xx, TLS failure): no verdict about the hardware is implied, the challenge is
-**not** consumed so the agent can retry with the same evidence, and an `ATTESTATION_APPRAISED`
-record with `status=none`, reason `verifier_unavailable` is still emitted. `500` is never used for
-a negative verdict.
+**not** consumed so the agent can retry with the same evidence, and a `CREDENTIAL_PROVISIONED`
+record whose `posture_assessment_ref.status=none`, reason `verifier_unavailable`, is still emitted.
+`500` is never used for a negative verdict.
 
 ### 9.3a Key certification: proving that `K` is a hardware-protected key
 
@@ -814,7 +822,7 @@ that already exist, and each consumer has one of them:
 | DCR | The `attestation` parameter is the `attestation_id`; the server reads its own store |
 | `/token` | Looks the assessment up by `(client_id, jkt)` (10.4); an `attestation_id` is only needed for the inline retry path |
 | Relying parties | The issued SVID's `attestation` claim, signed with the SVID |
-| Auditors | The `ATTESTATION_APPRAISED` TRACE record, signed with the producer key, holding `verifier_result_digest` and `evidence_digest` |
+| Auditors | The `CREDENTIAL_PROVISIONED` TRACE record, signed with the producer key, whose `posture_assessment_ref` holds `verifier_result_digest` and `evidence_digest` |
 
 One signed object remains in the attestation flow, the platform verifier's
 **`AttestationResultJWT`** (obtained and validated by jans, stored with the assessment, digest in
@@ -1098,8 +1106,8 @@ top-level `txn` member so an agent that did not supply one learns the execution 
 
 `IdJagService` sets `txn` on every ID-JAG it issues (fresh identifier unless the exchange request
 carries `txn` naming an open execution of the same client). This puts the human's login at the
-root of the execution: the ID-JAG `jti` and `sub` appear in `tokens[]` and `subject.principal`
-of every later record.
+root of the execution: the ID-JAG `jti` appears in `tokens[]` and its `sub` in
+`subject.human_sponsor` of every later record.
 
 Open executions are tracked in a small persistent registry (`jansTraceExecution`: `txn`,
 `clientId`, `principal`, `openedAt`, `expiresAt`, `closed`) so that `/token` can validate a
@@ -1123,13 +1131,13 @@ first).
 ```mermaid
 flowchart LR
     subgraph AS["jans-auth-server (producer: jans-auth)"]
-        E1["ATTESTATION_APPRAISED<br/>subject.hardware · verdict"]
-        E2["AUTHORIZATION_DECISION<br/>urn:jans:capability:register-client"]
-        E3["AUTHORIZATION_DECISION<br/>urn:jans:capability:issue-id-jag"]
-        E4["AUTHORIZATION_DECISION<br/>urn:jans:capability:issue-jwt-svid<br/>tokens: id-jag, jwt-svid"]
+        E1["CREDENTIAL_PROVISIONED<br/>attestation verdict as posture_assessment_ref"]
+        E2["CREDENTIAL_PROVISIONED<br/>enrolled key (register-client)"]
+        E3["EXECUTION_STARTED<br/>bootstrap: ID-JAG issued"]
+        E4["CREDENTIAL_PROVISIONED<br/>SVID issued<br/>credential: jwt-svid; delegation: id-jag"]
     end
     subgraph PDP["PDP (producer: cedarling)"]
-        E5["AUTHORIZATION_DECISION<br/>payments:refund · ALLOW"]
+        E5["AUTHORIZATION_DECISION<br/>decision{action:Refund, resource_type:Payment, ALLOW}"]
     end
     subgraph PEP["Gateway (producer: demo-gateway)"]
         E6["CAPABILITY_INVOKED<br/>tokens: jwt-svid"]
@@ -1162,15 +1170,37 @@ beyond that requires an external anchor (SCITT, section 18), which is out of sco
 
 ### 11.2 Records emitted
 
-| Event | `event_kind` | When | `capability_ids` | `tokens[]` | `subject` |
-|-------|--------------|------|------------------|------------|-----------|
-| Attestation appraised | `ATTESTATION_APPRAISED` (new kind in Lock, section 12; fallback: `AUTHORIZATION_DECISION` with `urn:jans:capability:attest-key`) | every verdict, including `none` | none | none | `hardware { jkt, attestation_id, platform, measurement, policy_version, status, verifier, verifier_result_digest, evidence_digest }`. **Lifecycle record**: `trace_execution_id = "att:" + attestation_id` (its own scope, not a later execution's) |
-| Client enrolled | `AUTHORIZATION_DECISION` | DCR accepted / rejected for an attested client | `urn:jans:capability:register-client` | none | `agent { spiffe_id, client_id }`, `hardware`. **Lifecycle record**: `trace_execution_id = "enroll:" + client_id`; `parent_record_ids → attested_by` the appraisal |
-| Human delegated | `AUTHORIZATION_DECISION` | ID-JAG issued | `urn:jans:capability:issue-id-jag` | `id-jag` (`jti`), `id_token` (`fingerprint`) | `principal { iss, sub, acr, auth_time }`, `agent { client_id }` |
-| SVID issued | `AUTHORIZATION_DECISION` | SVID issued or refused | `urn:jans:capability:issue-jwt-svid` | `jwt-svid` (`jti`), `id-jag` when present | `agent`, `principal`, `hardware` |
+Every record uses the authoritative GovOps/Jans record schema, not a bespoke shape: `subject`
+carries `workload_id` / `workload_instance_id` / `human_sponsor` (never the ad-hoc
+`agent` / `principal` / `hardware` sub-objects of an earlier draft), hardware/appraisal evidence
+travels in `attestation_ref` and `posture_assessment_ref`, and **no record signs a
+`capability_id`** — that label is Lock-derived from the signed facts (section 11.5). The four
+server events map onto existing event kinds rather than inventing one:
 
-SVID issuance record (`trace.policy` describes jans's own issuance policy; `runtime.pdp_id` is this
-server because the auth server is the PDP for "may this agent receive this credential"):
+Note on credentials vs. `tokens[]`: `CREDENTIAL_PROVISIONED` carries **no** `tokens[]` — the
+credential it provisions is named in `event.credential_fingerprint`, and any related credential
+(e.g. the ID-JAG behind a delegated SVID) is referenced through `parent_record_ids`. Only the
+`EXECUTION_STARTED` bootstrap carries `tokens[]` (the source ID-JAG / ID token of the exchange).
+
+| Event | `event_kind` | When | Signed facts | Credential / tokens | `subject` + scope |
+|-------|--------------|------|--------------|---------------------|-------------------|
+| Attestation appraised | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance`, no credential yet bound; the appraisal is carried as `posture_assessment_ref` + `attestation_ref`) | every verdict, including `none` | `posture_assessment_ref { attestation_id, status, platform, measurement, policy_version, verifier, verifier_result_digest, evidence_digest }`, `assessment_policy` | no `tokens[]`; no `credential_fingerprint` yet (bare-key appraisal) | `workload_id` (the enrolling client where known; absent for a bare key appraisal), `attestation_ref`. **Lifecycle record**: `trace_execution_id = "att:" + attestation_id` |
+| Client enrolled | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance`) | DCR accepted / rejected for an attested client | `workload_id`, `validity_period`, `provisioning_authority`, `posture_assessment_ref`, `credential_attributes { trust_domain, spiffe_id }` | `credential_fingerprint` = the enrolled key `jkt`; no `tokens[]` | `workload_id`, `attestation_ref`. **Lifecycle record**: `trace_execution_id = "enroll:" + client_id`; `parent_record_ids → attested_by` the appraisal |
+| Human delegated | `EXECUTION_STARTED` (token-exchange bootstrap form) | ID-JAG issued | `bootstrap { source_token_fingerprint, initial_capability_constraints }` | `tokens[]`: `id-jag` (`jti`), `id_token` (`fingerprint`) | `workload_id` (agent), `human_sponsor`. Opens the execution `txn` |
+| SVID issued | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance` or `renewal`) | SVID issued or refused | `workload_id`, `validity_period`, `provisioning_authority`, `posture_assessment_ref`, `credential_attributes { audiences }` | `credential_fingerprint` = `jwt-svid` (`jti`/`fingerprint`, `cnf_key_thumbprint`); the ID-JAG is linked via `parent_record_ids`, not `tokens[]` | `workload_id`, `human_sponsor`, `attestation_ref`. Correlated to the execution `txn` |
+
+The SVID-issuance decision ("may this agent receive this credential?") is a genuine policy
+decision, but it is recorded the way AIMS §8 models credential provisioning: the authority signs
+*that it provisioned a credential under an evaluated posture*, with the attestation verdict carried
+as the posture assessment, rather than a synthetic `AUTHORIZATION_DECISION` whose `(action,
+resource_type)` would be a made-up capability. Where a deployment genuinely wants a separate
+decision record for the issuance policy, it emits an `AUTHORIZATION_DECISION` signing a real
+`decision { action, resource_type, outcome }` (e.g. `action = Jans::Action::"IssueSvid"`,
+`resource_type = Jans::AgentCredential`) and links it to the `CREDENTIAL_PROVISIONED` by
+`parent_record_ids` — it never signs a `capability_id`.
+
+SVID issuance record (`CREDENTIAL_PROVISIONED`; the attestation verdict is the posture assessment,
+`provisioning_authority` is this server as the SPIFFE/SVID issuer):
 
 ```json
 {
@@ -1179,33 +1209,48 @@ server because the auth server is the PDP for "may this agent receive this crede
   "record_id": "rec_01J9…",
   "trace": {
     "eat_profile": "tag:jans.io,2026:trace-v1",
-    "event_kind": "AUTHORIZATION_DECISION",
+    "event_kind": "CREDENTIAL_PROVISIONED",
     "signed_at": 1790000100,
     "trace_execution_id": "exe_01J9…",
     "execution_authority": "https://op.example.org",
     "subject": {
-      "agent": { "spiffe_id": "spiffe://op.example.org/agent/3f9c…", "client_id": "3f9c…" },
-      "principal": { "iss": "https://idp.example.com", "sub": "alice", "acr": "urn:…:mfa" },
-      "hardware": { "jkt": "9XKt…", "attestation_id": "att_7b1e…", "platform": "azure-cvm-sev-snp",
-                    "measurement": "sha384:c9e4…", "policy_version": "agent-tpm-policy-2026-09" }
+      "workload_id": "spiffe://op.example.org/agent/3f9c…",
+      "workload_instance_id": "04bbe9ef-…",
+      "human_sponsor": "alice"
     },
-    "policy": {
-      "policy_store_id": "jans-auth-issuance",
-      "policy_store_version": "agent-tpm-policy-2026-09",
-      "policy_language": "jans-config",
-      "policy_language_version": "1",
-      "bundle_hash": "sha256:…"
+    "attestation_ref": {
+      "binding_kind": "attestation_result",
+      "attester": "spiffe://op.example.org/agent/3f9c…",
+      "verifier": "https://sharedeus.eus.attest.azure.net",
+      "result_digest": { "scheme": "plain_digest", "algorithm": "sha-256", "value": "sha256:…" },
+      "result_status": "affirming",
+      "appraised_at": 1790000000,
+      "freshness": { "mechanism": "nonce", "freshness_limit_seconds": 300 }
     },
     "runtime": { "pdp_id": "https://op.example.org" },
     "event": {
-      "outcome": "ALLOW",
-      "capability_ids": [ { "capability_id": "urn:jans:capability:issue-jwt-svid", "outcome": "ALLOW" } ],
-      "tokens": [
-        { "issuer": "https://op.example.org", "token_type": "jwt-svid", "jti": "svid_…" },
-        { "issuer": "https://idp.example.com", "token_type": "id-jag", "jti": "550e…" }
-      ],
-      "audience": "https://rp.example.com",
-      "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer"
+      "provisioning_kind": "initial_issuance",
+      "workload_id": "spiffe://op.example.org/agent/3f9c…",
+      "credential_fingerprint": {
+        "credential_type": "jwt_svid",
+        "jti": "svid_…",
+        "cnf_key_thumbprint": "9XKt…"
+      },
+      "validity_period": { "valid_from": 1790000100, "valid_until": 1790000700 },
+      "provisioning_authority": "https://op.example.org",
+      "posture_assessment_ref": {
+        "attestation_id": "att_7b1e…",
+        "status": "affirming",
+        "platform": "azure-cvm-sev-snp",
+        "measurement": "sha384:c9e4…",
+        "verifier": "https://sharedeus.eus.attest.azure.net",
+        "verifier_result_digest": "sha256:…"
+      },
+      "assessment_policy": { "policy_version": "agent-tpm-policy-2026-09", "bundle_hash": "sha256:…" },
+      "credential_attributes": {
+        "trust_domain": "op.example.org",
+        "audiences": ["https://rp.example.com"]
+      }
     }
   },
   "producer_chain": {
@@ -1224,6 +1269,12 @@ server because the auth server is the PDP for "may this agent receive this crede
 }
 ```
 
+`CREDENTIAL_PROVISIONED` carries **no** `tokens[]`, `capability_ids`, or `trace.policy` (those are
+not applicable to the kind — see `design.md`: Event-Kind-Specific Schemas); the credential it
+provisions is named by `event.credential_fingerprint`, and the SVID's own `jti` appears there, not
+in a `tokens[]` decision context. The ID-JAG the human delegation used is referenced through the
+`EXECUTION_STARTED` bootstrap and `parent_record_ids`, not by presenting it as a token here.
+
 `bundle_hash` is the SHA-256 of the RFC 8785 canonical JSON of **every input that can change
 whether this issuance is accepted**, so that any such change shows up as a policy change:
 
@@ -1235,9 +1286,12 @@ whether this issuance is accepted**, so that any such change shows up as a polic
 | Update-token and client-registration scripts in force for this client | `name` + `revision` + source digest of each |
 | Client overrides | `attestationMaxAgeSeconds`, `allowedResources`, `accessTokenLifetime`, `accessTokenSigningAlg` |
 
-`policy_store_version` is the script's `policy_version` for readability; `bundle_hash` is the
-authoritative identity of the policy. Token refs never carry token material, only `jti` or a
-SHA-256 `fingerprint`, as Lock's validator enforces.
+This digest is carried as the `assessment_policy` of the `CREDENTIAL_PROVISIONED` record (its
+`policy_version` is the script's `policy_version` for readability; its `bundle_hash` is the
+authoritative identity of the issuance ruleset). It is the posture-assessment policy the credential
+was provisioned under, not a `trace.policy` block — `CREDENTIAL_PROVISIONED` carries no
+`trace.policy`. Credential fingerprints never carry token material, only `jti` or a SHA-256
+`fingerprint`, as Lock's validator enforces.
 
 ### 11.3 Emission path
 
@@ -1302,19 +1356,36 @@ identical.
 | `traceClientId` | — | Client used to obtain `trace.write` tokens |
 | `traceEmissionMode` | `outbox` | `outbox` or `inline` |
 | `traceRecordAllIssuance` | `false` | Also record non-SVID issuance |
-| `traceAttestationAsDecision` | `false` | Fallback encoding until Lock has `ATTESTATION_APPRAISED` |
+| `traceEmitIssuanceDecision` | `false` | Also emit a separate `AUTHORIZATION_DECISION` (real `(action, resource_type)`) alongside the `CREDENTIAL_PROVISIONED`, for deployments that want an explicit issuance-policy decision record |
 
 ### 11.4 Mapping to the agentrust TRACE v0.2 record
 
 Lock's profile is an event model; the agentrust Trust Record is a per-run summary. A gateway that
 publishes an agentrust record for a run reads one Lock execution and fills: `subject` ←
-`subject.agent.spiffe_id`; `cnf.jwk` ← the attested key; `runtime.platform` / `measurement` /
-`nonce` and `appraisal.*` ← `ATTESTATION_APPRAISED`; `policy.bundle_hash` ← the PDP decision;
+`subject.workload_id`; `cnf.jwk` ← the attested key; `runtime.platform` / `measurement` /
+`nonce` and `appraisal.*` ← the `CREDENTIAL_PROVISIONED` `posture_assessment_ref` /
+`attestation_ref`; `policy.bundle_hash` ← the PDP decision's `trace.policy`;
 `tool_transcript.hash` ← digest over the ordered `CAPABILITY_INVOKED` records;
 `references[rel=authorized-intent]` ← the PDP decision record; `references[rel=approval-outcome]`
 ← the ID-JAG (`jti`, IdP as resolver); `delegation.credential_id` ← the ID-JAG `jti`;
 `transparency` ← Lock receipt URI. Export concern, not auth-server code; listed so the demo can
 show both views from one set of facts.
+
+### 11.5 Capability resolution is Lock-derived, never signed
+
+No record this server emits signs a `capability_id`, and neither do the PDP and PEP. Producers sign
+the **facts** — a `CREDENTIAL_PROVISIONED` provisioning event, an `AUTHORIZATION_DECISION` signing
+`decision { action, resource_type, outcome }`, a `CAPABILITY_INVOKED` signing
+`invocation { action, resource_type, outcome }`. Lock resolves the governance label
+`capability_id` from `(policy_store_id, policy_store_version, action, resource_type)` against the
+versioned capability mapping in the policy store and stores it as the Lock-derived
+`capability_resolution`, outside the signed assertion (see `govops-trace-profile.md` §9 and
+`design.md`: Capability Resolution). This plan therefore does **not** define
+`urn:jans:capability:*` values as signed fields; where this server acts as the PDP for an issuance
+policy and wants a decision record, it signs a real `(action, resource_type)` pair (e.g.
+`Jans::Action::"IssueSvid"` / `Jans::AgentCredential`) and lets Lock map it to a capability. The
+earlier draft's record-level `capability_ids` arrays and `urn:jans:capability:*` identifiers are
+removed for this reason.
 
 ## 12. What's new inside jans-auth-server
 
@@ -1374,10 +1445,10 @@ SDKs.
 | Component | Change | Needed by |
 |-----------|--------|-----------|
 | jans-core | `CustomScriptType.ATTESTATION`, `AttestationType`, `DummyAttestationType`; `JcsCanonicalizer` moved from Lock | PR 1, PR 6 |
-| jans-lock | New event kind `ATTESTATION_APPRAISED` + validator (`outcome` ∈ affirming/warning/contraindicated, `subject.hardware.jkt`, `event.attestation_id`, `platform`, `measurement`, `policy_version`; forbids `capability_ids`, `policy`); confirm `POST /audit/trace` submit and `GET /audit/trace/executions/{id}` read endpoints (documented, only the admin REST class exists on this branch) | PR 6, demo |
+| jans-lock | Accept the existing `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED` (bootstrap) event kinds this plan emits — no new event kind is introduced (the earlier `ATTESTATION_APPRAISED` proposal is dropped in favor of `CREDENTIAL_PROVISIONED` carrying the attestation verdict as `posture_assessment_ref`/`attestation_ref`); confirm the `POST /api/v1/audit/trace` submit (`202`, idempotent replay) and `GET /api/v1/audit/trace/executions/{id}` read endpoints (these are a Lock dependency, not reused — only the admin REST class exists on this branch) | PR 6, demo |
 | jans-linux-setup | Schema for `jansAttest`, `jansTraceChain`, `jansTraceOutbox`; register `jans-auth` producer key + chain in Lock when both are enabled; ship the reference script | PR 1, PR 6 |
 | jans-config-api, jans-cli-tui, Admin UI | `access_token_type`, attestation and trace properties | after PR 2 |
-| PDP / PEP (Cedarling, demo gateway) | Copy `txn`, token `jti`s and `capability_id` into their records; PEP validates SVID + DPoP via the bundle | demo |
+| PDP / PEP (Cedarling, demo gateway) | Copy the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s into their records, and sign `(action, resource_type)` facts — **never** a `capability_id` (Lock resolves it, section 11.5); PEP validates SVID + DPoP via the bundle | demo |
 
 ## 13. Implementation phases and pull requests
 
@@ -1517,7 +1588,7 @@ plan records (TRACE) but does not attest.
 | RFC 7662 Introspection | Online verification | **Implemented**; new claims |
 | OpenID AuthZEN 1.0 | Decision API the PEP calls | **Implemented** |
 | TRACE v0.2 (agentrust) | Record semantics, `references` registry, RFC 8785 canonicalisation, Ed25519 | Lock profile exists; export mapping |
-| OWASP GovOps | Capability catalogue naming (`capability_id` values) | Align as published |
+| OWASP GovOps | Record schema (`subject.workload_id`, signed `(action, resource_type)` facts, Lock-derived `capability_id`), capability-catalogue naming | Align as published; records conform to `govops-trace-profile.md` |
 
 ## 17. Resolved decisions and open questions
 
@@ -1587,7 +1658,7 @@ plan records (TRACE) but does not attest.
   accepted *input* at enrollment, never a protocol dependency.
 - **Node / workload attestation plugins à la SPIRE.** EAT plus platform verifiers is the single
   envelope.
-- **Changes to PDP / PEP record formats** beyond copying `txn`, token `jti`s and `capability_id`.
+- **Changes to PDP / PEP record formats** beyond copying the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s; they sign `(action, resource_type)` facts, and Lock derives `capability_id`.
 - **SCITT transparency logging.** Lock's receipt chain is the anchor for now; a receipt URI can be
   added to records later without changing producers.
 
@@ -1743,8 +1814,8 @@ becomes useful only when another system actually needs to consume it independent
 Accepted; removed. The design no longer mints a jans-signed assessment token. Section 9.6 now
 lists how each consumer learns the verdict without one: the agent from the `/attestation`
 response, DCR from the `attestation_id` it is given, `/token` from the `(client_id, jkt)` lookup,
-relying parties from the SVID's `attestation` claim, auditors from the `ATTESTATION_APPRAISED`
-record. The `attestation_assessment` response member, the `attestation-assessment+jwt` type, the
+relying parties from the SVID's `attestation` claim, auditors from the `CREDENTIAL_PROVISIONED`
+record (whose `posture_assessment_ref` carries the verdict). The `attestation_assessment` response member, the `attestation-assessment+jwt` type, the
 inline "assessment JWT" variants at DCR and `/token`, the corresponding test class and the
 "two result objects" decision were removed; the only signed attestation object left is the
 platform verifier's `AttestationResultJWT`. Section 9.6 notes the one case that would justify a
