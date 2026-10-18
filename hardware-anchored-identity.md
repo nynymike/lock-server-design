@@ -221,7 +221,7 @@ sequenceDiagram
     Agent->>TEE: fresh DPoP proof for the PEP
     TEE-->>Agent: proof
     Agent->>PEP: request + JWT-SVID + DPoP proof
-    Note over PEP: local: signature via bundle, sub, aud, exp<br/>DPoP key ↔ cnf.jkt · PDP decision · copy the pair<br/>(trace_execution_id + execution_authority)
+    Note over PEP: local: signature via bundle, sub, aud, exp<br/>full RFC 9449 DPoP proof (htm, htu, iat/age, jti-replay,<br/>nonce when used) · proof key ↔ cnf.jkt · PDP decision<br/>· copy the pair (trace_execution_id + execution_authority)
     PEP-->>Lock: CAPABILITY_INVOKED / RUNTIME_EFFECT
     PEP-->>Agent: 200
 ```
@@ -274,7 +274,34 @@ server {
 wants the hardware guarantee additionally demands a fresh DPoP proof signed by the key in `cnf`.
 Plain SPIFFE verifiers ignore `cnf`, the `https://jans.io/trace/*` correlation claims, `txn`,
 `attestation` and `delegation` (unknown claims are additive), so the token stays spec-valid for
-both audiences.
+both audiences. **A plain JWT-SVID validator that ignores `cnf` is bearer-only**: it gains no
+hardware guarantee, and a stolen SVID works at it until `exp`. The hardware binding is only
+realized by a PEP that performs the full proof-of-possession check below; this is why a
+high-value RP MUST be `cnf`-checking and SHOULD require DPoP, not merely validate the JWT.
+
+**Normative PEP DPoP-presentation requirements (RFC 9449).** "Fresh DPoP proof" is not a
+single check. A PEP that relies on the hardware binding MUST, on **every** request, verify the
+`DPoP` header proof as a complete RFC 9449 presentation — comparing the proof key to `cnf.jkt` is
+necessary but far from sufficient:
+
+| Check | Requirement |
+|-------|-------------|
+| Proof signature | The DPoP proof JWT (`typ: dpop+jwt`) verifies under the public key in its own `jwk` header, and that key's RFC 7638 thumbprint **equals the SVID's `cnf.jkt`** — this is the possession check, not the whole check |
+| `htm` | Equals the HTTP method of the request the proof accompanies (e.g. `POST`) |
+| `htu` | Equals the request URI with query and fragment removed, compared after normalization — the proof is bound to **this** endpoint, so a proof captured at one resource cannot be replayed at another |
+| `iat` / proof age | Within a small configured window (seconds–low minutes) of now, rejecting both stale proofs and proofs from the future beyond allowed clock skew |
+| `jti` + replay cache | Unique; the PEP keeps a **replay cache** of recently-seen `jti`s (at least the proof-age window) and rejects a repeat, so a single proof cannot be reused |
+| `nonce` (when used) | When the PEP issues a DPoP nonce (`DPoP-Nonce` / `use_dpop_nonce` challenge), the proof's `nonce` MUST equal the most recently issued value; a missing/stale nonce is rejected with a fresh challenge. A PEP under replay pressure SHOULD require a server-provided nonce rather than rely on `iat`/`jti` alone |
+| `ath` (when present) | If the proof carries an access-token hash (`ath`), it MUST equal the base64url SHA-256 of the presented SVID, binding the proof to this exact token |
+| audience | The SVID's `aud` MUST equal this PEP/resource (the ordinary JWT-SVID check), so a token minted for another resource is refused regardless of a valid proof |
+
+A PEP that performs only the `cnf.jkt` thumbprint comparison and skips `htm`/`htu`/age/`jti`-replay/
+`nonce` is **not** sender-constrained in practice: a captured proof could be replayed against a
+different method, a different endpoint, or more than once. These requirements are the same RFC 9449
+checks jans already applies at its own DPoP-protected endpoints (`DpopService`), restated here as
+the PEP's obligation; a PEP SHOULD reuse an RFC 9449 library rather than re-implement them. The
+demo gateway's PEP implements the full table, and `JwtSvidRoundTripHttpTest` exercises the negative
+cases (wrong `htu`, wrong `htm`, stale `iat`, replayed `jti`, missing required `nonce`).
 
 ![JWT-SVID verification anatomy](../../../assets/agent-identity-jwt-svid-verification.svg)
 
@@ -284,7 +311,7 @@ both audiences.
 | `sub` | `spiffe://op.example.org/agent/3f9c` authorised here? | relying party's identity policy |
 | `aud` | equals this service | the service's own identifier |
 | `iat`/`exp` | fresh (≤ 15 min) | clock |
-| `cnf.jkt` | DPoP proof verifies **and** proof key thumbprint matches | the hardware key, attested |
+| `cnf.jkt` | Full RFC 9449 DPoP presentation: proof signature, `htm`, `htu`, `iat`/age, unique `jti` against a replay cache, `nonce` when used, `ath` when present, **and** the proof-key thumbprint equals `cnf.jkt` (see "Normative PEP DPoP-presentation requirements" above) — not the thumbprint comparison alone | the hardware key, attested |
 | `attestation` | `status=affirming`, `appraised_at` recent, `measurement` acceptable to *this* verifier | the appraisal, re-checkable in Lock |
 | `delegation` | which human delegated, through which credential, at what authentication strength (`acr`/`amr`) and in which session (`sid`) | ID-JAG, recorded in Lock; the `sid` resolves to the Auth Server `AUTHENTICATION_EVENT` / FIDO `FIDO_CEREMONY` (§10.9) |
 
@@ -1918,7 +1945,7 @@ SDKs.
 | jans-lock | Accept the existing `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED` (bootstrap) event kinds this plan emits — no new event kind is introduced (the earlier `ATTESTATION_APPRAISED` proposal is dropped in favor of `CREDENTIAL_PROVISIONED` carrying the attestation verdict as `posture_assessment_ref`/`attestation_ref`); confirm the `POST /api/v1/audit/trace` submit (`202`, idempotent replay) and `GET /api/v1/audit/trace/executions/{id}` read endpoints (these are a Lock dependency, not reused — only the admin REST class exists on this branch) | PR 6, demo |
 | jans-linux-setup | Schema for `jansAttest`, `jansTraceChain`, `jansTraceOutbox`; register **both** producer keys + chains in Lock when enabled — `jans-auth` scoped `["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]` and `jans-svid-issuer` scoped `["CREDENTIAL_PROVISIONED"]`, each with its own Producer-Key Authorization Statement; ship the reference script | PR 1, PR 6 |
 | jans-config-api, jans-cli-tui, Admin UI | `access_token_type`, attestation and trace properties | after PR 2 |
-| PDP / PEP (Cedarling, demo gateway) | Copy the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s into their records, and sign `(action, resource_type)` facts — **never** a `capability_id` (Lock resolves it, section 11.5); PEP validates SVID + DPoP via the bundle | demo |
+| PDP / PEP (Cedarling, demo gateway) | Copy the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s into their records, and sign `(action, resource_type)` facts — **never** a `capability_id` (Lock resolves it, section 11.5); PEP validates the SVID via the bundle **and** performs the full RFC 9449 DPoP presentation check (`htm`/`htu`/`iat`-age/`jti`-replay/`nonce`-when-used/`ath`, plus proof-key = `cnf.jkt`; §6) — the thumbprint comparison alone is not sender-constrained | demo |
 | Auth Server / FIDO Server human-authentication evidence | The signed `AUTHENTICATION_EVENT` (`auth-server-trace-design.md`) and `FIDO_CEREMONY` (`fido-trace-design.md` / `fido-trace-design-MVP.md`) that resolve the human login behind an execution, correlated by `sid` (§10.9). **Deferred past the Lock MVP** (authentication/FIDO events are not in the three-kind MVP catalog); this plan only carries the `acr`/`amr`/`sid` inputs and gates delegation on them | later phase |
 
 ## 13. Implementation phases and pull requests
@@ -2061,7 +2088,8 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 
 | Event | Outcome |
 |-------|---------|
-| JWT-SVID stolen in transit or from a log | Replay fails at any `cnf`-checking verifier: no DPoP proof without the hardware key. At bearer-only verifiers it works until `exp`, which is why the TTL is minutes and high-value RPs should check `cnf` |
+| JWT-SVID stolen in transit or from a log | Replay fails at any PEP that performs the full RFC 9449 presentation check (§6): no valid DPoP proof without the hardware key. At a **bearer-only** verifier that ignores `cnf` it works until `exp`, which is why the TTL is minutes and a high-value RP MUST be `cnf`-checking and require DPoP |
+| Captured DPoP proof replayed (different method/endpoint, or reused) | Rejected by the PEP's `htm`/`htu` binding and its `jti` replay cache (§6); a proof is bound to one method, one endpoint, and one use, and a nonce challenge closes the window further. A PEP that only compares the proof-key thumbprint to `cnf.jkt` and skips these is not sender-constrained — the §6 requirements are normative for that reason |
 | Agent host compromised, key exfiltration attempted | Key is non-exportable; the attacker can only ask the hardware to sign while resident. Proof freshness windows and short SVID TTLs bound the abuse; disabling the client ends it. **Re-attestation does not by itself detect this**: a compromised process can keep calling the vTPM while the VM's launch measurement stays acceptable (see the guarantee statement below). Detection needs something that measures the agent runtime (PCR extension of the agent image, IMA, confidential containers) included in `allowed_measurements`, or behavioural evidence in the TRACE chain |
 | Evidence replayed from an earlier session | Challenge is single-use and bound to `jkt`; `nonce_mismatch` → `contraindicated`; the negative appraisal is itself recorded |
 | Attacker submits stale/forged evidence under a victim's `client_id` to force a `contraindicated` and knock the agent offline | Blocked: a submission naming a `client_id` only supersedes that client's approvals when it carries a valid DPoP proof of possession of `K` (section 9.3). Without the proof the verdict is recorded (`supersedesEligible=false`) but invalidates nothing and blocks no issuance, so knowing the public `client_id`/`K.public` is not enough to deny service; only the holder of `K` can drive a counting negative verdict |
@@ -2118,6 +2146,12 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
   evidence but marked `supersedesEligible=false`, so knowing a victim's public `client_id`/`K.public`
   cannot deny it service.
+- **The hardware guarantee requires the full RFC 9449 PEP check, not a thumbprint comparison.** A
+  PEP that relies on the `cnf` binding MUST verify every DPoP presentation completely —
+  `htm`, `htu`, `iat`/proof-age, a unique `jti` against a replay cache, `nonce` when the PEP issues
+  one, `ath` when present, and the proof-key thumbprint equal to `cnf.jkt` (§6). A plain JWT-SVID
+  validator that ignores `cnf` is bearer-only and gains no hardware guarantee, so a high-value RP
+  MUST be `cnf`-checking and require DPoP.
 - **Privacy: the SVID is minimized and disclosed per audience.** The default SVID carries only the
   claims a plain SPIFFE/PEP verifier needs (`iss`/`sub`/`aud`/`iat`/`nbf`/`exp`/`jti`/`cnf`);
   `attestation`, `delegation`, and the correlation id are opt-in per audience via a disclosure
