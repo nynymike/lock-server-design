@@ -37,8 +37,11 @@ relying party, SPIRE or plain JWT verifier, checks the token offline. When a hum
 agent, the human's identity enters through an ID-JAG and is carried into the SVID. Every step the
 server takes (appraisal, enrollment, delegation, issuance) is emitted as a signed, hash-chained
 **TRACE record** under one execution identifier, so a third party can later correlate the human,
-the agent, the hardware key, the authorization decision and the invocation of a governed capability
-without calling the server back.
+the agent, the hardware key, the authorization decision and the invocation of a governed
+capability. The SVID itself is checkable offline against the published bundle; correlating a full
+execution view is an online query against jans-lock in the initial (Phase-1) integration, and
+becomes fully offline-verifiable only with the later Phase-4 Evidence Packet (see §11.1 for the
+phase mapping).
 
 ## 2. The trust chain at a glance
 
@@ -55,7 +58,7 @@ trust stops there; the chain makes explicit what each party vouches for.
 | 6 | PUBLISH | `/spiffe/bundle` | Signing keys served in SPIFFE bundle format at a stable HTTPS URL | JWKS, `use: jwt-svid` |
 | 7 | DECIDE | PDP (AuthZEN / Cedarling) | May agent A (for human H) invoke capability C? | `AUTHORIZATION_DECISION` record |
 | 8 | PRESENT & INVOKE | Agent → PEP → capability | SVID + fresh DPoP proof; PEP verifies via the bundle, enforces the decision | `CAPABILITY_INVOKED`, `RUNTIME_EFFECT` records |
-| 9 | RECORD & VERIFY | jans-auth-server, PDP, PEP → jans-lock | Each producer signs and chains its records; Lock verifies, receipts, correlates by execution id | One offline-verifiable execution view |
+| 9 | RECORD & VERIFY | jans-auth-server, PDP, PEP → jans-lock | Each producer signs and chains its records; Lock verifies, receipts, correlates by execution id | One correlated execution view (queried online against Lock; fully offline-verifiable only with the Phase-4 Evidence Packet — see §11.1) |
 
 Links 1 to 3 happen once per agent deployment (and link 2 repeats on the attestation cadence).
 Links 4 to 9 repeat continuously; tokens live 5 to 15 minutes, so possession of the hardware key,
@@ -1162,6 +1165,36 @@ jans-auth-server becomes a TRACE **producer** towards jans-lock.
 > outbox, emit) can be built and unit-tested against the record schema independently, but the
 > end-to-end flow is gated on Lock delivering that subsystem.
 
+#### What each TRACE phase delivers, and what this plan may claim
+
+The TRACE subsystem is delivered in phases (`phased-implementation-plan.md`). The emission work
+here spans several of them, so this plan must not describe the Phase-1 integration as if it already
+produced Phase-4 assurance. The mapping:
+
+| This plan's feature | TRACE phase | What it delivers |
+|---------------------|-------------|------------------|
+| Signed record ingestion, producer-key registration, producer chains, the Lock receipt **hash** chain, correlation by `(evidence_domain_id, execution_authority, trace_execution_id)`, ingestion-time integrity flags, `AUTHORIZATION_DECISION` / `CAPABILITY_INVOKED` / `RUNTIME_EFFECT` facts, record/execution retrieval | **Phase 1 (MVP)** | Attributable, tamper-evident, correlatable evidence — a *submitted claim* Lock received and signature-checked |
+| Lock-signed **settlement**, signed **receipt checkpoints**, trust-tier assignment, `kid`-rotation/revocation handling | **Phase 2** | Lock standing behind a record as *settled*, and a ledger commitment a verifier can check |
+| `CREDENTIAL_PROVISIONED` posture/`attestation_ref`, token enrichment, operation-binding, evidence-origin classification, execution **completeness** (incl. AIMS), capability resolution | **Phase 3** | Context and completeness over the Phase-1 facts |
+| RATS **attestation binding** + the **instance-binding assessment**, the **`EXECUTION_STARTED` token-exchange bootstrap**, the **WIMSE Agent Identifier / credential-lifecycle** features (`CREDENTIAL_PROVISIONED` as a lifecycle kind, `workload_authentication`), **authenticated lineage checkpoints / full-history validation**, **Evidence Packets** and external anchoring | **Phase 4** | End-to-end, cross-domain, independently (offline) verifiable assurance |
+
+Consequences this plan honours:
+
+- The **initial integration is a Phase-1 producer**: it signs and ships records that Lock
+  *receives, verifies, chains, and correlates*. That is attributable, tamper-evident, correlatable
+  evidence — **not** settled, complete, or independently offline-verifiable evidence.
+- Several record shapes this plan emits (`CREDENTIAL_PROVISIONED` with `posture_assessment_ref` /
+  `attestation_ref`, the `EXECUTION_STARTED` token-exchange bootstrap, WIMSE/credential-lifecycle
+  metadata) are **Phase 3/4 features**. A producer MAY emit them earlier for forward-compatibility,
+  but their *assurance value* — RATS instance binding, lineage completeness, portable offline
+  verification — does not exist until Lock delivers those phases. Emitting the field is not the
+  same as delivering the guarantee.
+- "Offline-verifiable" and "without calling the server" describe the **Phase-4 end state**
+  (Evidence Packets carrying producer-key authorization statements, capability mappings, and
+  checkpoints), not what the Phase-1 integration produces. Until then, verifying a full execution
+  view is an online query against Lock, and only the **SVID itself** is offline-verifiable (against
+  the SPIFFE bundle, section 6).
+
 The target Lock profile is `tag:jans.io,2026:trace-v1`; event kinds `AUTHORIZATION_DECISION`,
 `CAPABILITY_INVOKED`, `RUNTIME_EFFECT`, `CREDENTIAL_PROVISIONED`, `EXECUTION_STARTED`; envelope
 `producer`, `kid`, `record_id`, `trace`, `producer_chain`, `parent_record_ids`, `signature`;
@@ -1509,7 +1542,7 @@ Each PR updates `jans-auth-server/docs/swagger.yaml` and the docs it touches in 
 | 3 | Attestation endpoint | Section 9: `ATTESTATION` flag, `/attestation/challenge`, `/attestation`, `AttestationService`, challenge state machine, verifier profiles + `AttestationResultVerifier`, `TpmCertifyVerifier`, entity + schema, verifier HTTP client, script type + `ExternalAttestationService`, reference script, discovery members, swagger |
 | 4 | DCR gate | Section 9.5: `attestation` parameter, DPoP proof on `/register`, `validateAttestation()`, `stale_evidence` + `challenge_id`, one-step `evidence` routing, `ClientAttributes.attestation` and `allowedResources` (`allowed_resources` metadata), `updateClient` re-gate, attestation row in the `JWT-SVID` validator, swagger client-metadata schemas |
 | 5 | Issuance | Section 10: `validateJwtSvidRequest`, `invalid_target`, key rule, freshness rule + `attestation_required`, inline `attestation` / `evidence` / `challenge_id` parameters, `JwtSvidBuilder`, lifetime, introspection, `txn` in ID-JAG, `TokenRequest` client support (`setResource`, `setAttestation`), swagger token endpoint |
-| 6 | TRACE emission | Section 11: producer key, chain state, outbox, emitter, four record builders, configuration, setup step |
+| 6 | TRACE emission (Phase-1 producer) | Section 11: producer key, chain state, outbox, emitter, record builders, configuration, setup step. Scope is a **TRACE Phase-1 producer** — attributable, correlatable records Lock receives/verifies/chains; it is gated on Lock shipping the TRACE subsystem, and the settlement, completeness, RATS/instance-binding, lineage, and Evidence-Packet assurances the records are forward-compatible with are later TRACE phases (see §11.1 phase mapping), not delivered here |
 | 7 | Interop and demo | SPIRE federation test (docker-compose recipe, manual before releases); end-to-end demo on one hardware platform; the wiki's failure demonstrations; agentrust export (11.4) |
 
 ### Hardware platform for the demo
