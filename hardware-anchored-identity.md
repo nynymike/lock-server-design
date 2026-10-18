@@ -1118,15 +1118,27 @@ per client. Entries expire by ORM TTL at `traceExecutionMaxAgeSeconds`.
 
 ### 11.1 Producer model
 
-jans-auth-server becomes a TRACE **producer** towards jans-lock, which already ships the evidence
-store, verifier and admin API (profile `tag:jans.io,2026:trace-v1`; event kinds
-`AUTHORIZATION_DECISION`, `CAPABILITY_INVOKED`, `RUNTIME_EFFECT`; envelope `producer`, `kid`,
-`record_id`, `trace`, `producer_chain`, `parent_record_ids`, `signature`; Ed25519 producer keys
-registered through `/audit/trace/admin/producer-keys`). Records are signed with a **dedicated
-Ed25519 producer key** (not the OIDC keys: producer keys are registered and revoked in Lock's
-registry, and revocation is anchored to chain position). Each node keeps its own chain
-(`producer_instance_id` = node id, monotonic `sequence_number`, `prev_record_hash`, zero hash
-first).
+jans-auth-server becomes a TRACE **producer** towards jans-lock.
+
+> **Lock-side dependency, not reused infrastructure.** This plan targets the TRACE ingestion,
+> verification, producer-key registry, receipt ledger, and execution-retrieval design specified in
+> `design.md` and `Lock-Server-TRACE-MVP-Design.md` — **none of which ships on the current branch.**
+> The Lock source today exposes only the ordinary audit endpoints (`/audit/health`, `/audit/log`,
+> `/audit/telemetry` and their `/bulk` variants); there is no `/api/v1/audit/trace` ingestion or
+> retrieval, no TRACE record store or verifier, no producer-key API, and no receipt ledger. Those
+> are **implementation dependencies this plan assumes Lock will add** (tracked in section 12's
+> dependency table), not completed components to call. The producer work below (sign, chain,
+> outbox, emit) can be built and unit-tested against the record schema independently, but the
+> end-to-end flow is gated on Lock delivering that subsystem.
+
+The target Lock profile is `tag:jans.io,2026:trace-v1`; event kinds `AUTHORIZATION_DECISION`,
+`CAPABILITY_INVOKED`, `RUNTIME_EFFECT`, `CREDENTIAL_PROVISIONED`, `EXECUTION_STARTED`; envelope
+`producer`, `kid`, `record_id`, `trace`, `producer_chain`, `parent_record_ids`, `signature`;
+Ed25519 producer keys registered administratively (the planned `/api/v1/audit/trace` admin key
+API). Records are signed with a **dedicated Ed25519 producer key** (not the OIDC keys: producer
+keys are to be registered and revoked in Lock's registry, with revocation anchored to chain
+position). Each node keeps its own chain (`producer_instance_id` = node id, monotonic
+`sequence_number`, `prev_record_hash`, zero hash first).
 
 ```mermaid
 flowchart LR
@@ -1304,9 +1316,10 @@ New package `io.jans.as.server.trace`:
   It is **derived from the outbox**, not kept separately: the outbox entry that holds record *n*
   also holds its sequence number and the hash of record *n-1*, and inserting the entry is what
   allocates the sequence number. There is therefore no second write to keep consistent.
-- `TraceEmitter`: durable outbox (`jansTraceOutbox`) + timer posting to Lock `POST /audit/trace`
-  with a `trace.write` client-credentials token from this server; retry with backoff; never drops
-  silently. `traceEmissionMode=inline` posts before the HTTP response (demo mode).
+- `TraceEmitter`: durable outbox (`jansTraceOutbox`) + timer posting to Lock's planned
+  `POST /api/v1/audit/trace` ingestion endpoint (a Lock dependency, not a current endpoint — see
+  section 11.1) with a `trace.write` client-credentials token from this server; retry with backoff;
+  never drops silently. `traceEmissionMode=inline` posts before the HTTP response (demo mode).
 
 #### Durability: the commit relationship between an action and its record
 
@@ -1567,12 +1580,12 @@ plan records (TRACE) but does not attest.
 | Signing key rotated | Bundle serves old + new for an overlap window and bumps `spiffe_sequence`; only an emergency rotation that drops the old key immediately invalidates in-flight tokens, by design |
 | Client registers its own SPIFFE ID or a foreign trust domain | Impossible by construction: `sub` is derived from `client_id` under jans's own trust domain; the inbound `spiffe_id` attribute plays no role in issuance |
 | jans-lock unreachable | Records queue in the outbox; auth continues. In `inline` mode the request fails, which is correct for a demo of accountability |
-| TRACE producer key compromised | Revoke via Lock's admin API; later records rejected; rotate the alias |
+| TRACE producer key compromised | Revoke via Lock's planned producer-key admin API (a Lock dependency, section 11.1/12); later records rejected; rotate the alias |
 | Attestation script accepts everything | Core verifies the `AttestationResultJWT` against the server-configured verifier profile, extracts nonce and key itself, verifies the `TPM2_Certify` chain, and caps the status at its own binding verdict (9.3b); a permissive script can only make policy looser, never name a different key or skip the nonce |
 | ID-JAG stolen | Audience- and client-bound, short-lived (existing); the SVID carries `delegation.credential_id` and the records show which agent used it |
 | Outbox full or evidence store unavailable | `JWT-SVID` issuance refused with `503 evidence_unavailable` (`fail-closed`); other traffic per `traceOutboxFullPolicy`, with a `coverage_gap` marker on the next record so the chain is visibly incomplete rather than silently short |
-| Crash between record commit and token persistence | A record exists for a `jti` introspection does not know; the reconciliation job emits a compensating `DENY` record linked to it (11.3) |
-| Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts; the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
+| Crash between record commit and token persistence | A `CREDENTIAL_PROVISIONED` record exists for a credential `jti` introspection does not know; the reconciliation job emits a compensating, superseding `CREDENTIAL_PROVISIONED` linked to it (11.3) |
+| Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
 ## 16. Specs to follow
 
@@ -1590,7 +1603,7 @@ plan records (TRACE) but does not attest.
 | RFC 8693 §4.1 `act` / §4.4 `may_act` | Considered and **not** used for the delegator (semantics are current actor / future actor, not delegating principal); a dedicated `delegation` claim is used instead | Not used |
 | RFC 7662 Introspection | Online verification | **Implemented**; new claims |
 | OpenID AuthZEN 1.0 | Decision API the PEP calls | **Implemented** |
-| TRACE v0.2 (agentrust) | Record semantics, `references` registry, RFC 8785 canonicalisation, Ed25519 | Lock profile exists; export mapping |
+| TRACE v0.2 (agentrust) | Record semantics, `references` registry, RFC 8785 canonicalisation, Ed25519 | Lock TRACE profile is **designed, not yet shipped** (section 11.1); export mapping is a gateway concern |
 | OWASP GovOps | Record schema (`subject.workload_id`, signed `(action, resource_type)` facts, Lock-derived `capability_id`), capability-catalogue naming | Align as published; records conform to `govops-trace-profile.md` |
 
 ## 17. Resolved decisions and open questions
