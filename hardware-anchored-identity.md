@@ -707,21 +707,98 @@ A key *named* in attestation evidence is not thereby a hardware key. Writing
 `SHA-256(nonce ‖ thumbprint(K.public))` into a report's `REPORT_DATA` binds those 64 bytes to the
 report; it says nothing about where the private half of `K` was generated or whether it can be
 exported. The design therefore requires a **separate, platform-specific certification** of `K`
-and treats the result as the hardware binding. The checks in the last column are performed by
-**core** (section 9.3b), not by the script; the script's role is to obtain the verifier result
-and apply measurement policy.
+and treats the result as the hardware binding. The checks are performed by **core** (section
+9.3b), not by the script; the script's role is to obtain the verifier result and apply measurement
+policy.
 
-| Platform (`evidence_format`) | What certifies `K` | Chain to the silicon root | Core checks |
-|------------------------------|--------------------|---------------------------|---------------|
-| **Azure confidential VM, SEV-SNP with vTPM** (`azure-cvm-sev-snp+json`), the demo platform | `TPM2_Certify` of `K` by the vTPM's **attestation key (AK)**, with `qualifyingData = nonce`. Output: `TPMS_ATTEST` (type `TPM_ST_ATTEST_CERTIFY`, `extraData = nonce`, `attested.certify.name = Name(K)`) and a `TPMT_SIGNATURE` by the AK | Azure's HCL puts the vTPM AK public key into the SNP report's runtime data (`REPORT_DATA = SHA-256(hcl_runtime_data)`), AMD signs the report with the VCEK. Azure Attestation verifies that chain and returns the AK in `x-ms-runtime.keys` of the `AttestationResultJWT`. **Note:** on Azure CVMs the guest cannot choose `REPORT_DATA`, so freshness comes from the `TPM2_Certify` `extraData`, not from the SNP report | (1) `AttestationResultJWT` valid, `x-ms-isolation-tee.x-ms-attestation-type = sevsnpvm`, launch measurement in policy, `x-ms-sevsnpvm-is-debuggable=false`; (2) `ak_public` equals the AK in `x-ms-runtime.keys`; (3) AK signature over `certify_info` verifies; (4) `extraData == nonce`; (5) `attested.certify.name == Name(key_public)` (TPM name = hash of the marshalled `TPMT_PUBLIC`); (6) `key_public` attributes contain `fixedTPM`, `fixedParent`, `sensitiveDataOrigin`, `sign`, and **not** `restricted` / `decrypt` as a duplicable key; (7) the key material inside `key_public` equals `attested_key` (JWK) |
-| **Physical / generic TPM 2.0** (`tpm2-quote+json`), fallback, second script | Same `TPM2_Certify` by an AK | AK certified by a privacy CA, or AK bound to the Endorsement Key via `TPM2_MakeCredential` / `TPM2_ActivateCredential` with the EK certificate chaining to the manufacturer CA | (2) to (7) as above, plus EK certificate chain and PCR quote policy |
-| **Bare SEV-SNP / TDX without a vTPM** | No TPM to certify an application key. The enclave software that generated `K` must be *measured* (its measurement is in the report) and must put `SHA-256(nonce ‖ thumbprint(K.public))` into `REPORT_DATA`; the guarantee is then "a measured, trusted guest image reports that it holds `K`", which is weaker than TPM certification and is stated as such in `platform` / `policy_version` | AMD VCEK / Intel PCK | Not in v1; listed so the limitation is explicit |
-| **`eat+jwt`** (CI and `verifier_kind=local`) | The EAT's `cnf.jwk` as asserted by the trusted attester key | The test JWKS | Signature, nonce, `cnf.jwk == attested_key`; **no** hardware guarantee; `platform=software-only` |
+#### The vendor-neutral binding contract (what every platform must satisfy)
 
-What this establishes, in words a relying party can rely on: *"The private half of `K` was
-generated inside, and cannot be exported from, the vTPM of a VM whose SEV-SNP launch measurement
-Azure Attestation appraised at time T."* It does not establish which process inside that VM is
-allowed to use `K`; see the guarantee statement in section 15.
+The certification mechanism differs by platform, but the design does **not** hard-code any one
+cloud's chain. Instead every platform profile — Azure, a bare TPM, Google, AWS, Oracle, or a future
+one — must satisfy the **same three abstract obligations**, and the profile (section 9.3b) declares
+*how* each is located in that vendor's attestation result. Core checks the obligations abstractly;
+the profile supplies the claim paths:
+
+| Obligation | What it proves | What the profile declares |
+|------------|----------------|---------------------------|
+| **Platform authenticity + measurement** | The hardware evidence is genuine and the runtime measured an acceptable image, with debug/TCB in policy | The verifier/issuer/JWKS that appraises the hardware evidence, and the claim paths to the measurement and the debug / TCB flags |
+| **Freshness** | The evidence was produced *after* this challenge, for *this* key | The RATS freshness mechanism and where the challenge nonce is echoed (a result claim, or the key-certification `extraData`) |
+| **Key certification** | The private half of `K` was generated in, and cannot be exported from, the hardware the measurement describes | The certification mechanism, the claim path to the attester/AK, and the certification artifact core must verify |
+
+A platform's `key_binding_strength` records *how strongly* the third obligation is met, because it
+genuinely differs across hardware and the difference is load-bearing for a relying party:
+
+- **`certified`** — a hardware key (vTPM/TPM) `TPM2_Certify`s `K` as non-exportable; the guarantee
+  is "the private half of `K` lives in and cannot leave this hardware."
+- **`measured_guest`** — no TPM certifies an application key; a *measured, trusted guest image*
+  reports it holds `K` (the key is bound to `REPORT_DATA`/`user_data`, not certified). Weaker, and
+  stated as such; usable only where the measured image is itself trusted to protect `K`.
+
+`key_binding_strength` is stored on the assessment and surfaced in `platform`/`posture_assessment_ref`,
+so an auditor and the PDP can tell a TPM-certified key from a merely-measured one **across clouds**.
+
+#### Platform profiles (each an instance of the contract)
+
+Each row is a profile instance; the **Status** column is non-normative until the profile carries
+the citations and conformance vectors required below. **The exact vendor claim paths in the Azure
+and other cloud rows are documented best-effort and are not yet substantiated by captured vectors
+in this repository — treat them as `experimental` pending validation (see "Platform references and
+conformance vectors").**
+
+| Platform (`evidence_format`) | Appraisal | Key certification / `key_binding_strength` | Status |
+|------------------------------|-----------|---------------------------------------------|--------|
+| **Azure confidential VM, SEV-SNP with vTPM** (`azure-cvm-sev-snp+json`), the demo platform | Delegated to Azure Attestation (`verifier_kind=azure-maa`) | `TPM2_Certify` of `K` by the vTPM AK with `qualifyingData = nonce` → `certified`. Azure's HCL is documented to place the vTPM AK in the SNP report runtime data (`REPORT_DATA = SHA-256(hcl_runtime_data)`), AMD signs the report with the VCEK, and MAA is documented to return the AK in `x-ms-runtime.keys`. On Azure CVMs the guest cannot choose `REPORT_DATA`, so freshness comes from the `TPM2_Certify` `extraData`, not the SNP report. **Claim paths per Azure MAA docs; pending captured vectors.** | experimental |
+| **Physical / generic TPM 2.0** (`tpm2-quote+json`) | In-process (`verifier_kind=local`), vendor-neutral | Same `TPM2_Certify` by an AK → `certified`. AK certified by a privacy CA, or bound to the EK via `TPM2_MakeCredential` / `TPM2_ActivateCredential` with the EK certificate chaining to the manufacturer CA | experimental |
+| **Google Cloud Confidential VM / Confidential Space** (`gcp-confidential-space+jwt`) | Delegated to the Confidential Space attestation service (`verifier_kind=gcp-cs`), which issues an OIDC-style token | Where a vTPM is present, `TPM2_Certify` → `certified`; otherwise the measured-image model → `measured_guest`. Profile declares the token issuer/JWKS and the claim paths to the image/submod measurement and the echoed nonce. **Claim paths per GCP Confidential Space docs; pending captured vectors.** | experimental |
+| **AWS Nitro Enclaves** (`aws-nitro+cbor`) | In-process (`verifier_kind=aws-nitro`): verify the COSE_Sign1 attestation document against the pinned AWS Nitro Attestation PKI root | No vTPM → `measured_guest`: the document's `public_key` / `user_data` carries `K`'s thumbprint and the `nonce` field carries freshness; PCRs are the measurement. **Structure per AWS Nitro docs; pending captured vectors.** | experimental |
+| **Oracle Cloud (OCI) confidential VM** (`oci-cvm-sev-snp+json`) | Delegated or in-process per the OCI offering; same SEV-SNP/TDX substrate | `certified` when the OCI instance exposes a vTPM that certifies `K`; otherwise `measured_guest`. **Per OCI confidential-computing docs; pending captured vectors.** | experimental |
+| **EAT** (`eat+jwt` / `eat+cwt`) — the preferred interop envelope | Delegated or in-process (`verifier_kind=local`); any platform able to emit an EAT | The EAT's `cnf.jwk`/`cnf.ckt` asserted by the trusted attester key, with `eat_nonce` for freshness. `key_binding_strength` is whatever the EAT's measurements justify (`certified` if it carries a hardware key-certification claim, else `measured_guest`); in CI with the test JWKS it is `software-only` and establishes **no** hardware guarantee | experimental (CI: software-only) |
+
+Core's concrete checks for a **`certified`** (TPM) profile are: (1) the verifier result is valid
+under the profile (issuer, signature, `exp`), the platform/attestation-type claim is as the profile
+expects, the launch/image measurement is in policy, and debug is disabled; (2) the attester/AK in
+the result equals the AK that signed the certification; (3) the AK signature over the certify
+structure verifies; (4) the certification's `extraData`/nonce equals the challenge nonce; (5) the
+certified key name equals `Name(key_public)`; (6) `key_public` attributes mark it non-duplicable
+(`fixedTPM`, `fixedParent`, `sensitiveDataOrigin`, `sign`, not `restricted`/`decrypt`-duplicable);
+(7) the key material inside `key_public` equals `attested_key`. For a **`measured_guest`** profile,
+(5)–(7) are replaced by "the measured guest image is in policy and the report binds
+`SHA-256(nonce ‖ thumbprint(K.public))`", and the assessment records `key_binding_strength=measured_guest`.
+These are the vendor-neutral checks; the Azure/TPM instance is the one with captured vectors
+targeted first (section 13, PR 3).
+
+What a `certified` profile establishes, in words a relying party can rely on: *"The private half of
+`K` was generated inside, and cannot be exported from, hardware whose launch/image measurement the
+named verifier appraised at time T."* It does not establish which process inside that runtime is
+allowed to use `K`; see the guarantee statement in section 15. A `measured_guest` profile
+establishes the weaker "a measured, trusted guest image reports it holds `K`."
+
+#### Platform references and conformance vectors
+
+Because the repository does not yet contain authoritative vendor material for these claim paths, a
+profile is **not** normative — and MUST ship as `maturity: experimental` (section 9.3b) — until it
+carries both:
+
+- **Vendor citations.** Each profile names the authoritative source for every claim path and
+  structure it relies on: the MAA `x-ms-*` result schema and the AMD SEV-SNP ABI (`REPORT_DATA`,
+  `PLATFORM_INFO`) for Azure; the TPM 2.0 spec for `TPM2_Certify` / `TPMS_ATTEST` / `TPMT_PUBLIC`;
+  the GCP Confidential Space attestation-token schema; the AWS Nitro attestation-document / PKI
+  spec; the OCI confidential-computing attestation docs. An uncited claim path is unverified by
+  definition and blocks `validated`.
+- **Captured interoperability vectors, positive and negative.** A recorded *positive* vector (real
+  evidence + verifier result that core's checks accept) and a set of *must-fail* vectors — wrong
+  nonce, wrong/forged attested key, debug-enabled, measurement-not-allowed, tampered AK signature,
+  expired verifier result — that core MUST reject. These follow the positive/negative/must-fail
+  discipline of the TRACE accountability-conformance work and live beside the profile as test
+  fixtures. Only when a profile has citations **and** passing positive/negative vectors is it
+  promoted to `maturity: validated`; a deployment MAY refuse `experimental` profiles for a
+  high-risk capability.
+
+**Platform-state caveat (SNP).** A conformant attestation result has no field for SNP
+`PLATFORM_INFO` (SMT enabled, the BadRAM DRAM-alias-check completion, ECC, ciphertext hiding), so a
+verifier reading a conformant result cannot appraise those even where the producer checked them
+(`research/trace-spec.txt`, LIMITATIONS). A profile that cares about those conditions MUST assert
+them explicitly in its measurement policy rather than assume the result covers them.
 
 ### 9.3b Division of trust: what core verifies, what the script decides
 
@@ -734,14 +811,22 @@ material itself and derives the binding from it; the script only hands the mater
 |---------|-----|-----|
 | Call the platform verifier; choose endpoint, credentials, request shape | Script | `callVerifier()` |
 | `AttestationResultJWT` signature, `iss`, `exp`, `nbf` | **Core** | Against a server-configured **verifier profile** (`attestationVerifierProfiles`, below), never against script-supplied keys |
-| Extract nonce and attested key from the result | **Core** | Claim paths come from the verifier profile (Azure: `x-ms-runtime.keys`, nonce via the certify structure; Intel TA: `nonce`, `cnf`); the script cannot redirect them |
+| Extract nonce and attested key from the result | **Core** | Claim paths come from the verifier profile (per-vendor, e.g. Azure: `x-ms-runtime.keys`, nonce via the certify structure; Intel TA: `nonce`, `cnf`; GCP/AWS/OCI per their profiles — see 9.3a); the script cannot redirect them |
 | Nonce equals the challenge nonce | **Core** | Compared to the persisted challenge |
 | Attested key equals the challenge `jkt` and a registered key of `client_id` | **Core** | RFC 7638 thumbprint of the key core extracted |
 | Key certification chain (`TPM2_Certify` parse, AK match, signature, `extraData`, name, attributes) | **Core** | `TpmCertifyVerifier` in `io.jans.as.server.attestation` (small, self-contained TPM 2.0 structure parsing; no external library) |
 | Platform measurement allowlist, TCB / firmware policy, debug flag, `policy_version`, `platform` label | Script | Reads the already-verified result claims through `context.getVerifiedResultClaims()` |
 | Final `status` | **Core** | `min(coreBinding, scriptPolicy)`: `affirming` only when both are; a script may lower to `warning` / `contraindicated`, never raise |
 
-`attestationVerifierProfiles` (`AppConfiguration`, list):
+`attestationVerifierProfiles` (`AppConfiguration`, list). Each entry is **one instance of the
+vendor-neutral binding contract** (section 9.3a): it names the verifier trust anchor and the
+per-vendor claim paths, declares the `keyBindingStrength` it achieves (`certified` /
+`measured_guest`), and carries a `maturity` (`experimental` default, `validated` only once the
+profile has vendor citations and passing positive/negative conformance vectors — section 9.3a). A
+deployment MAY refuse `experimental` profiles for a high-risk capability. **Adding a cloud is a new
+profile entry plus its claim-path map and vectors — not a core change**; prefer the standards-based
+`eat+jwt` / `eat+cwt` envelope where a platform can emit one, so only the trust anchor and claim
+paths are per-deployment.
 
 ```json
 [
@@ -750,8 +835,34 @@ material itself and derives the binding from it; the script only hands the mater
     "jwksUri": "https://sharedeus.eus.attest.azure.net/certs",
     "issuers": ["https://sharedeus.eus.attest.azure.net"],
     "evidenceFormats": ["azure-cvm-sev-snp+json"],
+    "measurementClaimPath": "x-ms-sevsnpvm-launchmeasurement",
+    "debugClaimPath": "x-ms-sevsnpvm-is-debuggable",
     "akClaimPath": "x-ms-runtime.keys",
-    "platform": "azure-cvm-sev-snp"
+    "platform": "azure-cvm-sev-snp",
+    "keyBindingStrength": "certified",
+    "maturity": "experimental"
+  },
+  {
+    "kind": "gcp-cs",
+    "jwksUri": "https://confidentialcomputing.googleapis.com/.well-known/jwks",
+    "issuers": ["https://confidentialcomputing.googleapis.com"],
+    "evidenceFormats": ["gcp-confidential-space+jwt"],
+    "measurementClaimPath": "submods.container.image_digest",
+    "nonceClaimPath": "eat_nonce",
+    "platform": "gcp-confidential-space",
+    "keyBindingStrength": "measured_guest",
+    "maturity": "experimental"
+  },
+  {
+    "kind": "aws-nitro",
+    "trustAnchor": "aws-nitro-attestation-pki-root",
+    "evidenceFormats": ["aws-nitro+cbor"],
+    "measurementClaimPath": "pcrs",
+    "keyClaimPath": "public_key",
+    "nonceClaimPath": "nonce",
+    "platform": "aws-nitro",
+    "keyBindingStrength": "measured_guest",
+    "maturity": "experimental"
   },
   {
     "kind": "local",
@@ -760,10 +871,18 @@ material itself and derives the binding from it; the script only hands the mater
     "evidenceFormats": ["eat+jwt"],
     "nonceClaimPath": "eat_nonce",
     "keyClaimPath": "cnf.jwk",
-    "platform": "software-only"
+    "platform": "software-only",
+    "keyBindingStrength": "measured_guest",
+    "maturity": "experimental"
   }
 ]
 ```
+
+`measurementClaimPath` / `debugClaimPath` / `akClaimPath` / `keyClaimPath` / `nonceClaimPath` are
+the contract's three obligations expressed as this vendor's claim paths; `trustAnchor` names a
+pinned root for in-process (`local` / `aws-nitro`) appraisal where there is no JWKS to fetch. Core
+reads only these declared paths — a script cannot redirect them (9.3b) — so a new cloud is onboarded
+by configuration and fixtures, not by editing core.
 
 The script's `verifier_kind` must name a profile; a script result whose `AttestationResultJWT`
 does not verify under that profile is `contraindicated` with `untrusted_verifier` regardless of
@@ -850,8 +969,8 @@ Reference script `docs/script-catalog/attestation/AgentAttestation.py` (+ `.md`)
 | Attribute | Purpose |
 |-----------|---------|
 | `formats` | Comma list of `evidence_format` values handled, e.g. `azure-cvm-sev-snp+json` |
-| `verifier_kind` | `azure-maa`, `intel-ta` or `local`. Selects how `verifyEvidence` appraises: call Azure Attestation, call Intel Trust Authority, or verify in-process |
-| `verifier_url` | Attestation endpoint of the platform verifier (e.g. `https://<tenant>.attest.azure.net/attest/SevSnpVm?api-version=…`, `https://api.trustauthority.intel.com/appraisal/v1/attest`) |
+| `verifier_kind` | Names an `attestationVerifierProfiles` entry and selects how `verifyEvidence` appraises: `azure-maa` / `intel-ta` / `gcp-cs` (call the cloud's attestation service), `aws-nitro` / `local` (verify in-process against a pinned root or trusted JWKS). Adding a cloud adds a backend here and a profile entry (9.3b) — not a core change |
+| `verifier_url` | Attestation endpoint of the platform verifier, for the delegated kinds (e.g. `https://<tenant>.attest.azure.net/attest/SevSnpVm?api-version=…`, `https://api.trustauthority.intel.com/appraisal/v1/attest`, the GCP Confidential Space attestation endpoint); unused for in-process kinds (`local`, `aws-nitro`), which verify against a pinned `trustAnchor` |
 | `verifier_api_key` | Credential for verifiers that need one (Intel TA). Stored as an encrypted script property; never logged, never returned, redacted in TRACE records |
 | `verifier_timeout_ms` | Outbound call timeout; default `5000` |
 | `trusted_verifier_jwks_uri` | JWKS used to validate the returned `AttestationResultJWT` (Azure Attestation `…/certs`, Intel TA JWKS). For `verifier_kind=local` with `eat+jwt`: the trusted attester key set (the test JWKS in CI) |
@@ -864,8 +983,10 @@ Reference script `docs/script-catalog/attestation/AgentAttestation.py` (+ `.md`)
 Delegate, don't parse: v1 ships `verifier_kind=azure-maa` and `intel-ta`, which forward the raw
 evidence and verify the returned `AttestationResultJWT`, plus `verifier_kind=local` for `eat+jwt`
 (used in CI). In-process TPM 2.0 quote verification (`tpm2-quote+json` under `local`) is a second
-script, after v1. In all cases the script runs inside jans-auth-server during `POST /attestation`;
-the agent is never on the path to the verifier.
+script, after v1. Additional cloud backends (`gcp-cs`, `aws-nitro`, OCI) are **further profile
+instances of the same contract** (section 9.3a), added as configuration + fixtures without a core
+change and shipping `experimental` until their vectors exist. In all cases the script runs inside
+jans-auth-server during `POST /attestation`; the agent is never on the path to the verifier.
 
 ### 9.5 Where the gate is enforced
 
@@ -1956,7 +2077,7 @@ Each PR updates `jans-auth-server/docs/swagger.yaml` and the docs it touches in 
 |---|----|-------|
 | 1 | `access_token_type` | Section 7: enum, `RegisterRequestParam`, `ClientAttributes.accessTokenType`, resolver, validator (without the attestation row), swagger deprecation of `access_token_as_jwt`, `RegisterRequest` client support |
 | 2 | Bundle endpoint | Section 8: `SPIFFE_SVID_ISSUANCE` flag, `SpiffeOwnBundleService`, endpoint, discovery member, trust-domain pinning, config properties, swagger path + `SpiffeBundle` schema |
-| 3 | Attestation endpoint | Section 9: `ATTESTATION` flag, `/attestation/challenge`, `/attestation`, `AttestationService`, challenge state machine, verifier profiles + `AttestationResultVerifier`, `TpmCertifyVerifier`, entity + schema, verifier HTTP client, script type + `ExternalAttestationService`, reference script, discovery members, swagger |
+| 3 | Attestation endpoint | Section 9: `ATTESTATION` flag, `/attestation/challenge`, `/attestation`, `AttestationService`, challenge state machine, the **vendor-neutral binding contract** + verifier profiles (`maturity`/`keyBindingStrength`) + `AttestationResultVerifier`, `TpmCertifyVerifier`, entity + schema, verifier HTTP client, script type + `ExternalAttestationService`, reference script, discovery members, swagger. **Ship the Azure + generic-TPM profiles with vendor citations and captured positive/negative conformance vectors (promoting them to `validated`); other cloud profiles (GCP/AWS/OCI) ship `experimental` until their vectors exist (section 9.3a)** |
 | 4 | DCR gate | Section 9.5: `attestation` parameter, DPoP proof on `/register`, `validateAttestation()`, `stale_evidence` + `challenge_id`, one-step `evidence` routing, `ClientAttributes.attestation` and `allowedResources` (`allowed_resources` metadata), `updateClient` re-gate, attestation row in the `JWT-SVID` validator, swagger client-metadata schemas |
 | 5 | Issuance | Section 10: `validateJwtSvidRequest`, `invalid_target`, key rule, freshness rule + `attestation_required`, inline `attestation` / `evidence` / `challenge_id` parameters, `JwtSvidBuilder`, lifetime, introspection, `txn` in ID-JAG, `TokenRequest` client support (`setResource`, `setAttestation`), swagger token endpoint |
 | 6 | TRACE emission (Phase-1 producer) | Section 11: producer key, chain state, outbox, emitter, record builders, configuration, setup step. Scope is a **TRACE Phase-1 producer** — attributable, correlatable records Lock receives/verifies/chains; it is gated on Lock shipping the TRACE subsystem, and the settlement, completeness, RATS/instance-binding, lineage, and Evidence-Packet assurances the records are forward-compatible with are later TRACE phases (see §11.1 phase mapping), not delivered here |
@@ -2186,6 +2307,21 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   service.
 - **Delegate, don't parse**: v1 forwards raw evidence to a platform verifier and validates its
   `AttestationResultJWT`; TPM quotes in-process later.
+- **Attestation is vendor-neutral: one binding contract, per-cloud profiles.** Every platform
+  satisfies the same three obligations — platform authenticity + measurement, freshness, and key
+  certification — and a verifier profile (9.3b) declares that vendor's claim paths; core checks the
+  obligations abstractly. Azure, generic TPM 2.0, GCP Confidential Space, AWS Nitro, OCI, and the
+  preferred standards-based EAT envelope are profile instances, so adding a cloud is configuration
+  + fixtures, not a core change (section 9.3a).
+- **Platform claim paths are unverified until cited and vectored.** The exact vendor claim paths
+  (Azure `x-ms-*`/HCL/AK, and the GCP/AWS/OCI equivalents) are documented best-effort and are
+  **not** substantiated by captured vectors in this repository. A profile ships `maturity:
+  experimental` until it carries vendor citations **and** passing positive/negative conformance
+  vectors, at which point it is `validated`; PR 3 does this for Azure + generic TPM first, and a
+  deployment MAY refuse `experimental` for a high-risk capability (section 9.3a).
+- **`key_binding_strength` is recorded per platform.** `certified` (a vTPM/TPM `TPM2_Certify`s a
+  non-exportable `K`) vs. `measured_guest` (a measured image reports it holds `K`) is stored on the
+  assessment and surfaced across clouds, so a relying party can tell them apart (section 9.3a).
 - **Only jans talks to the platform verifier**, from the attestation script during
   `POST /attestation`. The agent sends raw hardware evidence to jans and nothing anywhere else.
 - **No jans-signed assessment token.** The assessment is a server-side record referenced by
