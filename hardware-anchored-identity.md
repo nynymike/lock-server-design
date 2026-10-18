@@ -50,8 +50,8 @@ trust stops there; the chain makes explicit what each party vouches for.
 | 1 | ROOT | TPM / TEE hardware | Non-exportable keypair; vendor-signed raw evidence over it | Raw evidence (quote / report) |
 | 2 | ATTEST | `/attestation` + script | Single-use challenge; **jans** sends the raw evidence to the platform verifier and receives its `AttestationResultJWT`; measurement policy applied; **assessment stored with a validity window** | `attestation_id` (server-side assessment), `AttestationResultJWT` (verifier's) |
 | 3 | ENROLL | DCR `/register` | Registration accepted only with a fresh `affirming` assessment for the registered key; `client_id` ↔ `jkt` ↔ `attestation_id` persisted; SPIFFE ID assigned | `spiffe://td/agent/<client_id>` |
-| 4 | DELEGATE | Token exchange (ID-JAG) | Human's ID token exchanged for an ID-JAG naming the agent; execution id `txn` minted | ID-JAG with `txn` |
-| 5 | ISSUE | `/token` + DPoP | `client_credentials` or JWT bearer with ID-JAG; DPoP key must equal the enrolled key **and** have an assessment younger than the maximum age; else `attestation_required` | JWT-SVID with `cnf.jkt`, `txn`, `attestation` |
+| 4 | DELEGATE | Token exchange (ID-JAG) | Human's ID token exchanged for an ID-JAG naming the agent; the `(trace_execution_id, execution_authority)` pair is minted (execution id aliased by `txn`) | ID-JAG with the canonical correlation claims |
+| 5 | ISSUE | `/token` + DPoP | `client_credentials` or JWT bearer with ID-JAG; DPoP key must equal the enrolled key **and** have an assessment younger than the maximum age; else `attestation_required` | JWT-SVID with `cnf.jkt`, the `(trace_execution_id, execution_authority)` claims, `attestation` |
 | 6 | PUBLISH | `/spiffe/bundle` | Signing keys served in SPIFFE bundle format at a stable HTTPS URL | JWKS, `use: jwt-svid` |
 | 7 | DECIDE | PDP (AuthZEN / Cedarling) | May agent A (for human H) invoke capability C? | `AUTHORIZATION_DECISION` record |
 | 8 | PRESENT & INVOKE | Agent → PEP → capability | SVID + fresh DPoP proof; PEP verifies via the bundle, enforces the decision | `CAPABILITY_INVOKED`, `RUNTIME_EFFECT` records |
@@ -64,23 +64,44 @@ not any long-lived secret, is the durable credential.
 ## 3. The correlation model
 
 An **execution** is one unit of agent work: a task a human delegated, or an autonomous run. It is
-identified by a `trace_execution_id`, carried in every token as the `txn` claim (RFC 8417 §2.2;
-jans already uses `txn` in transaction tokens). Everyone downstream (PDP, PEP, capability) copies
-`txn` into its own records. Correlation is structural: an auditor queries one execution and gets
-the whole chain.
+identified by the canonical correlation **pair** `(trace_execution_id, execution_authority)` that
+every TRACE record carries (see `Lock-Server-TRACE-MVP-Design.md` §7.1 and `design.md`: Audit
+Context Propagation Profile). The two values **always travel together** — `execution_authority`
+scopes the execution id, and a bare id is not resolvable without it.
+
+jans stamps the pair into the tokens it issues using the canonical token claims, and continues to
+set `txn` (RFC 8417 §2.2; jans already uses `txn` in transaction tokens) as an **application-level
+alias** for the execution id so the existing transaction-token machinery keeps working:
+
+| Carried value | Canonical token claim | Also as |
+|---------------|-----------------------|---------|
+| `trace_execution_id` | `https://jans.io/trace/execution_id` | `txn` (same value; the application alias jans already understands) |
+| `execution_authority` | `https://jans.io/trace/execution_authority` | — (jans's issuer / configured authority) |
+
+Everyone downstream (PDP, PEP, capability) reads the **pair** — never `txn` alone — and copies both
+into its own records' `trace.trace_execution_id` and `trace.execution_authority` fields; a host,
+sidecar, PEP, or gateway translates the applicable carrier (the canonical HTTP headers
+`Audit-Trace-ID` / `Audit-Execution-Authority`, OTel baggage `audit.trace_id` /
+`audit.execution_authority`, or the signed token claims above) into Cedarling's normalized input
+model, since Cedarling does not parse tokens, headers, or baggage itself. Unsigned headers and
+baggage are correlation hints; the signed token claims are the authoritative binding. Correlation
+is then structural: an auditor queries one `(execution_authority, trace_execution_id)` and gets the
+whole chain.
 
 Execution scope is defined independently of credential lifetime:
 
 | Scope | Identifier | Opened by | Closed by |
 |-------|------------|-----------|-----------|
-| **Execution** (`txn`) | `exe_…` | The ID-JAG exchange (human-delegated), or the first `/token` call of an autonomous agent that carries no `txn`; the server mints it and returns it in the token response (`txn` member) so the agent reuses it | `traceExecutionMaxAgeSeconds` (default 24 h), or an explicit `txn_close=true` on a token request |
+| **Execution** | `(trace_execution_id, execution_authority)` — `trace_execution_id` value `exe_…`, aliased by `txn` | The ID-JAG exchange (human-delegated), or the first `/token` call of an autonomous agent that carries no execution id; the server mints the pair and returns it in the token response (the canonical claims, plus the `txn` alias) so the agent reuses it | `traceExecutionMaxAgeSeconds` (default 24 h), or an explicit `txn_close=true` on a token request |
 | **Token lifetime** | SVID `jti` | Each issuance | `exp` (minutes) |
 | **Key lifecycle** (attestation, enrollment) | `attestation_id`, `client_id` | Before any execution exists | Key rotation / client removal |
 
-A renewal inside an execution presents the same `txn` (as the ID-JAG's claim, or the `txn`
-request parameter); the server accepts it while the execution is open **and** belongs to the same
-`client_id`, and refuses foreign or expired values with `invalid_request` (`txn_unknown`). So one
-execution spans many token renewals, and tokens never fragment it. Attestation and enrollment
+A renewal inside an execution presents the same execution id (as the ID-JAG's
+`https://jans.io/trace/execution_id` claim / `txn` alias, or the `txn` request parameter); the
+server accepts it while the execution is open **and** belongs to the same `client_id`, and refuses
+foreign or expired values with `invalid_request` (`txn_unknown`). The reissued token carries the
+same `(trace_execution_id, execution_authority)` pair, so one execution spans many token renewals
+and tokens never fragment it. Attestation and enrollment
 records are **not** execution records: they happen before any execution and serve many later
 ones. They keep their own identifiers, and every execution record that relies on them points at
 them through `parent_record_ids` (section 11.2).
@@ -94,7 +115,7 @@ flowchart LR
         P["Policy decision<br/>AuthZEN / Cedarling · ALLOW or DENY"]
         C["Governed capability<br/>(action, resource_type) at the PEP;<br/>capability_id Lock-derived"]
     end
-    X(("trace_execution_id<br/>= txn claim"))
+    X(("(trace_execution_id,<br/>execution_authority)<br/>trace_execution_id aliased by txn"))
     H -- "ID-JAG jti" --> X
     A -- "JWT-SVID jti" --> X
     K -- "attestation_id" --> X
@@ -182,7 +203,7 @@ sequenceDiagram
     Note over Human,AS: ③ DELEGATE — when a human starts an execution
     Human->>AS: token exchange: ID token → requested_token_type=id-jag, audience=AS
     AS-->>Lock: EXECUTION_STARTED (token-exchange bootstrap · ID-JAG issued)
-    AS-->>Human: ID-JAG { sub: alice, client_id: agent, txn }
+    AS-->>Human: ID-JAG { sub: alice, client_id: agent,<br/>execution_id + execution_authority (txn alias) }
     Human->>Agent: hand ID-JAG to the agent
 
     Note over TEE,AS: ④ ISSUE — every few minutes
@@ -191,13 +212,13 @@ sequenceDiagram
     Agent->>AS: POST /token grant=jwt-bearer assertion=ID-JAG (or client_credentials)<br/>DPoP proof · resource=#lt;PEP#gt;
     Note over AS: jkt = thumbprint of the DPoP proof public key (K.public)<br/>jkt must be a registered key of client_id<br/>assessment looked up by latestRelevant(client_id, jkt)<br/>status must be affirming and appraised_at within max age,<br/>else 400 attestation_required { nonce }
     AS-->>Lock: CREDENTIAL_PROVISIONED (SVID issued · posture_assessment_ref)
-    AS-->>Agent: JWT-SVID { sub: spiffe id, aud, exp +10m, cnf.jkt, txn, attestation, delegation }
+    AS-->>Agent: JWT-SVID { sub: spiffe id, aud, exp +10m, cnf.jkt,<br/>execution_id + execution_authority (txn alias), attestation, delegation }
 
     Note over TEE,PEP: ⑤ PRESENT & VERIFY — per request
     Agent->>TEE: fresh DPoP proof for the PEP
     TEE-->>Agent: proof
     Agent->>PEP: request + JWT-SVID + DPoP proof
-    Note over PEP: local: signature via bundle, sub, aud, exp<br/>DPoP key ↔ cnf.jkt · PDP decision · copy txn
+    Note over PEP: local: signature via bundle, sub, aud, exp<br/>DPoP key ↔ cnf.jkt · PDP decision · copy the pair<br/>(trace_execution_id + execution_authority)
     PEP-->>Lock: CAPABILITY_INVOKED / RUNTIME_EFFECT
     PEP-->>Agent: 200
 ```
@@ -244,8 +265,9 @@ server {
 
 **Bearer vs. bound.** Signature + claims checks alone treat the token as bearer. A verifier that
 wants the hardware guarantee additionally demands a fresh DPoP proof signed by the key in `cnf`.
-Plain SPIFFE verifiers ignore `cnf`, `txn`, `attestation` and `delegation` (unknown claims are additive),
-so the token stays spec-valid for both audiences.
+Plain SPIFFE verifiers ignore `cnf`, the `https://jans.io/trace/*` correlation claims, `txn`,
+`attestation` and `delegation` (unknown claims are additive), so the token stays spec-valid for
+both audiences.
 
 ![JWT-SVID verification anatomy](../../../assets/agent-identity-jwt-svid-verification.svg)
 
@@ -1046,6 +1068,8 @@ New `io.jans.as.server.model.token.JwtSvidBuilder` produces:
   "exp": 1790000700,
   "jti": "svid_…",
   "cnf": { "jkt": "9XKt…" },
+  "https://jans.io/trace/execution_id": "exe_01J9…",
+  "https://jans.io/trace/execution_authority": "https://op.example.org",
   "txn": "exe_01J9…",
   "attestation": {
     "id": "att_7b1e…",
@@ -1073,7 +1097,8 @@ New `io.jans.as.server.model.token.JwtSvidBuilder` produces:
 | `iat`, `nbf`, `exp` | from `accessToken`; lifetime per 10.6 | |
 | `jti` | `context.getTokenReferenceId()` | |
 | `cnf.jkt` | `context.getDpop()` | always present here |
-| `txn` | the ID-JAG's `txn` for a JWT bearer grant; else the `txn` request parameter when it names an open execution of this `client_id`; else freshly minted **and returned in the token response** so renewals reuse it (section 3) | correlation key; one per execution, not per token |
+| `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` = the ID-JAG's execution id for a JWT bearer grant; else the `txn` request parameter when it names an open execution of this `client_id`; else freshly minted. `execution_authority` = this server's configured authority (its issuer by default). Both **returned in the token response** so renewals reuse them | The authoritative correlation binding that PDP/PEP read; the two MUST travel together; one pair per execution, not per token |
+| `txn` | Same value as `execution_id`, set for compatibility with the existing transaction-token machinery | Application alias for `execution_id`, not a separate correlation key |
 | `attestation` | the assessment that satisfied 10.4 | hardware state the token was issued under |
 | `delegation` | `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` = the ID-JAG token type URI, `credential_id` = the ID-JAG `jti`; omitted for pure `client_credentials` | human ↔ agent correlation inside the token. **Not** RFC 8693 `act`: `act` names the *current actor* acting on behalf of `sub`, which would say Alice acts for the agent; and `may_act` names a party authorised to *become* an actor. Neither is "the principal who delegated". The SPIFFE agent stays `sub`; the delegator is an explicit, separately named reference to the credential that carried the delegation |
 | `client_id`, `scope`, `token_type` | as today | harmless additive claims |
@@ -1081,7 +1106,8 @@ New `io.jans.as.server.model.token.JwtSvidBuilder` produces:
 Everything else in `createAccessToken()` (`externalUpdateTokenService.modifyAccessToken()`,
 `statusListService`, `TokenEntity` persistence, stats) is unchanged, so introspection, revocation
 and the update-token script keep working. The update-token script may add claims to an SVID, but
-`iss`, `sub`, `aud`, `exp`, `jti`, `cnf`, `txn`, `attestation` and `delegation` are **protected**:
+`iss`, `sub`, `aud`, `exp`, `jti`, `cnf`, the `https://jans.io/trace/execution_id` and
+`https://jans.io/trace/execution_authority` claims, `txn`, `attestation` and `delegation` are **protected**:
 core snapshots them before `modifyAccessToken()` runs and re-applies the snapshot afterwards, so
 a script can neither remove nor alter them; an attempt is logged at `WARN` with the claim names
 and the script name, and the issuance proceeds with the protected values. A script that needs a
@@ -1098,16 +1124,21 @@ key-regeneration adjustment (an SVID must not outlive its signing key's presence
 ### 10.7 Response and introspection
 
 Token response shape is unchanged: `access_token` = the SVID, `token_type: DPoP`, `expires_in`, no
-refresh token. `IntrospectionWebService` returns `sub` = the SPIFFE ID, `cnf.jkt`, `txn`,
-`attestation` and `delegation` for SVID grants. The token response for an SVID also carries a
-top-level `txn` member so an agent that did not supply one learns the execution it is in.
+refresh token. `IntrospectionWebService` returns `sub` = the SPIFFE ID, `cnf.jkt`, the
+`https://jans.io/trace/execution_id` / `https://jans.io/trace/execution_authority` pair (with the
+`txn` alias), `attestation` and `delegation` for SVID grants. The token response for an SVID also
+carries top-level `execution_id` + `execution_authority` members (and the `txn` alias) so an agent
+that did not supply an execution learns the pair it is in and reuses both on renewal.
 
-### 10.8 `txn` in the ID-JAG and the execution registry
+### 10.8 The execution pair in the ID-JAG and the execution registry
 
-`IdJagService` sets `txn` on every ID-JAG it issues (fresh identifier unless the exchange request
-carries `txn` naming an open execution of the same client). This puts the human's login at the
-root of the execution: the ID-JAG `jti` appears in `tokens[]` and its `sub` in
-`subject.human_sponsor` of every later record.
+`IdJagService` stamps the canonical correlation pair on every ID-JAG it issues — the
+`https://jans.io/trace/execution_id` claim (fresh unless the exchange request carries `txn` /
+`execution_id` naming an open execution of the same client) and
+`https://jans.io/trace/execution_authority` (this server's configured authority), with `txn` set to
+the same execution-id value as the compatibility alias. The two claims travel together. This puts
+the human's login at the root of the execution: the ID-JAG `jti` appears in `tokens[]` and its
+`sub` in `subject.human_sponsor` of every later record.
 
 Open executions are tracked in a small persistent registry (`jansTraceExecution`: `txn`,
 `clientId`, `principal`, `openedAt`, `expiresAt`, `closed`) so that `/token` can validate a
@@ -1159,14 +1190,15 @@ flowchart LR
     E4 -. "parent: issued_credential" .-> E5
     E5 -. "parent: authorized_by" .-> E6
     E6 -. "parent: produced_effect" .-> E7
-    L[("jans-lock<br/>same trace_execution_id")]
+    L[("jans-lock<br/>same (trace_execution_id, execution_authority)")]
     E1 & E2 & E3 & E4 & E5 & E6 & E7 --> L
 ```
 
 Reading the diagram: **solid** arrows are the per-producer hash chain (`prev_record_hash`) that
 Lock verifies; **dashed** arrows are `parent_record_ids` cross-references between producers,
 which Lock stores and shows but which carry no ordering guarantee of their own. Everything
-sharing one `trace_execution_id` (= `txn`) is one execution.
+sharing one `(trace_execution_id, execution_authority)` pair (the `trace_execution_id` aliased by
+`txn`) is one execution.
 
 What the hash chain does and does not prove: within the records Lock holds, it detects any
 reordering, removal or insertion between two retained records (`chain_link_failure`) and any
@@ -1520,7 +1552,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, and not-in-`allowed_resources` (exact and prefix); freshness rule none / stale / fresh; inline paths; `attestation_required` body |
 | `AuthorizationGrantTest` (extend) | protected SVID claims re-applied after `modifyAccessToken()` alters or removes them; `WARN` logged; additive claims kept |
 | `DpopServiceTest` (extend) | `validateDpopKeyIsRegistered`: match, mismatch, no JWKS, `jwks_uri` |
-| `JwtSvidBuilderTest` | `sub` derivation; `aud` = resources only; `cnf.jkt`; `txn` sources and reuse across renewals; `attestation`; `delegation` present / absent; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
+| `JwtSvidBuilderTest` | `sub` derivation; `aud` = resources only; `cnf.jkt`; the `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` pair is always present together, sourced correctly, and reused across renewals, with `txn` carrying the same execution-id value; `attestation`; `delegation` present / absent; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
 | `TpmCertifyVerifierTest` | `TPMS_ATTEST` parse; AK signature; `extraData` mismatch; name mismatch; attribute policy; key material equals JWK |
 | `AttestationResultVerifierTest` | profile lookup by `verifier_kind`; signature / issuer / `exp`; claim-path extraction; script-supplied JWKS ignored |
 | `AttestationChallengeServiceTest` | `pending → processing` CAS and the losing racer; `completed` terminal; retry after `verifier_unavailable` keeps nonce; retry limit; lease expiry repair |
@@ -1770,10 +1802,14 @@ execution records reference them. A fresh `txn` per autonomous token issuance al
 execution across renewals. Define execution scope independently of credential lifetime.**
 
 Accepted. Section 3 now defines three scopes (execution, token lifetime, key lifecycle) with their
-own identifiers. An execution (`txn`) is opened by the ID-JAG exchange or by the first `/token`
-call of an autonomous agent that carries no `txn`; the server mints it, returns it in the token
-response, and accepts it on later renewals while the execution is open and belongs to the same
-client (`jansTraceExecution` registry, `traceExecutionMaxAgeSeconds`, section 10.8). Attestation
+own identifiers, and the execution is identified by the canonical pair
+`(trace_execution_id, execution_authority)` (with `txn` as an application alias for the execution
+id), carried in tokens as `https://jans.io/trace/execution_id` /
+`https://jans.io/trace/execution_authority`. An execution is opened by the ID-JAG exchange or by
+the first `/token` call of an autonomous agent that carries no execution id; the server mints the
+pair, returns it in the token response, and accepts it on later renewals while the execution is
+open and belongs to the same client (`jansTraceExecution` registry, `traceExecutionMaxAgeSeconds`,
+section 10.8). Attestation
 and enrollment records are lifecycle records with their own `trace_execution_id` scope
 (`att:<attestation_id>`, `enroll:<client_id>`); every issuance record references them, and the
 ID-JAG record, through `parent_record_ids` (`attested_by`, `enrolled_as`, `delegated_by`),
