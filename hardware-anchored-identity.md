@@ -1316,19 +1316,22 @@ allowed and detectable.
 
 | Step | Order | Why |
 |------|-------|-----|
-| 1 | Build the record for the action *as if it succeeded* (`outcome=ALLOW`, token `jti` known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later |
+| 1 | Build the record for the action *as if it succeeded* (the provisioned `credential_fingerprint` — the SVID `jti` — is known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later |
 | 2 | Insert the outbox entry (record, sequence number, previous hash, `state=pending`) | This is the durable commitment; it allocates the chain position. If it fails, the action fails with `503 evidence_unavailable` and nothing else is written |
 | 3 | Persist the action's own entity (`TokenEntity`, `Client`, `AttestationAssessment`) | On backends with multi-entry transactions (SQL) steps 2 and 3 are one transaction. On LDAP / Couchbase they are two writes in this order, so a crash between them yields a record for a token that was never issued |
 | 4 | Return the HTTP response | |
-| 5 | Emitter posts the entry to Lock, marks `state=delivered` on `201` **or** `409` (Lock already has `record_id`: duplicate delivery after a crash between post and mark) | Delivery is at-least-once; Lock's store is keyed by `record_id`, so duplicates are idempotent |
+| 5 | Emitter posts the entry to Lock, marks `state=delivered` on `202` **or** on an idempotent-replay acceptance (Lock already has `record_id`: duplicate delivery after a crash between post and mark) | Delivery is at-least-once; Lock's store is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is never expected here and is surfaced as an error, not treated as delivered |
 
 Crash recovery: on startup the emitter resends every `pending` entry of its node in sequence
 order; because sequence allocation *is* the outbox insert, there are no gaps and no forks, and
-`prev_record_hash` continuity is re-read from the tail entry. A record whose action did not
-complete (step 3 failed) describes a token `jti` that introspection does not know; a nightly
-reconciliation job emits a compensating `AUTHORIZATION_DECISION` with `outcome=DENY`, reason
-`not_persisted`, and a `parent_record_ids` link to the orphan, so the trail stays honest without
-rewriting history.
+`prev_record_hash` continuity is re-read from the tail entry. A `CREDENTIAL_PROVISIONED` record
+whose action did not complete (step 3 failed) names a credential `jti` that introspection does not
+know; a nightly reconciliation job emits a compensating, separately-signed `CREDENTIAL_PROVISIONED`
+(`provisioning_kind=rotation`, `supersedes_credential_fingerprint` pointing at the orphan,
+`credential_attributes` marking it never-activated, reason `not_persisted`) with a
+`parent_record_ids` link to the orphan — the issuance record is never rewritten, and the
+compensation is a new provisioning fact rather than a misused `AUTHORIZATION_DECISION` DENY (which
+would overload a decision record with a credential-lifecycle correction).
 
 Outbox exhaustion: the outbox is bounded (`traceOutboxMaxEntries`, default 100 000, and
 `traceOutboxMaxAgeSeconds`). When full, behaviour follows `traceOutboxFullPolicy`:
@@ -1638,7 +1641,7 @@ plan records (TRACE) but does not attest.
 - **SPIFFE ID path shape.** `spiffe://<td>/agent/<client_id>`. If operators need
   human-meaningful paths, allow an admin-approved segment while keeping the `client_id` suffix
   mandatory.
-- **Lock event kind for attestation.** New kind preferred; fallback flag keeps PR 6 independent.
+- **Separate issuance-decision record.** Resolved: issuance is recorded as `CREDENTIAL_PROVISIONED` (the attestation verdict is its `posture_assessment_ref`); no new `ATTESTATION_APPRAISED` kind is introduced and there is no `AUTHORIZATION_DECISION` fallback. Open only whether a deployment also emits a *separate* `AUTHORIZATION_DECISION` (signing a real `(action, resource_type)`) for the issuance policy — gated by `traceEmitIssuanceDecision`, default off.
 - **Storing raw evidence.** SEV-SNP / TDX reports can contain platform identifiers; default off,
   digest always stored.
 - **Revocation story.** Short TTL + disable client + introspection. Confirm acceptable before
