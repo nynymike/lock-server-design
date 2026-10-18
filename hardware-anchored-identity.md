@@ -2358,7 +2358,6 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Crash between record commit and token persistence | A `CREDENTIAL_PROVISIONED` record exists for a credential `jti` introspection does not know; the reconciliation job emits a compensating, superseding `CREDENTIAL_PROVISIONED` linked to it (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
-<<<<<<< HEAD
 ### 15.1 Residual trust assumptions
 
 The limits above are stated where each mechanism is defined; this table consolidates them so the
@@ -2387,8 +2386,6 @@ later TRACE phases ship (§11.1 phase mapping). The rest are inherent trust anch
 accepts or verifies out of band; none is hidden, and each is surfaced in the evidence rather than
 silently assumed.
 
-=======
->>>>>>> origin/main
 ## 16. Operational requirements
 
 The sections above specify the protocol; this one collects the **deployment and operational
@@ -2506,7 +2503,6 @@ The deployment SHOULD expose metrics so the honest-failure paths are observable 
 | Revocation-to-remediation lag | Time from a key/client revocation to issuance actually stopping — the window an attacker still has |
 | Native `jans-trace-core` self-test / load failures | Fails closed for ingestion (11.3); must be alerted, not silent |
 
-<<<<<<< HEAD
 ### 16.9 Availability posture: SLOs and fail-open/closed per capability-risk tier
 
 A verifier, bundle, or Lock outage must not silently turn accountability or posture into stale
@@ -2571,17 +2567,6 @@ Configuration:
 The availability tier reuses the capability-risk classification the PDP/PEP already hold; this plan
 does not introduce a second risk taxonomy, it consumes the existing one to choose the outage
 resolution.
-=======
-### 16.9 Availability posture (fail-open vs fail-closed)
-
-A verifier or Lock outage must not silently turn accountability or posture into stale trust. The
-default is fail-closed for `JWT-SVID` issuance (no committed TRACE record → no SVID, section 11.3;
-no fresh appraisal → `attestation_required`, 10.4). Whether a given capability tolerates fail-open
-is a **per-capability-risk-tier** decision the operator makes, not a global switch: a low-risk
-logging capability MAY accept `warning`/degraded posture, a payments capability MUST fail closed.
-The verifier-unavailable and bundle-unavailable behaviors (section 15) are the mechanism; the
-risk-tier policy chooses which way they resolve.
->>>>>>> origin/main
 
 ## 17. Specs to follow
 
@@ -2934,3 +2919,87 @@ portable token later (another authorization server consuming this server's appra
 shape it would take (an EAT with `eat_nonce`, `cnf`, `measurements`, EAR `status`), addable as a
 new response member without changing the rest.
 
+
+## 21. Glossary
+
+This plan spans six vocabularies. The short definitions below are scoped to how each term is used
+*here*; the authoritative definition is the cited spec or design document.
+
+### SPIFFE / workload identity
+
+| Term | In this plan |
+|------|--------------|
+| **SPIFFE ID** | A URI `spiffe://<trust-domain>/<path>` naming a workload. Here the agent's identity, derived as `spiffe://<td>/agent/<client_id>` and carried as the SVID `sub` (§5, §10.5). |
+| **JWT-SVID** | A SPIFFE Verifiable Identity Document in JWT form — the short-lived agent credential this plan mints (§10). Bearer unless `cnf`-bound (§6). |
+| **Trust domain** | The SPIFFE scoping authority (`<td>`); pinned once per server (§8). |
+| **SPIFFE bundle** | The JWKS of SVID signing keys, published at `/spiffe/bundle` so relying parties verify offline (§8). |
+| **SPIRE** | A common SPIFFE runtime; one federation consumer of the bundle (§6). |
+| **`workload_id` / `workload_instance_id`** | The stable workload identity vs. the rotating per-runtime-instance id (the TRACE `subject` fields; §11.2). |
+
+### OAuth / DPoP / tokens
+
+| Term | In this plan |
+|------|--------------|
+| **DPoP** (RFC 9449) | Demonstrating Proof-of-Possession: a per-request signed proof that the caller holds the key in the token's `cnf`. The hardware binding at presentation (§6). |
+| **`cnf` / `jkt`** | The confirmation claim (RFC 7800) and the RFC 7638 thumbprint of the bound key; `cnf.jkt` pins the SVID to the hardware key (§6, §10.5). |
+| **ID-JAG** | Identity Assertion JWT Authorization Grant (draft-ietf-oauth-identity-assertion-authz-grant): the token exchange that carries the human's identity into the agent flow (§5, §10.8). |
+| **DCR** | Dynamic Client Registration — the `/register` path where a key is enrolled and attestation is gated (§9.5). |
+| **`txn`** | RFC 8417 transaction claim; here an **application alias** for the execution id, not a separate correlation key (§3). |
+| **PPID / pairwise subject** | A per-audience pseudonymous identifier for the human, so unrelated relying parties cannot correlate them (§10.10). |
+
+### RATS / attestation
+
+| Term | In this plan |
+|------|--------------|
+| **RATS** (RFC 9334) | Remote ATtestation procedureS; the Attester / Verifier / Relying-Party role model the attestation flow follows (§9.2). |
+| **Attester / Verifier / Relying Party** | The hardware producing evidence / the platform service appraising it (Azure MAA, Intel TA, …) / jans accepting the verdict (§9.2). |
+| **Evidence vs. Attestation Result** | Raw hardware-signed evidence vs. the verifier's signed appraisal (`AttestationResultJWT`) of it (§9.2). |
+| **EAR / EAT** | EAT Attestation Result (draft-ietf-rats-ar4si) status vocabulary — `affirming` / `warning` / `contraindicated` (§9.6); EAT (RFC 9711) is the preferred cloud-neutral evidence envelope (§9.3a). |
+| **`TPM2_Certify` / AK / vTPM** | The TPM operation that certifies a key as non-exportable, the attestation key that signs it, and the virtual TPM on a confidential VM (§9.3a). |
+| **`key_binding_strength`** | `certified` (TPM-certified, non-exportable) vs. `measured_guest` (a measured image reports it holds the key) (§9.3a). |
+| **`attestation_ref` / `posture_assessment_ref`** | The producer-signed RATS binding, and the credential-provisioning posture reference carrying the attestation verdict (§11.2; `design.md`). |
+
+### TRACE / Lock evidence
+
+| Term | In this plan |
+|------|--------------|
+| **TRACE** | The signed, hash-chained evidence-record model Lock ingests; Lock emits the profile `tag:jans.io,2026:trace-v1` (§11.1). |
+| **Lock (jans-lock)** | The evidence collector/verifier this plan produces records toward — a dependency, not yet shipped (§11.1). |
+| **Producer / producer key / producer chain** | The signer of a record, its registered Ed25519 key, and its per-node hash chain; this plan uses two producer roles, `jans-auth` and `jans-svid-issuer` (§11.1). |
+| **`trace_execution_id` / `execution_authority`** | The canonical correlation **pair** identifying one execution; a correlation key, not an operation binding (§3). |
+| **`CREDENTIAL_PROVISIONED` / `EXECUTION_STARTED` / `AUTHORIZATION_DECISION` / `CAPABILITY_INVOKED` / `RUNTIME_EFFECT`** | The event kinds this plan emits or references (§11.2). |
+| **`capability_id`** | The governance label Lock *derives* from signed `(action, resource_type)` facts — never signed by a producer (§11.5). |
+| **Settlement / Evidence Packet / lineage checkpoint** | Lock-side assurance layers (Phase 2/4), referenced for phase scoping (§11.1). |
+| **`jans-trace-core`** | The shared Rust library for canonicalization / Ed25519 signing / digest, with normative cross-language vectors (§11.3). |
+| **Operation binding** | `request_digest` / `input_digest` / `tool_call_digest` / `result_digest` + proof-of-possession binding — the Phase-3 same-operation proof (§3; `design.md`). |
+
+### AIMS / WIMSE
+
+| Term | In this plan |
+|------|--------------|
+| **AIMS** | IETF Agent Identity Management System (draft-ietf-wimse-aims-00); the agent-identity/credential/posture/observability model this plan aligns with. |
+| **WIMSE** | Workload Identity in Multi-System Environments; the identifier/credential family AIMS builds on (SPIFFE is one instance). |
+| **Credential provisioning / posture assessment** | AIMS §8: credential issuance is the point posture is evaluated — modeled here as `CREDENTIAL_PROVISIONED` (§11.2). |
+| **WPT / HTTP Message Signature** | AIMS §9 application-layer proof-of-possession mechanisms; referenced for `workload_authentication` / `pop_binding` (Phase 3). |
+| **`human_sponsor` / `sid`** | The authenticated human behind an agent, and the OIDC session id that ties the execution to a browser session and a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` (§10.9). |
+
+### GovOps / policy
+
+| Term | In this plan |
+|------|--------------|
+| **GovOps** | The OWASP agent-governance architecture (capability as the unit of governance); its vendor-neutral TRACE profile `tag:govops.owasp.org,2026:trace-v1` is a schema-compatible sibling of the Jans profile (§11.1). |
+| **PDP / PEP** | Policy Decision Point (Cedarling / AuthZEN) and Policy Enforcement Point (the gateway mediating a capability); distinct TRACE producers (§11.2). |
+| **Cedarling** | The embeddable Cedar-based PDP; consumes the normalized correlation pair and signs `AUTHORIZATION_DECISION` (§3, §16.5). |
+| **AuthZEN** | The decision API a PEP calls; the `(action, resource_type)` facts map to a `capability_id` via the policy store (§11.5). |
+| **Capability / `(action, resource_type)`** | The governed unit — a Cedar action on a resource type; producers sign the facts, Lock derives the `capability_id` (§11.5). |
+
+### This plan's own terms
+
+| Term | In this plan |
+|------|--------------|
+| **`K`** | The agent's hardware keypair — the durable credential; its private half never leaves the secure element (§5). |
+| **Assessment (`attestation_id`)** | jans's server-side record of an attestation verdict for a key, with a validity window (§9.6, §9.7). |
+| **`supersedesEligible`** | Whether a negative verdict may invalidate a standing approval — true only with proof of possession of `K` (§9.3, §10.4). |
+| **`agentLifecycleState`** | The client lifecycle — `active` / `suspended` / `decommissioned` / `tombstoned` (§9.9). |
+| **Capability-risk tier** | `critical` / `standard` / `low`; chooses how a verifier/bundle/Lock outage resolves (§16.9). |
+| **Lifecycle vs. execution record** | Appraisal/enrollment (lifecycle, own identifiers) vs. delegation/issuance (carry the execution pair) (§3). |
