@@ -236,10 +236,14 @@ piece of evidence; the private half of `K` never crosses that boundary.
 Reading the arrows: a **solid** arrow is a request the sender initiates and waits for; a
 **dashed** arrow is either the reply to the solid arrow above it, or a one-way notification the
 sender does not wait for (the records jans and the PEP send to jans-lock go through an outbox,
-section 11.3). `K` is the agent's single hardware keypair: its private half signs the DPoP proofs
+section 11.3). `K` is **a** hardware keypair of the agent: its private half signs the DPoP proofs
 and the `private_key_jwt` client assertion, its public half (`K.public`) is the `attested_key` in
-the challenge, the key in the registration `jwks`, and the thumbprint in the SVID's `cnf.jkt`.
-There is exactly one key per agent; attestation, enrollment and issuance all talk about it.
+the challenge, a key in the registration `jwks`, and the thumbprint in the SVID's `cnf.jkt`. In the
+steady state an agent uses one key; but a client's `jwks` MAY legitimately hold **more than one**
+attested key during a rollover, and each key is independently attested, assessed, and bound. Which
+key a given issuance talks about is fixed per request by the DPoP proof's thumbprint — attestation,
+enrollment, and issuance always name a specific `jkt`. The full multiplicity, rotation, and
+recovery rules are section 9.9.
 
 ## 6. Verification: how and where
 
@@ -860,8 +864,12 @@ On success: `ClientAttributes.attestation = { attestationId, jkt, platform, meas
 policyVersion, appraisedAt }`; `clientId` set on the assessment; `dpopBoundAccessToken` forced
 `true`; enrollment TRACE record emitted. Existing `ClientRegistrationType` scripts still run after
 the gate and can read `context.getAttestationAssessment()`. `updateClient` re-runs the gate when
-`jwks` / `jwks_uri` change; a key swap without a fresh assessment for the new key is rejected
-(`invalid_client_metadata`, `attestation_required_for_new_key`).
+`jwks` / `jwks_uri` change: each **newly added** key needs its own fresh `affirming` assessment
+(else `invalid_client_metadata`, `attestation_required_for_new_key`), and — outside the
+administrative recovery paths — the update must be **old-key-authorized**, i.e. signed by a
+proof over a key already trusted for the client, so only the current key holder can add or remove
+a key. The full multiplicity, dual-key rollover, and destroyed-key / emergency recovery rules are
+section 9.9.
 
 **At `/token`** (section 10.4).
 
@@ -978,6 +986,82 @@ deterministic.
 
 Discovery members (gated on the flag): `attestation_endpoint`, `attestation_challenge_endpoint`,
 `attestation_evidence_formats_supported`.
+
+### 9.9 Key lifecycle: multiplicity, rotation, and recovery
+
+An agent is not "one key forever." Keys are destroyed with their hardware, rotated for hygiene, and
+replaced after compromise, and a rollover inherently needs two live keys at once. The design
+therefore treats a client's key set as a small, attested, per-key-assessed collection, not a
+singleton, and specifies the transitions.
+
+#### Multiple keys are allowed, and each is bound on its own
+
+`jwks` / `jwks_uri` MAY contain more than one key. The model is **per-key**, not per-client:
+
+- Every key the client presents for SVID use must have its **own** `affirming` assessment
+  (`latestRelevant(client_id, jkt)` is keyed by `jkt`, section 10.4) — a fresh assessment for key
+  A does not vouch for key B. `updateClient` runs the DCR attestation gate (section 9.5) for each
+  **newly added** key and rejects any added key that lacks a fresh `affirming` assessment
+  (`invalid_client_metadata`, `attestation_required_for_new_key`).
+- Issuance is always about the single key that signed the request's DPoP proof. A `jwks` with two
+  keys means the agent *may* present either; it does not weaken the binding, because the
+  `(client_id, jkt)` assessment and the `cnf.jkt` on the issued SVID both name the exact key used.
+- An operator MAY cap the set with `clientMaxAttestedKeys` (default 2 — enough for a rollover
+  overlap, not an unbounded fan-out); an update exceeding it is rejected.
+
+So "exactly one key" is the common runtime state, not an invariant the server enforces; what the
+server enforces is that **every** usable key is independently attested and that no key enters the
+set without passing the gate.
+
+#### Rotation is old-key-authorized (dual-key overlap)
+
+A planned rotation never drops the old key before the new one is trusted:
+
+1. The agent generates `K2` in hardware and attests it (`/attestation`, `purpose=enroll`), getting
+   an `affirming` assessment for `jkt(K2)`.
+2. The agent calls `updateClient` adding `K2` to `jwks` **while `K1` is still present**, and the
+   request is authenticated by a `private_key_jwt` / DPoP proof signed by **`K1`** (the existing
+   trusted key). This is the **old-key-authorized** step: the party that controls the current key
+   is the only one who can enroll an additional key, so a stolen `attestation_id` or a third party
+   who attested some unrelated key cannot graft a key onto the client (the same proof-of-possession
+   principle as section 9.3's supersession gate).
+3. Both keys are now usable; the agent migrates its issuance to `K2` at its own pace.
+4. The agent calls `updateClient` removing `K1`, again authenticated by a proof over a still-trusted
+   key (`K1` or `K2`). Removing `K1` immediately stops new issuance under it; outstanding
+   `K1`-bound SVIDs expire within their minutes-long TTL.
+
+Lock's producer-side `IDENTITY_ROTATED` lifecycle event (where TRACE emission is enabled) records
+the rotation, linking the old and new `jkt`s, so the key change is itself evidence.
+
+#### Recovery when the old key cannot authorize the new one
+
+Old-key-authorized rotation assumes `K1` is still usable. The destroyed-hardware and compromise
+cases break that assumption and are handled by an **administrative** path, never by anonymous
+self-service (which would reintroduce the hijack the old-key rule prevents):
+
+| Situation | What happened to `K1` | Recovery |
+|-----------|----------------------|----------|
+| **Destroyed / lost TPM** (hardware failure, decommissioned node) | `K1`'s private half is gone; no proof over it is possible | An operator (admin scope) authorizes a **re-enrollment**: the agent attests a fresh `K2` and an administrative `updateClient` (not old-key-authorized — the admin is the authority) binds `K2` and removes the dead `K1`. Recorded as `IDENTITY_ROTATED` with reason `key_lost`, so the break in key continuity is explicit rather than silent |
+| **VM rebuild / re-image** (same logical agent, new runtime instance) | A new vTPM means a new key and a new `workload_instance_id` | Treated as re-enrollment of the same logical `client_id` with a new attested key and instance; the `workload_instance_id` change is visible in the evidence (and is exactly why instance binding is a separate assessment — section 15). No old-key authorization is possible or expected |
+| **Suspected compromise / emergency replacement** | `K1` may still be usable, but must not be trusted | An operator **revokes** `K1` out of band: an administrative action marks every `K1`-bound assessment `contraindicated` (`supersedesEligible=true`, admin-authorized) and removes `K1` from `jwks`, so issuance under `K1` stops at once and outstanding SVIDs die within the TTL. A fresh `K2` is enrolled by the normal attested path. Recorded as `IDENTITY_ROTATED` reason `emergency` |
+
+#### Clone and snapshot detection (a limit, stated honestly)
+
+A VM snapshot/clone can carry a *copy* of the runtime but, for a non-exportable hardware key,
+**not** a copy of `K`'s private half — so a clone cannot produce DPoP proofs for `K1` and simply
+has no usable key until it enrolls its own, which goes through the gate. Where the key lives in a
+**vTPM whose state is included in a snapshot**, that protection is only as strong as the platform's
+snapshot handling; this plan does not detect two live instances sharing one `jkt` beyond what the
+platform measurement and the per-instance `workload_instance_id` surface. Detecting concurrent use
+of one key from two runtimes is a behavioural / instance-binding concern (section 15, Phase-4
+instance binding), explicitly out of scope here and stated so rather than implied.
+
+#### Configuration
+
+| Property | Default | Meaning |
+|----------|---------|---------|
+| `clientMaxAttestedKeys` | 2 | Maximum attested keys in a client's `jwks` (one steady-state key plus a rollover overlap) |
+| `attestationAllowAdminReEnrollment` | `true` | Whether the admin re-enrollment / revocation recovery path is enabled |
 
 ## 10. JWT-SVID issuance at `/token`
 
@@ -1715,7 +1799,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `AttestationRestWebServiceImplTest` | flag disabled; `invalid_challenge` carries a fresh challenge; no `500` for a verdict; `503 verifier_unavailable` keeps the challenge; a submission with a `client_id` and no/invalid DPoP proof is accepted-and-recorded but `supersedesEligible=false`; a `client_id` submission with a valid proof over `K` is `supersedesEligible=true`; pre-enrollment (no `client_id`) needs no proof |
 | `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
 | `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
-| `RegisterValidatorTest` (extend) | `validateAttestation` by id; expired; wrong purpose; key not in `jwks`; missing DPoP proof on `/register`; proof key ≠ attested key; `allowed_resources` empty for `JWT-SVID`; `stale_evidence` has `challenge_id` |
+| `RegisterValidatorTest` (extend) | `validateAttestation` by id; expired; wrong purpose; key not in `jwks`; missing DPoP proof on `/register`; proof key ≠ attested key; `allowed_resources` empty for `JWT-SVID`; `stale_evidence` has `challenge_id`; **multi-key / rollover (9.9):** a `jwks` with two attested keys is accepted and each key needs its own `affirming` assessment; adding a key without a fresh assessment → `attestation_required_for_new_key`; adding/removing a key requires an old-key-authorized proof outside the admin path; exceeding `clientMaxAttestedKeys` is rejected; the admin re-enrollment / revocation path binds a new key or revokes `K1` without old-key authorization |
 | `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, and not-in-`allowed_resources` (exact and prefix); freshness rule none / stale / fresh; inline paths; `attestation_required` body |
 | `AuthorizationGrantTest` (extend) | protected SVID claims re-applied after `modifyAccessToken()` alters or removes them; `WARN` logged; additive claims kept |
 | `DpopServiceTest` (extend) | `validateDpopKeyIsRegistered`: match, mismatch, no JWKS, `jwks_uri` |
@@ -1814,6 +1898,8 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked `supersededBy` by per-entry CAS (10.4), so a racing `/token` on another node cannot settle on them. The agent must obtain a new `affirming` appraisal |
 | Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side |
 | Agent decommissioned or compromised | Admin disables the client: issuance stops; tokens die within the TTL; introspection reports `active: false` |
+| Agent's hardware key `K` destroyed, lost, or compromised | No old-key-authorized rotation is possible, so recovery is the administrative path (section 9.9): an operator authorizes re-enrollment of a fresh attested key (destroyed/lost) or revokes `K` and enrolls a replacement (compromise). Issuance under `K` stops at once; a VM rebuild additionally changes `workload_instance_id`, which stays visible in the evidence. Recorded as `IDENTITY_ROTATED` (`key_lost` / `emergency`) |
+| Agent VM cloned or snapshotted | A clone cannot export the non-exportable `K`, so it holds no usable key and must enroll its own through the gate; detecting two live runtimes sharing one `jkt` (vTPM-in-snapshot case) is a Phase-4 instance-binding concern, out of scope here and stated so (section 9.9) |
 | Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out |
 | Signing key rotated | Bundle serves old + new for an overlap window and bumps `spiffe_sequence`; only an emergency rotation that drops the old key immediately invalidates in-flight tokens, by design |
 | Client registers its own SPIFFE ID or a foreign trust domain | Impossible by construction: `sub` is derived from `client_id` under jans's own trust domain; the inbound `spiffe_id` attribute plays no role in issuance |
@@ -1860,6 +1946,13 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
   evidence but marked `supersedesEligible=false`, so knowing a victim's public `client_id`/`K.public`
   cannot deny it service.
+- **A client may hold more than one attested key, and key lifecycle is specified.** "Exactly one
+  key" is the common runtime state, not an enforced invariant; `jwks` MAY hold up to
+  `clientMaxAttestedKeys` (default 2) for a rollover overlap, each key independently attested and
+  assessed. Planned rotation is **old-key-authorized** (a proof over a trusted key adds/removes a
+  key); destroyed-key, VM-rebuild, and compromise cases use an **administrative** re-enrollment /
+  revocation path, recorded as `IDENTITY_ROTATED`. Clone/snapshot detection beyond "a clone has no
+  usable key" is a Phase-4 instance-binding concern, out of scope. See section 9.9.
 - **Two TRACE producer roles, two keys.** jans-auth-server registers a `jans-auth` producer
   (`["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]`, matching `auth-server-trace-design.md` exactly)
   and a separate `jans-svid-issuer` credential-provisioning producer (`["CREDENTIAL_PROVISIONED"]`,
@@ -1908,8 +2001,9 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 - **Separate issuance-decision record.** Resolved: issuance is recorded as `CREDENTIAL_PROVISIONED` (the attestation verdict is its `posture_assessment_ref`); no new `ATTESTATION_APPRAISED` kind is introduced and there is no `AUTHORIZATION_DECISION` fallback. Open only whether a deployment also emits a *separate* `AUTHORIZATION_DECISION` (signing a real `(action, resource_type)`) for the issuance policy — gated by `traceEmitIssuanceDecision`, default off.
 - **Storing raw evidence.** SEV-SNP / TDX reports can contain platform identifiers; default off,
   digest always stored.
-- **Revocation story.** Short TTL + disable client + introspection. Confirm acceptable before
-  promising anything stronger.
+- **Revocation story.** Short TTL + disable client + introspection for *token* revocation, plus the
+  administrative key revocation / re-enrollment path for a compromised or lost **key** (section
+  9.9). Confirm this is acceptable before promising anything stronger (e.g. SSF/CAEP push).
 
 ## 18. What this plan deliberately excludes
 
