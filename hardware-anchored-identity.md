@@ -2358,6 +2358,34 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Crash between record commit and token persistence | A `CREDENTIAL_PROVISIONED` record exists for a credential `jti` introspection does not know; the reconciliation job emits a compensating, superseding `CREDENTIAL_PROVISIONED` linked to it (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
+### 15.1 Residual trust assumptions
+
+The limits above are stated where each mechanism is defined; this table consolidates them so the
+**trust surface is auditable at a glance**. Each row is something a relying party or auditor must
+*assume* (or separately verify) because this plan does not prove it. "Mitigation / where detailed"
+points at the section that bounds or addresses it.
+
+| # | What must be trusted / is not proven | Why it is residual | Mitigation / where detailed |
+|---|--------------------------------------|--------------------|-----------------------------|
+| 1 | **The platform verifier** (Azure MAA, Intel TA, GCP CS, …) appraises honestly and its signing keys are uncompromised | jans delegates appraisal of raw hardware evidence to it; a dishonest verifier could affirm a bad platform | Verifier trust anchors are server config (`attestationVerifierProfiles`); core re-checks the result signature/issuer/nonce/key binding (9.3b); raw evidence can be re-appraised independently when stored (§15, "Auditor doubts jans") |
+| 2 | **The named platform claim paths are correct** (e.g. Azure HCL→AK→`x-ms-runtime.keys`) | Not substantiated by captured vectors in-repo | Profiles ship `experimental` until citations + positive/negative vectors promote them to `validated` (9.3a) |
+| 3 | **The right process inside the attested runtime uses `K`** | Attestation proves the platform and key custody, not which process signs (and not that agent memory/prompts are intact) | Needs agent-runtime measurement (IMA, confidential containers) in `allowed_measurements`, or behavioural TRACE evidence (§15 guarantee) |
+| 4 | **A `measured_guest` key is actually protected by its guest image** | On bare SEV-SNP/TDX/Nitro without a vTPM, `K` is reported-by-a-measured-image, not TPM-certified | `key_binding_strength` records `measured_guest` vs `certified` so a verifier can tell them apart (9.3a) |
+| 5 | **The relying-party PEP performs the full RFC 9449 check** | A `cnf`-ignoring (bearer-only) or thumbprint-only PEP gets no hardware guarantee | Normative PEP presentation requirements; high-value RPs MUST be `cnf`-checking and require DPoP (§6) |
+| 6 | **SNP `PLATFORM_INFO` conditions** (SMT, BadRAM alias check, ECC) | A conformant attestation result has no field for them, so a verifier cannot appraise them | A profile that cares MUST assert them in its measurement policy explicitly (9.3a) |
+| 7 | **The TRACE evidence producers ran in an attested runtime** | The agent's attestation binds its *credential*, not the Auth Server / PDP / PEP producer runtimes | Attested-tier evidence is the Phase-4 RATS + instance-binding assessment, not delivered here (§15, "A hardware-bound credential is not an attested TRACE producer") |
+| 8 | **Lock and its operator are honest about completeness** | A producer chain + receipts prove order/integrity of what Lock holds, not that every event was emitted or the tail not withheld; and Lock is a dependency, not yet shipped | Checkpoints bound tail-withholding to one interval; full collusion-resistance needs external SCITT anchoring (Phase 4, out of scope); Lock subsystem status (§11.1) |
+| 9 | **A shared `trace_execution_id` does not prove same-operation** | It is a correlation key, not an operation binding | Phase-3 operation-binding commitments prove same-operation; until then treat as correlation only (§3) |
+| 10 | **The human authenticated as strongly as policy intends** | The ID-JAG names a human; its strength depends on the gate and the IdP | Phishing-resistant gate by default, `acr`/`amr`/`sid` recorded; signed `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` are deferred companion evidence (§10.9) |
+| 11 | **Current revocation / non-staleness** cannot be established offline | Signature validity is permanent; a since-revoked key still verifies offline | Short SVID TTL + client disable + introspection; key/client revocation is administrative (9.9); offline verification reports non-revocation as "not checked" |
+| 12 | **The clock is roughly correct** | Freshness windows depend on time agreement | `allowedClockSkewSeconds` bounds every window; the challenge nonce — not a timestamp — carries the actual replay guarantee (16.4) |
+| 13 | **Deployment/operational controls are in place** | Verifier egress, quotas, per-backend durability, metrics, policy-store lifecycle are the operator's | Specified as normative operational requirements (§16) |
+
+Rows 7, 8, 9, and the attested-producer uplift are **phase-gated**: they become provable as the
+later TRACE phases ship (§11.1 phase mapping). The rest are inherent trust anchors a deployment
+accepts or verifies out of band; none is hidden, and each is surfaced in the evidence rather than
+silently assumed.
+
 ## 16. Operational requirements
 
 The sections above specify the protocol; this one collects the **deployment and operational
