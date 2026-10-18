@@ -1416,15 +1416,15 @@ parties receive a value they can use to correlate the human across services.
 |------|-------|------|
 | header `alg`, `kid`, `typ: JWT` | client `access_token_signing_alg` if asymmetric else `defaultSignatureAlgorithm`; key from `WebKeysConfiguration` (the set the bundle publishes); HMAC rejected at registration and defensively here | existing `JwtSigner` |
 | `iss` | `appConfiguration.getIssuer()` | |
-| `sub` | `SpiffeIdUtil.buildAgentSpiffeId(trustDomain, clientId)` → `spiffe://<td>/agent/<client_id>`; validates the trust domain grammar first (a `/` in the configured domain must not silently become path segments) | **derived**, never from the `spiffe_id` attribute, which means the opposite thing (an external identity the client authenticates *in* with). Spoofing and collisions are structurally impossible |
+| `sub` | `SpiffeIdUtil.buildAgentSpiffeId(trustDomain, clientId)` → `spiffe://<td>/agent/<client_id>`. The trust-domain grammar is validated first, so a `/` in the configured domain cannot silently become path segments. | **Derived** by the server, never taken from the `spiffe_id` client attribute (which means the opposite thing — an external identity the client authenticates *in* with). Spoofing and collisions are therefore structurally impossible. |
 | `aud` | exactly the validated `resource` values; `removeClaim` first so neither `client_id` nor `additionalAudience` leak in | **required**; the reverse of the inbound validator where `aud` must equal our issuer |
 | `iat`, `nbf`, `exp` | from `accessToken`; lifetime per 10.6 | |
 | `jti` | `context.getTokenReferenceId()` | |
 | `cnf.jkt` | `context.getDpop()` | always present here |
-| `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` = the ID-JAG's execution id for a JWT bearer grant; else the `txn` request parameter when it names an open execution of this `client_id`; else freshly minted. `execution_authority` = this server's configured authority (its issuer by default). Both **returned in the token response** so renewals reuse them | The authoritative correlation binding that PDP/PEP read; the two MUST travel together; one pair per execution, not per token. **Disclosed per audience (§10.10):** emitted raw only to a **same-domain** audience; a cross-domain audience receives a pairwise/opaque execution reference, never the global id |
-| `txn` | Same value as `execution_id`, set for compatibility with the existing transaction-token machinery | Application alias for `execution_id`, not a separate correlation key; shares the execution id's per-audience disclosure rule (§10.10) |
-| `attestation` | the assessment that satisfied 10.4 | hardware state the token was issued under. **Disclosed per audience (§10.10):** the default is `status`-only (`{status, appraised_at}`); `platform` / `measurement` / `policy_version` / `id` are emitted only to an audience whose disclosure profile is `full`, since raw measurements are fingerprinting material |
-| `delegation` | `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` = the ID-JAG token type URI, `credential_id` = the ID-JAG `jti`; omitted for pure `client_credentials` | human ↔ agent correlation inside the token. **Not** RFC 8693 `act`: `act` names the *current actor* acting on behalf of `sub`, which would say Alice acts for the agent; and `may_act` names a party authorised to *become* an actor. Neither is "the principal who delegated". The SPIFFE agent stays `sub`; the delegator is an explicit, separately named reference to the credential that carried the delegation. **Disclosed per audience (§10.10):** omitted entirely unless the audience opts in, and `principal_sub` is a **pairwise** identifier per `(audience, human)` unless the audience is authorized for the raw subject — so unrelated RPs cannot correlate the human; the raw identity otherwise lives only in access-controlled TRACE evidence, resolved by `sid` |
+| `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` is the ID-JAG's execution id for a JWT-bearer grant; otherwise the `txn` request parameter when it names an open execution of this `client_id`; otherwise freshly minted. `execution_authority` is this server's configured authority (its issuer by default). Both are returned in the token response so renewals reuse them. | *Role:* the authoritative correlation binding PDP/PEP read. *Rule:* the two MUST travel together — one pair per execution, not per token. *Disclosure (§10.10):* raw only to a same-domain audience; a cross-domain audience gets a pairwise/opaque reference, never the global id. |
+| `txn` | Same value as `execution_id`, kept for the existing transaction-token machinery. | An application alias for `execution_id`, not a separate correlation key. Shares the execution id's per-audience disclosure rule (§10.10). |
+| `attestation` | The assessment that satisfied 10.4 — the hardware state the token was issued under. | *Disclosure (§10.10):* default is `status`-only (`{status, appraised_at}`). `platform` / `measurement` / `policy_version` / `id` go only to an audience whose profile is `full`, since raw measurements are fingerprinting material. |
+| `delegation` | *Contains:* `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` (the ID-JAG token-type URI), and `credential_id` (the ID-JAG `jti`). Omitted for pure `client_credentials`. | *Role:* ties the human to the agent inside the token. *Why not `act`:* RFC 8693 `act` names the *current actor* acting for `sub` (that would read as "Alice acts for the agent"), and `may_act` names a party allowed to *become* an actor — neither means "the principal who delegated." So the SPIFFE agent stays `sub`, and the delegator is a separate, explicit reference to the credential that carried the delegation. *Disclosure (§10.10):* omitted unless the audience opts in; `principal_sub` is **pairwise** per `(audience, human)` unless the audience is authorized for the raw subject, so unrelated RPs cannot correlate the human. The raw identity otherwise lives only in access-controlled TRACE evidence, resolved by `sid`. |
 | `client_id`, `scope`, `token_type` | as today | harmless additive claims |
 
 Everything else in `createAccessToken()` (`externalUpdateTokenService.modifyAccessToken()`,
@@ -1682,7 +1682,28 @@ Consequences this plan honours:
   producer-key ↔ record chain. This plan emits the `attestation_ref`/`posture_assessment_ref`
   inputs but does not deliver that assessment; see the guarantee statement in section 15.
 
-The target Lock profile is `tag:jans.io,2026:trace-v1`; event kinds `AUTHORIZATION_DECISION`,
+**Which profile this plan emits, and why.** Records are emitted under the **Lock/Jans profile**
+`eat_profile: tag:jans.io,2026:trace-v1` — the profile Lock itself accepts and verifies
+(`design.md`: Token Modeling / Alignment with TRACE v0.2). That is a **distinct, deliberate
+choice**, not a default:
+
+- It is **not** the base agentrust profile `tag:agentrust-io.com,2026:trace-v0.2`. The Jans profile
+  *extends* v0.2 (a verifier declares the profiles it accepts, v0.2 §3.3); interop with a plain
+  v0.2 verifier is by the field mapping in `design.md`'s Alignment section, not by emitting v0.2
+  directly.
+- It is **not** the OWASP GovOps profile `tag:govops.owasp.org,2026:trace-v1`. GovOps is a
+  **separate, vendor-neutral** EAT profile (`govops-trace-profile.md`) describing the same
+  capability-governance *shape* without naming Jans/Lock components. This plan targets a concrete
+  jans-auth-server → jans-lock deployment, so it emits the Jans/Lock profile Lock verifies; the two
+  are schema-compatible siblings (same envelope, same event kinds, same signed-facts/collector-
+  derived split), and a record is tagged with exactly one profile — this one. A deployment that
+  must emit GovOps-tagged records instead would change only the `eat_profile` tag and any
+  GovOps-specific field names, not the architecture here.
+
+The profiles are **never mixed in one record**: every record this plan emits carries
+`tag:jans.io,2026:trace-v1` and nothing else.
+
+Under that profile: event kinds `AUTHORIZATION_DECISION`,
 `CAPABILITY_INVOKED`, `RUNTIME_EFFECT`, `CREDENTIAL_PROVISIONED`, `EXECUTION_STARTED`; envelope
 `producer`, `kid`, `record_id`, `trace`, `producer_chain`, `parent_record_ids`, `signature`;
 Ed25519 producer keys registered administratively (the planned `/api/v1/audit/trace` admin key
@@ -1905,8 +1926,17 @@ was provisioned under, not a `trace.policy` block — `CREDENTIAL_PROVISIONED` c
 
 New package `io.jans.as.server.trace`:
 
-- `TraceRecordBuilder`: envelope, RFC 8785 canonicalisation (move Lock's `JcsCanonicalizer` to
-  jans-core), Ed25519 signature. It selects the producer key by **role**: the
+- `TraceRecordBuilder`: envelope, RFC 8785 canonicalisation, Ed25519 signature, and
+  `content_digest` — all produced by the **shared `jans-trace-core`** library, not a jans-local
+  reimplementation. Canonicalization/signing/digest are exactly the deterministic operations that
+  crate owns (`jans-trace-core-mvp-design.md`), and the production path uses it directly (via its
+  Java/JNI binding) or, if native packaging is unacceptable for a deployment, a Java implementation
+  that **passes `jans-trace-core`'s normative cross-language test vectors byte-for-byte** — the same
+  conformance bar Lock's own ingestion is held to, so a record this producer signs and a record
+  Lock verifies canonicalize and digest identically. "Move Lock's `JcsCanonicalizer`" is therefore
+  *not* the plan: the plan is to **depend on `jans-trace-core`** (or prove vector-identical output),
+  so there is one canonical implementation, not two that can drift. The builder selects the
+  producer key by **role**: the
   `jans-svid-issuer` key alias (`trace-svid-issuer`) for `CREDENTIAL_PROVISIONED` records, and the
   `jans-auth` key alias (`trace-producer`) for the `EXECUTION_STARTED` bootstrap (and, in the
   companion Auth Server design, `AUTHENTICATION_EVENT`). Both are dedicated producer keys from
@@ -2065,7 +2095,7 @@ SDKs.
 
 | Component | Change | Needed by |
 |-----------|--------|-----------|
-| jans-core | `CustomScriptType.ATTESTATION`, `AttestationType`, `DummyAttestationType`; `JcsCanonicalizer` moved from Lock | PR 1, PR 6 |
+| jans-core | `CustomScriptType.ATTESTATION`, `AttestationType`, `DummyAttestationType`; a binding to the shared **`jans-trace-core`** canonicalization/signing/digest library (its Java/JNI binding, or a Java implementation that passes its normative vectors), **not** a jans-local canonicalizer — so producer and Lock outputs are byte-identical | PR 1, PR 6 |
 | jans-lock | Accept the existing `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED` (bootstrap) event kinds this plan emits — no new event kind is introduced (the earlier `ATTESTATION_APPRAISED` proposal is dropped in favor of `CREDENTIAL_PROVISIONED` carrying the attestation verdict as `posture_assessment_ref`/`attestation_ref`); confirm the `POST /api/v1/audit/trace` submit (`202`, idempotent replay) and `GET /api/v1/audit/trace/executions/{id}` read endpoints (these are a Lock dependency, not reused — only the admin REST class exists on this branch) | PR 6, demo |
 | jans-linux-setup | Schema for `jansAttest`, `jansTraceChain`, `jansTraceOutbox`; register **both** producer keys + chains in Lock when enabled — `jans-auth` scoped `["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]` and `jans-svid-issuer` scoped `["CREDENTIAL_PROVISIONED"]`, each with its own Producer-Key Authorization Statement; ship the reference script | PR 1, PR 6 |
 | jans-config-api, jans-cli-tui, Admin UI | `access_token_type`, attestation and trace properties | after PR 2 |
@@ -2134,7 +2164,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `AbstractAuthorizationGrantTest` (extend) | SVID lifetime source, cap, key-regeneration interaction |
 | `IntrospectionWebServiceTest` (extend) | SPIFFE `sub`, `cnf`, `txn`, `attestation`, `delegation` |
 | `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or when `acr` is below `idJagMinAcr`, or `amr` is outside `idJagAllowedAmr`; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry |
-| `TraceRecordBuilderTest` | envelope; canonical bytes stable; signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
+| `TraceRecordBuilderTest` | envelope; **canonicalization, signature, and `content_digest` are byte-identical to `jans-trace-core`'s normative vectors** (run the shared vectors through this producer's path and assert equality with the Rust/Lock output — the cross-language conformance bar); signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); records carry `eat_profile: tag:jans.io,2026:trace-v1` only; no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
 | `TraceChainStateTest` | sequence allocated by outbox insert; `prev_record_hash` links; zero hash first; tail re-read after restart; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
 | `TraceEmitterTest` | outbox retry; `202` and idempotent-replay acceptance both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; inline ordering; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
 
@@ -2251,8 +2281,9 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | RFC 8693 §4.1 `act` / §4.4 `may_act` | Considered and **not** used for the delegator (semantics are current actor / future actor, not delegating principal); a dedicated `delegation` claim is used instead | Not used |
 | RFC 7662 Introspection | Online verification | **Implemented**; new claims |
 | OpenID AuthZEN 1.0 | Decision API the PEP calls | **Implemented** |
-| TRACE v0.2 (agentrust) | Record semantics, `references` registry, RFC 8785 canonicalisation, Ed25519 | Lock TRACE profile is **designed, not yet shipped** (section 11.1); export mapping is a gateway concern |
-| OWASP GovOps | Record schema (`subject.workload_id`, signed `(action, resource_type)` facts, Lock-derived `capability_id`), capability-catalogue naming | Align as published; records conform to `govops-trace-profile.md` |
+| TRACE v0.2 (agentrust) | Base record semantics, `references` registry, RFC 8785 canonicalisation, Ed25519 | This plan emits the **Lock/Jans profile `tag:jans.io,2026:trace-v1`**, which *extends* v0.2 (not emitted as base v0.2); the Lock TRACE subsystem is **designed, not yet shipped** (section 11.1); v0.2 export is a gateway concern |
+| `jans-trace-core` | Shared canonicalization / Ed25519 signing / `content_digest` library and its **normative cross-language vectors** | Producer path depends on it (JNI) or passes its vectors byte-for-byte (section 11.3); one canonical implementation, no jans-local fork |
+| OWASP GovOps | Vendor-neutral sibling profile `tag:govops.owasp.org,2026:trace-v1` (same shape: `subject.workload_id`, signed `(action, resource_type)` facts, collector-derived `capability_id`), capability-catalogue naming | This plan emits the Jans/Lock profile, **not** the GovOps tag (section 11.1); the two are schema-compatible, and records carry exactly one profile |
 
 ## 17. Resolved decisions and open questions
 
@@ -2270,6 +2301,13 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
   evidence but marked `supersedesEligible=false`, so knowing a victim's public `client_id`/`K.public`
   cannot deny it service.
+- **Profile and canonical implementation are fixed.** Records are emitted under the Lock/Jans
+  profile `tag:jans.io,2026:trace-v1` only — an extension of agentrust v0.2, and a deliberate
+  sibling of (not the same tag as) the vendor-neutral GovOps profile `tag:govops.owasp.org,2026:trace-v1`;
+  the profiles are never mixed in a record (§11.1). Canonicalization, signing, and `content_digest`
+  come from the shared `jans-trace-core` library (or a Java implementation proven byte-identical
+  against its normative vectors), so producer and Lock outputs cannot drift (§11.3) — there is no
+  jans-local canonicalizer fork.
 - **The hardware guarantee requires the full RFC 9449 PEP check, not a thumbprint comparison.** A
   PEP that relies on the `cnf` binding MUST verify every DPoP presentation completely —
   `htm`, `htu`, `iat`/proof-age, a unique `jti` against a replay cache, `nonce` when the PEP issues
