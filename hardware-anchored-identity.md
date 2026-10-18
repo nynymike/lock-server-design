@@ -232,7 +232,7 @@ sequenceDiagram
     Agent->>TEE: sign DPoP proof (+ private_key_jwt)
     TEE-->>Agent: signatures (key never leaves)
     Agent->>AS: POST /token grant=jwt-bearer assertion=ID-JAG (or client_credentials)<br/>DPoP proof · resource=#lt;PEP#gt;
-    Note over AS: jkt = thumbprint of the DPoP proof public key (K.public)<br/>jkt must be a registered key of client_id<br/>assessment looked up by latestRelevant(client_id, jkt)<br/>status must be affirming and appraised_at within max age,<br/>else 400 attestation_required { nonce }
+    Note over AS: jkt = thumbprint of the DPoP proof public key (K.public)<br/>jkt must be a registered key of client_id<br/>authoritative KeyAttestationState read by (client_id, jkt)<br/>status must be affirming and appraised_at within max age;<br/>issuance commits under CAS on the row's revision,<br/>else 400 attestation_required { nonce }
     AS-->>Lock: CREDENTIAL_PROVISIONED (SVID issued · posture_assessment_ref)
     AS-->>Agent: JWT-SVID { sub: spiffe id, aud, exp +10m, cnf.jkt,<br/>execution_id + execution_authority (txn alias), attestation, delegation }
 
@@ -603,10 +603,11 @@ against the agent. Therefore:
   legitimate agent from a third party who only learned its public identifiers.
 - A submission with a `client_id` but **no valid proof of possession** is still processed and its
   verdict is still **recorded as evidence** (negative verdicts are evidence), but it is marked
-  **non-superseding**: it is stored with `supersedesEligible=false`. Such a record is a recorded
-  observation, not issuance state — `latestRelevant` **excludes it from selection** (section 10.4),
-  so it can **never** invalidate a standing `affirming` assessment, and it can **never** become the
-  selected verdict and block issuance for that client, even when it is the newest record. The
+  **non-superseding**: it is stored with `supersedesEligible=false` in the `AttestationAssessment`
+  evidence log and is **never written through to the authoritative `KeyAttestationState` row**
+  (section 9.7). Because it never touches that single row, it can **never** overwrite a standing
+  `affirming` state and can **never** block issuance for that client, even when it is the newest
+  observation. The
   `attestationChallenge`'s `client_id` binding plus this proof requirement together mean "only the
   holder of `K` can cause a negative verdict to count against this client."
 - A submission with **no** `client_id` (pre-enrollment) binds only to the key it attests; it has no
@@ -1119,32 +1120,54 @@ explicitly allowed); everything else is a refusal with the `reasons` list in the
 
 ### 9.7 Persistence
 
-New entity `AttestationAssessment` (`ou=attestations`, `jansAttest`): `attestationId` (primary),
-`jkt` (indexed), `clientId` (indexed, nullable until enrollment), `status`, `platform`,
-`measurement`, `policyVersion`, `verifier`, `verifierResultJwt` (the `AttestationResultJWT`,
-stored when `attestationStoreVerifierResult=true`, default), `verifierResultDigest`,
-`evidenceFormat`, `evidenceDigest`, raw evidence only when `attestationStoreEvidence=true`,
-`keyCertified` (core-computed, 9.3b), `challengeId`, `appraisedAt`, `expiresAt` (ORM TTL
-attribute, as tokens), `supersededBy`, `supersededAt`, `supersedesEligible` (whether this verdict
-may invalidate a standing approval for its `clientId` — `true` only when the submission carried a
-valid DPoP proof of possession of the attested key, section 9.3), `consumed`, `consumedByJti`,
-`version`, `traceRecordId`, `reasons`. Schema in `jans-linux-setup`, ORM entries for all backends.
-Lookups: `latestRelevant(clientId, jkt)` (section 10.4), `byId`.
+Attestation state is split into **two entities with different jobs**: an append-only **evidence
+log** of every verdict ever appraised, and a **single authoritative state row per
+`(client_id, jkt)`** that issuance reads and that supersession writes. The split is what makes the
+concurrency guarantee hold: there is exactly one row whose revision serializes rejection against
+issuance, so there is no multi-entry update to make atomic and no cross-entry ordering to tie-break.
 
-Three fields carry the concurrency state, and they are not maintained with a multi-entry
-transaction (which LDAP and Couchbase do not offer) but with **per-entry optimistic
-compare-and-set (CAS)** on `version` — the same mechanism the challenge state machine already uses
-(section 9.3c):
+**`AttestationAssessment` — the evidence log (append-only, never mutated).** New entity
+(`ou=attestations`, `jansAttest`): `attestationId` (primary), `jkt` (indexed), `clientId` (indexed,
+nullable until enrollment), `status`, `platform`, `measurement`, `policyVersion`, `verifier`,
+`verifierResultJwt` (the `AttestationResultJWT`, stored when `attestationStoreVerifierResult=true`,
+default), `verifierResultDigest`, `evidenceFormat`, `evidenceDigest`, raw evidence only when
+`attestationStoreEvidence=true`, `keyCertified` (core-computed, 9.3b), `challengeId`, `appraisedAt`,
+`expiresAt` (ORM TTL attribute, as tokens), `supersedesEligible` (whether this verdict was entitled
+to change authoritative state — `true` only when the submission carried a valid DPoP proof of
+possession of the attested key, section 9.3), `traceRecordId`, `reasons`. Once written, a row is
+**immutable**: it is a dated observation, not a mutable status. Appraising a new verdict never
+rewrites an earlier one. Lookups: `byId`, `byKey(clientId, jkt)` (for the evidence trail and
+introspection).
 
-| Field | Meaning | How it is written |
-|-------|---------|-------------------|
-| `version` | A monotonic revision counter on the entry | Every mutation is a CAS: read `version = v`, write the change **conditioned on `version` still being `v`**, incrementing it to `v+1`. All supported backends expose this: a SQL `UPDATE … WHERE version = :v`, an LDAP modify with a `version`-assertion control (RFC 4528) or delete-old/add-new value edit, or a Couchbase mutate with the document CAS token. A lost CAS means another node changed the entry first; the loser re-reads and re-evaluates rather than overwriting. |
-| `supersededBy` / `supersededAt` | The id of the later `contraindicated` / `warning` assessment that invalidated this one, and when | Set by that later verdict's write (section 10.4), one entry at a time under CAS — never a transaction spanning several assessment entries |
-| `consumed` / `consumedByJti` | Whether this assessment has already backed an issuance, and which SVID `jti` consumed it (for `attestationRequireFreshPerIssuance`) | Set by a **conditional claim** at issuance (section 10.4): CAS `consumed=false → true` succeeds for exactly one concurrent `/token`; the losers get `attestation_required` and re-attest |
+**`KeyAttestationState` — the authoritative state (one row per key, mutated under CAS).** New
+entity (`ou=keyAttestationStates`, `jansKeyAttestState`): primary key is the pair
+**`(clientId, jkt)`** (one row per attested key — not one per attempt); `revision` (a monotonic
+counter, the single source of order for this key); `status` (the current authoritative verdict:
+`affirming` / `warning` / `contraindicated` / `none`); `appraisedAt`, `expiresAt` (copied from the
+assessment that set this state); `assessmentId` (the evidence-log row that produced the current
+state); `consumed` / `consumedByJti` (for `attestationRequireFreshPerIssuance`); `reasons`. There
+is no `supersededBy`/`supersededAt` and no cross-entry `(appraisedAt, version)` tie-break anymore:
+supersession is simply the next CAS that overwrites this one row, and `revision` is a total order by
+construction. Schema in `jans-linux-setup`, ORM entries for all backends, alongside
+`AttestationAssessment`. Lookups: `getKeyState(clientId, jkt)` (section 10.4), and the evidence
+trail joins the log's `attestationId` to this row's `assessmentId`.
 
-`version` is also what makes "newest by `appraised_at`" unambiguous under a tie: two assessments
-with the same `appraisedAt` are ordered by `(appraisedAt, version)`, so `latestRelevant` is
-deterministic.
+Every state transition is an **optimistic compare-and-set (CAS) on `revision`** of this single row
+— the same mechanism the challenge state machine already uses (section 9.3c), and the only kind of
+atomicity all backends offer (LDAP and Couchbase have no multi-entry transaction):
+
+| Transition | Who writes it | The CAS |
+|------------|---------------|---------|
+| Record a new authoritative verdict (section 10.4 write side) | `/attestation`, only for a `supersedesEligible == true` appraisal | Read the row at `revision = r` (or absent). Write `status`, `appraisedAt`, `expiresAt`, `assessmentId`, reset `consumed = false`, **conditioned on `revision` still being `r`**, setting `revision = r + 1`. First write for a key is an insert conditioned on absence. A `contraindicated`/`warning` that lands this way *is* the supersession: it overwrites the single authoritative row, so there is nothing else to mark. |
+| Claim the state for one issuance (section 10.4 read/commit side) | `/token`, when `attestationRequireFreshPerIssuance` | CAS `consumed = false → true, consumedByJti = :svidJti` **conditioned on `revision` still being the `r` the issuance evaluated**. Succeeds for exactly one concurrent `/token`; a loser (another issuance, or a rejection that bumped `revision`) gets `attestation_required`. |
+
+CAS on one entry is uniformly available: a SQL `UPDATE … WHERE revision = :r`, an LDAP modify with
+a `revision`-assertion control (RFC 4528) or delete-old/add-new value edit, or a Couchbase mutate
+with the document CAS token. A lost CAS means another node advanced the row first; the loser
+re-reads and re-evaluates against the new state rather than overwriting it. Because there is only
+one row per key, `revision` is a genuine total order — the earlier `(appraisedAt, version)`
+tie-break across separate assessment entries, which was **not** a total order (two entries could
+share both fields), is gone.
 
 ### 9.8 Configuration and discovery
 
@@ -1183,9 +1206,9 @@ singleton, and specifies the transitions.
 
 `jwks` / `jwks_uri` MAY contain more than one key. The model is **per-key**, not per-client:
 
-- Every key the client presents for SVID use must have its **own** `affirming` assessment
-  (`latestRelevant(client_id, jkt)` is keyed by `jkt`, section 10.4) — a fresh assessment for key
-  A does not vouch for key B. `updateClient` runs the DCR attestation gate (section 9.5) for each
+- Every key the client presents for SVID use must have its **own** authoritative `affirming` state
+  (there is one `KeyAttestationState` row per `(client_id, jkt)`, section 10.4) — a fresh
+  assessment for key A does not vouch for key B. `updateClient` runs the DCR attestation gate (section 9.5) for each
   **newly added** key and rejects any added key that lacks a fresh `affirming` assessment
   (`invalid_client_metadata`, `attestation_required_for_new_key`).
 - Issuance is always about the single key that signed the request's DPoP proof. A `jwks` with two
@@ -1228,7 +1251,7 @@ self-service (which would reintroduce the hijack the old-key rule prevents):
 |-----------|----------------------|----------|
 | **Destroyed / lost TPM** (hardware failure, decommissioned node) | `K1`'s private half is gone; no proof over it is possible | An operator (admin scope) authorizes a **re-enrollment**: the agent attests a fresh `K2` and an administrative `updateClient` (not old-key-authorized — the admin is the authority) binds `K2` and removes the dead `K1`. Recorded as `IDENTITY_ROTATED` with reason `key_lost`, so the break in key continuity is explicit rather than silent |
 | **VM rebuild / re-image** (same logical agent, new runtime instance) | A new vTPM means a new key and a new `workload_instance_id` | Treated as re-enrollment of the same logical `client_id` with a new attested key and instance; the `workload_instance_id` change is visible in the evidence (and is exactly why instance binding is a separate assessment — section 15). No old-key authorization is possible or expected |
-| **Suspected compromise / emergency replacement** | `K1` may still be usable, but must not be trusted | An operator **revokes** `K1` out of band: an administrative action marks every `K1`-bound assessment `contraindicated` (`supersedesEligible=true`, admin-authorized) and removes `K1` from `jwks`, so issuance under `K1` stops at once and outstanding SVIDs die within the TTL. A fresh `K2` is enrolled by the normal attested path. Recorded as `IDENTITY_ROTATED` reason `emergency` |
+| **Suspected compromise / emergency replacement** | `K1` may still be usable, but must not be trusted | An operator **revokes** `K1` out of band: an administrative action overwrites the `(client_id, K1)` `KeyAttestationState` row to `contraindicated` under CAS (`supersedesEligible=true`, admin-authorized) and removes `K1` from `jwks`, so issuance under `K1` stops at once and outstanding SVIDs die within the TTL. A fresh `K2` is enrolled by the normal attested path. Recorded as `IDENTITY_ROTATED` reason `emergency` |
 
 #### Clone and snapshot detection (a limit, stated honestly)
 
@@ -1376,84 +1399,113 @@ lives in hardware.
 
 ### 10.4 Attestation freshness rule
 
+Issuance reads the **single authoritative state row** for the key (`KeyAttestationState`, one per
+`(client_id, jkt)`; section 9.7), capturing its `revision`, and commits the issuance with a CAS
+conditioned on that same `revision`. The CAS is the linearization point: a rejection takes effect
+against an issuance if, and only if, it advances the row's `revision` before that issuance's commit
+lands.
+
 ```text
-assessment = attestationService.latestRelevant(client_id, dpopJkt)
-             // AUTHORITATIVE ISSUANCE STATE ONLY: newest by (appraisedAt, version) among entries with
-             //   status != none
-             //   AND supersedesEligible == true   // non-eligible (anonymous) verdicts are recorded
-             //                                     // observations, never issuance state — they are
-             //                                     // excluded from selection entirely (see below)
-             //   AND supersededBy == null
-maxAge     = min(attestationMaxAgeForIssuanceSeconds, client.attestationMaxAgeSeconds)
-if assessment == null
-   or assessment.status == contraindicated                 // a newer rejection wins over any older approval
-   or (assessment.status == warning && !attestationAcceptWarning)
-   or assessment.expiresAt <= now                          // the assessment's own validity window has closed
-   or assessment.appraisedAt < now - maxAge                // older than the issuance freshness bound
-   or (attestationRequireFreshPerIssuance && assessment.consumed)
+state = attestationService.getKeyState(client_id, dpopJkt)   // the ONE authoritative row, or null
+r     = state?.revision                                      // the revision this issuance evaluates against
+maxAge = min(attestationMaxAgeForIssuanceSeconds, client.attestationMaxAgeSeconds)
+
+// --- evaluate the gate against the authoritative state ---
+if state == null
+   or state.status == none                                   // never a real verdict, or last write was an outage
+   or state.status == contraindicated                        // the authoritative verdict is a rejection
+   or (state.status == warning && !attestationAcceptWarning)
+   or state.expiresAt <= now                                 // the state's own validity window has closed
+   or state.appraisedAt < now - maxAge                       // older than the issuance freshness bound
+   or (attestationRequireFreshPerIssuance && state.consumed)
 then
    return 400 attestation_required
 
+// --- commit, conditioned on the state not having changed since it was read ---
 if attestationRequireFreshPerIssuance:
-   // claim the assessment for exactly one issuance via per-entry CAS on `version`
-   ok = attestationService.compareAndConsume(assessment.id, assessment.version, svidJti)
-        // atomic: WHERE id = :id AND version = :v AND consumed = false
-        //         SET consumed = true, consumedByJti = :svidJti, version = v + 1
-   if not ok:
-      return 400 attestation_required                      // another /token consumed it first; re-attest
+   // claim this state for exactly one issuance AND confirm no rejection slipped in
+   ok = attestationService.compareAndConsume(client_id, dpopJkt, r, svidJti)
+        // atomic on the single row:
+        //   WHERE clientId = :c AND jkt = :j AND revision = :r AND consumed = false
+        //   SET consumed = true, consumedByJti = :svidJti, revision = r + 1
+else:
+   // no per-issuance consume, but still confirm the evaluated revision is current
+   ok = attestationService.stillCurrent(client_id, dpopJkt, r)
+        // atomic read-check: the row still exists at revision = :r
+if not ok:
+   return 400 attestation_required   // a rejection or a competing issuance advanced revision; re-attest/retry
 ```
 
-Both an expired assessment (`expiresAt <= now`) and one older than the issuance freshness bound
+Both an expired state (`expiresAt <= now`) and one older than the issuance freshness bound
 (`appraisedAt < now - maxAge`) are rejected — the two are distinct: `expiresAt` is the validity
 window the appraisal was stored with (section 9.7), `maxAge` is the stricter per-issuance bound,
 and either closing is sufficient to require re-attestation.
 
-**Recorded observation vs. authoritative issuance state.** This is the crux of the
-denial-of-service defence, and it is enforced on **both** sides — the write *and* the read:
+**When a rejection takes effect relative to an in-flight issuance.** A rejection (a
+supersession-eligible `contraindicated`/`warning`) takes effect the instant its write commits the
+CAS that advances the key's `revision` from `r` to `r + 1` (section 9.7). Relative to an issuance
+that read the state at `revision = r`:
 
-- An assessment with `supersedesEligible == false` (an anonymous submission naming someone else's
-  `client_id`, no proof of possession of `K`; section 9.3) is a **recorded observation** only. It
-  is stored as evidence, but it is **not part of issuance state**: `latestRelevant` filters it out
-  (`supersedesEligible == true` is a selection predicate, above), so it can never *become the
-  selected verdict* and can never, by its mere existence as the newest record, cause a
-  `400 attestation_required`. This closes the gap a read filter of only `status != none AND
-  supersededBy == null` would leave open — where an anonymous `contraindicated`, being newest and
-  non-superseded, would be selected and would block issuance even though it marked nothing
-  superseded.
-- Only a `supersedesEligible == true` verdict is **authoritative issuance state**: it is eligible
-  for selection by `latestRelevant`, and a supersession-eligible `contraindicated`/`warning` is the
-  only thing that **marks earlier approvals `supersededBy`** (the write side).
+- If the rejection's `r → r + 1` commits **before** the issuance's final CAS, the issuance's CAS
+  (which still names `revision = r`) **fails** and the issuance returns `attestation_required`. The
+  rejection wins.
+- If the issuance's CAS commits **first**, it advances the row to `r + 1` itself; the rejection's
+  CAS (also naming `r`) then fails, re-reads, and re-applies against `r + 1`, landing as the
+  authoritative verdict for every subsequent issuance. That one in-flight SVID was issued against
+  the then-current approval; its short TTL bounds the exposure, and the recorded rejection stops the
+  next issuance.
 
-So a non-eligible submission updates neither the selected verdict nor the supersession state; both
-the read (selection) and the write (supersession) are gated on `supersedesEligible`. **Latest
-relevant, not latest affirming:** among the authoritative (eligible, non-superseded, real-verdict)
-assessments, the newest by `(appraisedAt, version)` decides, so an agent just refused by an
-*eligible* `contraindicated` cannot fall back to an older approval still inside the age window —
-that eligible rejection both wins selection and marks the older approval superseded. An anonymous
-replay of stale evidence by a third party who knows only the public `client_id`/`K.public` is
-recorded but is inert against issuance.
-Supersession is implemented **without** a multi-entry transaction (LDAP and Couchbase have none):
-when a new supersession-eligible `contraindicated`/`warning` verdict is stored, the writer marks
-each still-live earlier `affirming` assessment for that key `supersededBy = <new id>`,
-`supersededAt = now` with a **per-entry CAS on `version`** (section 9.7). `latestRelevant` filters
-on `supersedesEligible == true` **and** `supersededBy == null`, so a concurrent `/token` on another
-node either sees the new eligible verdict as newest or sees the older approval already marked
-superseded; it can never settle on an approval the system has invalidated, and it never selects a
-non-eligible observation at all. A CAS that loses to a racing writer is retried against the re-read entry,
-so supersession converges without a transaction. Which outcomes invalidate prior approval (all
-conditional on `supersedesEligible == true`):
+When `attestationRequireFreshPerIssuance` is on there is **no** window in which an issuance reads an
+approval, a rejection commits, and the issuance still succeeds against the stale read — the issuance
+does not succeed on the read, it succeeds on the `revision` CAS, and that CAS and the rejection
+contend for the *same single row*, so a rejection that commits first makes the issuance fail. With
+the flag off, the commit is a `stillCurrent(r)` read-check rather than a mutating CAS, so a
+rejection landing in the sliver between that check and the mint can let **one** already-evaluated
+issuance through; that single SVID is bounded by its short TTL and the rejection stops every
+subsequent issuance. In both modes the key guarantee holds — a rejection is authoritative for all
+issuance that has not already passed its commit point, and no issuance can resurrect an approval the
+row no longer holds. This is the guarantee the previous per-assessment-entry CAS could not give at
+all: updating several assessment entries one at a time left the window open even under
+`attestationRequireFreshPerIssuance` (a reader passed on entry A while a writer marked entry A
+superseded), and separate entries sharing `(appraisedAt, version)` were not even totally ordered.
+One row, one `revision`, one CAS closes both gaps.
 
-| Outcome of a new attestation attempt | Authenticated? | Effect on earlier `affirming` assessments for the same key |
+**Recorded observation vs. authoritative issuance state.** The denial-of-service defence rests on
+the same single-row model, split from the evidence log:
+
+- An appraisal with `supersedesEligible == false` (an anonymous submission naming someone else's
+  `client_id`, no proof of possession of `K`; section 9.3) is written **only to the
+  `AttestationAssessment` evidence log**. It **never touches `KeyAttestationState`** — the write
+  side skips the state CAS entirely for a non-eligible verdict (section 9.7). So it cannot change
+  the authoritative `status`, cannot advance `revision`, and therefore can neither supersede a
+  standing approval nor, by its mere existence as the newest record, cause a
+  `400 attestation_required`. A third party who knows only the public `client_id`/`K.public` writes
+  a dated observation and nothing more.
+- Only a `supersedesEligible == true` appraisal is written **through to `KeyAttestationState`**: it
+  overwrites the single authoritative row under CAS, which *is* the supersession — a
+  supersession-eligible `contraindicated`/`warning` replaces the prior approval in place, so there
+  are no other entries to mark.
+
+**Authoritative, not latest-affirming.** Because there is one authoritative row, an agent just
+refused by an eligible `contraindicated` cannot fall back to an older approval still inside the age
+window: the older approval no longer exists as state — it was overwritten. The evidence log still
+holds both the old approval and the new rejection for the auditor, but issuance reads only the one
+authoritative row. An anonymous replay of stale evidence by a third party is recorded in the
+evidence log and is inert against that row. Which outcomes overwrite the authoritative row with a
+rejection (all conditional on `supersedesEligible == true`):
+
+| Outcome of a new attestation attempt | Authenticated? | Effect on the key's authoritative `KeyAttestationState` row |
 |--------------------------------------|----------------|-----------------------------------------------------------|
-| `contraindicated` with `measurement_not_allowed`, `debug_enabled`, `untrusted_verifier` (verifier rejected the platform), `key_not_certified` | Yes: a verifier-signed or hardware-signed statement about **this** platform and key | **Invalidated.** Issuance stops immediately; the agent must obtain a new `affirming` appraisal |
-| `contraindicated` with `nonce_mismatch`, `evidence_expired` | Partly: valid evidence, wrong challenge (replay or a stale report) | **Invalidated.** A replay attempt against this key is a signal; the legitimate agent can simply re-attest |
-| `contraindicated` with `key_mismatch` (evidence is about some other key) | About a different key | **Not invalidated**; the assessment is stored against the key the evidence named, not against `jkt`. Prevents a third party from knocking out an agent by attesting an unrelated key under its `client_id` |
-| `none` with `verifier_unavailable` | No: nothing was appraised | **Not invalidated**, and not extended either. Prior approval remains valid until its own `expires_at`; the outage is visible in the evidence trail as a `none` record |
-| `warning` | Yes | Replaces the prior approval as the latest verdict; accepted only with `attestationAcceptWarning` |
+| `contraindicated` with `measurement_not_allowed`, `debug_enabled`, `untrusted_verifier` (verifier rejected the platform), `key_not_certified` | Yes: a verifier-signed or hardware-signed statement about **this** platform and key | **Overwritten to `contraindicated`** under CAS. Issuance stops immediately; the agent must obtain a new `affirming` appraisal |
+| `contraindicated` with `nonce_mismatch`, `evidence_expired` | Partly: valid evidence, wrong challenge (replay or a stale report) | **Overwritten to `contraindicated`.** A replay attempt against this key is a signal; the legitimate agent can simply re-attest |
+| `contraindicated` with `key_mismatch` (evidence is about some other key) | About a different key | **No change**; the verdict is logged against the key the evidence named, not against this `jkt`, so it never reaches this row. Prevents a third party from knocking out an agent by attesting an unrelated key under its `client_id` |
+| `none` with `verifier_unavailable` | No: nothing was appraised | **No change, and not extended either** — a `none` outage is logged as evidence but is **not** written through to the state row, so the prior `affirming` row stands until its own `expiresAt`. The outage is visible in the evidence trail |
+| `warning` | Yes | **Overwrites** the row as the current verdict; accepted at issuance only with `attestationAcceptWarning` |
+| `supersedesEligible == false` (any status, no proof of possession) | No | **No change**; written to the evidence log only, never to the state row (section 9.7). This is the DoS guard |
 | `invalid_challenge`, `invalid_request`, `unsupported_evidence_format` (HTTP `400`) | No appraisal | No assessment stored; no effect |
 
-The DCR gate (9.5) uses the same `latestRelevant` rule, and `updateClient` re-evaluates it when
-keys change.
+The DCR gate (9.5) reads the same single `KeyAttestationState` row, and `updateClient`
+re-evaluates it when keys change.
 
 ```json
 {
@@ -1465,13 +1517,15 @@ keys change.
 }
 ```
 
-How the server finds the assessment: the token request carries **no** `attestation_id`. The DPoP
-proof carries the public key; its RFC 7638 thumbprint is `jkt`. That `jkt` was the challenge key
-at `/attestation` and is the `jkt` column of the stored assessment, and the enrollment bound the
-same key to `client_id`. So `(client_id, jkt)` is a natural key: the server looks up the newest
-unexpired `affirming` assessment for that pair and never needs the agent to name it. The
-`attestation_id` becomes known to the agent (and useful) only in the inline paths below, and it
-is stamped into the SVID's `attestation.id` so verifiers and auditors can reference it.
+How the server finds the state: the token request carries **no** `attestation_id`. The DPoP proof
+carries the public key; its RFC 7638 thumbprint is `jkt`. That `jkt` was the challenge key at
+`/attestation`, is the primary key of the `KeyAttestationState` row together with `client_id`, and
+the enrollment bound the same key to `client_id`. So `(client_id, jkt)` names exactly one
+authoritative row: the server reads it directly and never needs the agent to name an assessment.
+The `attestation_id` recorded on that row (`assessmentId`, pointing at the evidence-log entry that
+set the state) is stamped into the SVID's `attestation.id` so verifiers and auditors can reference
+the appraisal that backed issuance; the inline paths below let an agent supply an `attestation_id`
+it just obtained so the write-through and this read happen in one round trip.
 
 New `TokenErrorResponseType.ATTESTATION_REQUIRED("attestation_required")`. The agent satisfies it
 in one of three ways, in order of preference:
@@ -2275,7 +2329,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `SpiffeBundleRestWebServiceImplTest` | flag disabled; headers |
 | `SpiffeTrustDomainServiceTest` | pin on first start; adopt another node's value; invalid domain → `ERROR`, no exception |
 | `SpiffeIdUtilTest` (extend) | `buildAgentSpiffeId`; trust domain with `/` rejected |
-| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; `latestRelevant` picks the newest **non-superseded** real verdict and breaks `appraisedAt` ties by `version`; an assessment past its own `expiresAt` is rejected even inside `maxAge`, and one past `maxAge` is rejected even before `expiresAt`; a supersession-eligible `contraindicated` (submission carried a valid DPoP proof of `K`) supersedes an older fresh `affirming` via per-entry CAS (no multi-entry transaction); a `contraindicated` **without** proof of possession is recorded with `supersedesEligible=false`, and `latestRelevant` **excludes it from selection** so that — even as the newest record for `(client_id, jkt)` — it supersedes nothing, is never the selected verdict, and does not block issuance (the DoS guard, read **and** write side); a lost supersession CAS is retried and still converges; `attestationRequireFreshPerIssuance` consume is a CAS on `consumed` that succeeds for exactly one of two concurrent `/token` calls and the loser gets `attestation_required`; `none` neither supersedes nor extends; `key_mismatch` stored against the other key |
+| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; **single-row state model:** there is exactly one `KeyAttestationState` per `(client_id, jkt)` and a supersession-eligible `contraindicated` **overwrites** it in place under CAS on `revision` (no `supersededBy`, no cross-entry tie-break); `revision` is strictly monotonic per key; the state past its own `expiresAt` is rejected even inside `maxAge`, and one past `maxAge` is rejected even before `expiresAt`; **rejection-vs-in-flight-issuance race (the core fix):** given an issuance that read the row at `revision = r`, a `contraindicated` committing `r → r+1` before the issuance's commit makes the issuance's `compareAndConsume(... revision = r ...)` / `stillCurrent(r)` **fail** → `attestation_required`; if the issuance's CAS commits first, the rejection's CAS loses, re-reads `r+1`, and re-applies — no interleaving lets an issuance succeed on a stale-approval read after a rejection commits; a `contraindicated` **without** proof of possession is written to the evidence log with `supersedesEligible=false` and **never reaches `KeyAttestationState`**, so it overwrites nothing, never becomes authoritative, and does not block issuance even as the newest observation (the DoS guard); `attestationRequireFreshPerIssuance` consume is a CAS on `(revision, consumed)` of the one row that succeeds for exactly one of two concurrent `/token` calls, the loser gets `attestation_required`; a `none` outage is logged but not written through to the row; `key_mismatch` logged against the other key, state row for this `jkt` unchanged |
 | `AttestationRestWebServiceImplTest` | flag disabled; `invalid_challenge` carries a fresh challenge; no `500` for a verdict; `503 verifier_unavailable` keeps the challenge; a submission with a `client_id` and no/invalid DPoP proof is accepted-and-recorded but `supersedesEligible=false`; a `client_id` submission with a valid proof over `K` is `supersedesEligible=true`; pre-enrollment (no `client_id`) needs no proof |
 | `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
 | `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
@@ -2373,10 +2427,10 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Captured DPoP proof replayed (different method/endpoint, or reused) | Rejected by the PEP's `htm`/`htu` binding and its `jti` replay cache (§6); a proof is bound to one method, one endpoint, and one use, and a nonce challenge closes the window further. A PEP that only compares the proof-key thumbprint to `cnf.jkt` and skips these is not sender-constrained — the §6 requirements are normative for that reason |
 | Agent host compromised, key exfiltration attempted | Key is non-exportable; the attacker can only ask the hardware to sign while resident. Proof freshness windows and short SVID TTLs bound the abuse; disabling the client ends it. **Re-attestation does not by itself detect this**: a compromised process can keep calling the vTPM while the VM's launch measurement stays acceptable (see the guarantee statement below). Detection needs something that measures the agent runtime (PCR extension of the agent image, IMA, confidential containers) included in `allowed_measurements`, or behavioural evidence in the TRACE chain |
 | Evidence replayed from an earlier session | Challenge is single-use and bound to `jkt`; `nonce_mismatch` → `contraindicated`; the negative appraisal is itself recorded |
-| Attacker submits stale/forged evidence under a victim's `client_id` to force a `contraindicated` and knock the agent offline | Blocked: a submission naming a `client_id` only supersedes that client's approvals when it carries a valid DPoP proof of possession of `K` (section 9.3). Without the proof the verdict is recorded (`supersedesEligible=false`) but `latestRelevant` excludes it from selection, so it invalidates nothing and — even as the newest record — is never the selected verdict and blocks no issuance. Knowing the public `client_id`/`K.public` is not enough to deny service; only the holder of `K` can drive a counting negative verdict |
+| Attacker submits stale/forged evidence under a victim's `client_id` to force a `contraindicated` and knock the agent offline | Blocked: a submission naming a `client_id` is written through to the authoritative `KeyAttestationState` row only when it carries a valid DPoP proof of possession of `K` (section 9.3). Without the proof the verdict is logged (`supersedesEligible=false`) but never reaches that single row, so it overwrites nothing and — even as the newest observation — is never authoritative and blocks no issuance. Knowing the public `client_id`/`K.public` is not enough to deny service; only the holder of `K` can drive a counting negative verdict |
 | Evidence about a different key than the DPoP / registration key | Core extracts the attested key from the verifier result and the certify structure, compares it to the challenge `jkt` and to the registered keys; `key_mismatch`; the script has no input into this comparison |
-| Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **supersedes** any earlier approval at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
-| Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked `supersededBy` by per-entry CAS (10.4), so a racing `/token` on another node cannot settle on them. The agent must obtain a new `affirming` appraisal |
+| Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **overwrites** the key's authoritative state row at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
+| Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: the one authoritative `KeyAttestationState` row now reads `contraindicated`; the old approval was overwritten in place, not left alongside. A racing `/token` on another node either reads the new state or has its commit CAS on `revision` fail (10.4), so it can never settle on the overwritten approval. The agent must obtain a new `affirming` appraisal |
 | Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side. **How this resolves is the capability-risk tier's choice (§16.9):** `critical` fails closed once no fresh appraisal remains; `low` MAY proceed under a recorded degraded posture if its policy opts in |
 | Agent suspended, decommissioned, or expired | The client's `agentLifecycleState` gates issuance (§9.9): `suspended` refuses `/token` reversibly (`403 client_suspended`), `decommissioned` refuses permanently and removes the keys, and reaching `agentExpiresAt` does one or the other per `agentExpiryAction`. In all cases outstanding SVIDs die within the TTL and introspection reports `active: false`. The `client_id` is never recycled; a decommissioned client becomes a `tombstoned` identity after `clientTombstoneAfterSeconds`, with its evidence retained |
 | Agent's hardware key `K` destroyed, lost, or compromised | No old-key-authorized rotation is possible, so recovery is the administrative path (section 9.9): an operator authorizes re-enrollment of a fresh attested key (destroyed/lost) or revokes `K` and enrolls a replacement (compromise). Issuance under `K` stops at once; a VM rebuild additionally changes `workload_instance_id`, which stays visible in the evidence. Recorded as `IDENTITY_ROTATED` (`key_lost` / `emergency`) |
@@ -2513,14 +2567,19 @@ lost.
 
 ### 16.7 Per-backend durability and fault tests
 
-The CAS/lease mechanisms (challenge state 9.3c, assessment supersession/consume 9.7/10.4) and the
-outbox-before-action commit (11.3) MUST be validated on **every supported backend** — SQL, LDAP,
-Couchbase, and clustered deployments — because their transactional semantics differ (SQL has
-multi-entry transactions; LDAP/Couchbase use per-entry CAS). Fault tests MUST cover: a node crash
-between the outbox write and entity persistence (reconciliation emits the compensating record,
-11.3); a lost supersession/consume CAS under concurrency (retry converges, 10.4); a node crash
-mid-`processing` on a challenge (lease repair, 9.3c); and Lock unreachable (outbox backlog, then
-at-least-once delivery, 11.3).
+The CAS/lease mechanisms (challenge state 9.3c, the single-row `KeyAttestationState` revision CAS
+for supersession and issuance 9.7/10.4) and the outbox-before-action commit (11.3) MUST be
+validated on **every supported backend** — SQL, LDAP, Couchbase, and clustered deployments —
+because their transactional semantics differ (SQL has multi-entry transactions; LDAP/Couchbase use
+single-entry CAS, which is all this design needs because all attestation state for a key lives in
+one row). Fault tests MUST cover: a node crash between the outbox write and entity persistence
+(reconciliation emits the compensating record, 11.3); the **rejection-vs-in-flight-issuance race**
+— a `contraindicated` and a concurrent `/token` contending for the same `(client_id, jkt)` row,
+asserting the issuance's `revision` CAS fails when the rejection commits first and that no
+interleaving issues an SVID against an overwritten approval (10.4); a lost supersession/consume CAS
+under concurrency (retry converges against the new `revision`, 10.4); a node crash mid-`processing`
+on a challenge (lease repair, 9.3c); and Lock unreachable (outbox backlog, then at-least-once
+delivery, 11.3).
 
 ### 16.8 Operational metrics
 
@@ -2635,11 +2694,11 @@ resolution.
 - **Proof of possession of `K` gates negative-verdict supersession.** `/attestation` needs no OAuth
   auth for a pre-enrollment caller, but a submission naming an existing `client_id` only
   invalidates that client's standing approvals (section 10.4) when it carries a valid DPoP proof of
-  possession of the attested key (section 9.3). An anonymous negative verdict is recorded as
-  evidence but marked `supersedesEligible=false`, which keeps it out of issuance state entirely:
-  `latestRelevant` excludes it from selection, so it neither supersedes a standing approval nor
-  becomes the newest selected verdict. Knowing a victim's public `client_id`/`K.public` cannot deny
-  it service.
+  possession of the attested key (section 9.3). An anonymous negative verdict is recorded in the
+  `AttestationAssessment` evidence log but marked `supersedesEligible=false`, which keeps it out of
+  issuance state entirely: it is **never written through to the authoritative `KeyAttestationState`
+  row**, so it neither overwrites a standing approval nor becomes the current verdict. Knowing a
+  victim's public `client_id`/`K.public` cannot deny it service.
 - **A shared execution id is correlation, not same-operation proof.** Records sharing
   `(trace_execution_id, execution_authority)` are claimed to belong to one execution; this does
   **not** prove two of them describe the same operation. Same-operation proof is the Phase-3
@@ -2833,15 +2892,22 @@ and keep obtaining tokens with an earlier, still-fresh positive assessment. Use 
 relevant assessment and define which failures invalidate prior approval; a verifier outage should
 have different semantics from an authenticated measurement failure.**
 
-Accepted. `latestAffirming` is replaced everywhere by `latestRelevant(client_id, jkt)`: the newest
-non-superseded assessment with a real verdict (`status != none`, ordered by `(appraisedAt, version)`)
-decides, and a `contraindicated` verdict supersedes every earlier approval for that key by setting
-`supersededBy`/`supersededAt` via **per-entry optimistic CAS on `version`** — not a multi-entry
-transaction, which LDAP and Couchbase do not provide (`supersededBy`/`version` columns in the
-assessment entity, section 9.7). The freshness check also rejects an assessment whose own
+Accepted, and strengthened to a **single authoritative state row per `(client_id, jkt)`**
+(`KeyAttestationState`) with a monotonic `revision`, separate from the append-only
+`AttestationAssessment` evidence log (section 9.7). The current verdict for a key is that one row,
+not "the newest among many assessment entries" — the earlier `latestRelevant` ordering by
+`(appraisedAt, version)` was **not** a total order (two entries could share both fields) and the
+earlier per-assessment-entry CAS could **not** serialize rejection against issuance (a `/token`
+could pass its read of an approval while a writer marked that approval superseded, and still
+issue). Now a `contraindicated`/`warning` **overwrites** the single row under CAS on `revision`
+(that overwrite *is* the supersession — there are no sibling entries to mark), and issuance commits
+with a CAS conditioned on the `revision` it evaluated, so a rejection that commits first makes the
+issuance's CAS fail. The linearization point and the precise rejection-vs-in-flight-issuance
+semantics are stated in section 10.4. The freshness check also rejects a state whose own
 `expiresAt` has passed, independently of the per-issuance `maxAge` bound, and
-`attestationRequireFreshPerIssuance` claims an assessment for exactly one issuance with a CAS on
-`consumed` (section 10.4). Section 10.4 contains the rule and a table of outcomes:
+`attestationRequireFreshPerIssuance` claims the row for exactly one issuance with the same
+`revision` CAS (now also toggling `consumed`). Section 10.4 contains the rule and a table of
+outcomes:
 
 - authenticated platform rejections (`measurement_not_allowed`, `debug_enabled`,
   `untrusted_verifier`, `key_not_certified`) and replay signals (`nonce_mismatch`,
@@ -3035,8 +3101,9 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | Term | In this plan |
 |------|--------------|
 | **`K`** | The agent's hardware keypair — the durable credential; its private half never leaves the secure element (§5). |
-| **Assessment (`attestation_id`)** | jans's server-side record of an attestation verdict for a key, with a validity window (§9.6, §9.7). |
-| **`supersedesEligible`** | Whether a negative verdict may invalidate a standing approval — true only with proof of possession of `K` (§9.3, §10.4). |
+| **`AttestationAssessment` (`attestation_id`)** | An immutable, append-only evidence-log entry: one attestation verdict as appraised at a point in time. Never mutated; not read for issuance (§9.7). |
+| **`KeyAttestationState`** | The **single authoritative row per `(client_id, jkt)`**, carrying the current verdict and a monotonic `revision`. Issuance reads it; a supersession-eligible rejection overwrites it under CAS; the `revision` CAS serializes rejection against in-flight issuance (§9.7, §10.4). |
+| **`supersedesEligible`** | Whether a verdict is written through from the evidence log to the authoritative `KeyAttestationState` row — true only with proof of possession of `K`; a non-eligible verdict is evidence only and can never block issuance (§9.3, §10.4). |
 | **`agentLifecycleState`** | The client lifecycle — `active` / `suspended` / `decommissioned` / `tombstoned` (§9.9). |
 | **Capability-risk tier** | `critical` / `standard` / `low`; chooses how a verifier/bundle/Lock outage resolves (§16.9). |
 | **Lifecycle vs. execution record** | Appraisal/enrollment (lifecycle, own identifiers) vs. delegation/issuance (carry the execution pair) (§3). |
