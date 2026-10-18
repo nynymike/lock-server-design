@@ -2358,6 +2358,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Crash between record commit and token persistence | A `CREDENTIAL_PROVISIONED` record exists for a credential `jti` introspection does not know; the reconciliation job emits a compensating, superseding `CREDENTIAL_PROVISIONED` linked to it (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
+<<<<<<< HEAD
 ### 15.1 Residual trust assumptions
 
 The limits above are stated where each mechanism is defined; this table consolidates them so the
@@ -2386,6 +2387,8 @@ later TRACE phases ship (§11.1 phase mapping). The rest are inherent trust anch
 accepts or verifies out of band; none is hidden, and each is surfaced in the evidence rather than
 silently assumed.
 
+=======
+>>>>>>> origin/main
 ## 16. Operational requirements
 
 The sections above specify the protocol; this one collects the **deployment and operational
@@ -2503,6 +2506,7 @@ The deployment SHOULD expose metrics so the honest-failure paths are observable 
 | Revocation-to-remediation lag | Time from a key/client revocation to issuance actually stopping — the window an attacker still has |
 | Native `jans-trace-core` self-test / load failures | Fails closed for ingestion (11.3); must be alerted, not silent |
 
+<<<<<<< HEAD
 ### 16.9 Availability posture: SLOs and fail-open/closed per capability-risk tier
 
 A verifier, bundle, or Lock outage must not silently turn accountability or posture into stale
@@ -2567,6 +2571,17 @@ Configuration:
 The availability tier reuses the capability-risk classification the PDP/PEP already hold; this plan
 does not introduce a second risk taxonomy, it consumes the existing one to choose the outage
 resolution.
+=======
+### 16.9 Availability posture (fail-open vs fail-closed)
+
+A verifier or Lock outage must not silently turn accountability or posture into stale trust. The
+default is fail-closed for `JWT-SVID` issuance (no committed TRACE record → no SVID, section 11.3;
+no fresh appraisal → `attestation_required`, 10.4). Whether a given capability tolerates fail-open
+is a **per-capability-risk-tier** decision the operator makes, not a global switch: a low-risk
+logging capability MAY accept `warning`/degraded posture, a payments capability MUST fail closed.
+The verifier-unavailable and bundle-unavailable behaviors (section 15) are the mechanism; the
+risk-tier policy chooses which way they resolve.
+>>>>>>> origin/main
 
 ## 17. Specs to follow
 
