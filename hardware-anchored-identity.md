@@ -1211,12 +1211,86 @@ platform measurement and the per-instance `workload_instance_id` surface. Detect
 of one key from two runtimes is a behavioural / instance-binding concern (section 15, Phase-4
 instance binding), explicitly out of scope here and stated so rather than implied.
 
+#### Client lifecycle: suspension, transfer, decommission, and tombstones
+
+Keys rotate under the rules above, but the **enrolled client** — the agent identity itself — also
+has a lifecycle, and leaving it implicit is the gap the key rules alone do not close. The client
+carries an explicit `agentLifecycleState` (a `ClientAttributes` field), and issuance consults it on
+every `/token` the same way it consults the attestation freshness rule (section 10.4):
+
+```text
+          ┌─────────── suspend ──────────┐
+          ▼                              │
+active ──────────── suspend ──────────► suspended ──── resume ──┐
+  │                                        │                    │
+  │ decommission                           │ decommission       │ (back to active)
+  ▼                                        ▼                    │
+decommissioned ─────────── (terminal) ◄────┘◄───────────────────┘
+  │
+  │ retention window elapses
+  ▼
+tombstoned (terminal; identity preserved, no issuance ever)
+```
+
+| State | Issuance at `/token` | How it is entered | Notes |
+|-------|----------------------|-------------------|-------|
+| `active` | Allowed (subject to the attestation and lifecycle checks) | Enrollment; `resume` from `suspended` | The normal operating state |
+| `suspended` | **Refused** (`403 client_suspended`); outstanding SVIDs die within their minutes-long TTL | Admin action, or an automated risk/SSF signal (a later phase) | **Reversible.** Keys and assessments are retained; a `resume` returns the client to `active` without re-enrollment. Used for "stop this agent now, decide later" |
+| `decommissioned` | **Refused** (`403 client_decommissioned`), permanently | Admin action when the agent is retired | **Terminal for issuance.** Keys are removed from `jwks` so no proof can be produced; the `client_id` is **not** reused. The record of the client and its history is retained |
+| `tombstoned` | Refused, permanently | Automatic, once a decommissioned client's retention window elapses | A **tombstone**: the operational client entity is reduced to its stable identity plus a retention marker, but the `client_id` remains permanently reserved so it is never re-issued to a different agent and historical evidence stays resolvable |
+
+Two rules make transfer and reuse safe:
+
+- **Owner transfer is an attributed administrative action, never a silent re-bind.** Handing an
+  agent to a new operator/owner changes the client's ownership metadata through the admin path and
+  is recorded (an `IDENTITY_ROTATED`-adjacent lifecycle note with reason `owner_transfer`); it does
+  **not** rotate the SPIFFE `sub` (still derived from `client_id`) and does not, by itself, grant
+  the new owner the ability to issue — the key rules (section 9.9) still apply, so a transfer
+  typically pairs with an old-key-authorized or admin re-enrollment.
+- **`client_id` is never recycled.** A decommissioned or tombstoned `client_id` is permanently
+  reserved. Reuse would let new activity inherit an old agent's evidence trail — the recycled-NHI
+  hazard — so the identity is preserved as a tombstone rather than freed.
+
+Expiry is the time-bounded form of this: a client MAY carry an `agentExpiresAt`, after which
+issuance is refused exactly as for `suspended` (configurable whether expiry suspends or
+decommissions), so a short-lived agent cannot keep minting tokens past its intended life.
+
+#### Retention of evidence and trust material after assessment expiry
+
+An assessment's `expiresAt` (section 9.7) bounds how long it can **authorize issuance**; it does
+**not** bound how long the assessment, its verifier result, and the key material needed to
+*verify past records* are kept. These are different clocks, and conflating them would make old
+evidence unverifiable:
+
+- An expired, superseded, or consumed `AttestationAssessment` is **retained** (not TTL-deleted
+  while any record references it) so an auditor can later resolve a `CREDENTIAL_PROVISIONED`
+  record's `posture_assessment_ref`/`attestation_id` and re-check the stored
+  `AttestationResultJWT`. The ORM TTL that expires an assessment *for issuance* is distinct from
+  its *retention* lifetime (`attestationRetentionSeconds`, default long — e.g. the evidence
+  retention policy of the deployment).
+- A **retired producer key or hardware key** (rotated out, revoked, or belonging to a
+  decommissioned client) is kept available for **historical verification** of records it signed,
+  independent of whether it may still be *used* — the same "a later revocation never retroactively
+  invalidates an already-verified record" discipline the TRACE design applies to producer keys.
+  The SPIFFE bundle stops serving a rotated-out *signing* key for new verification once it ages out,
+  but the key's thumbprint and the records' signatures remain verifiable from the retained evidence.
+- A **tombstoned client** keeps its stable identity and the evidence/trust material bound to it for
+  the retention window, so "what did this agent do, under what posture, before it was retired?"
+  stays answerable after the client can no longer issue anything.
+
+The rule, stated once: **authorization lifetime ≠ evidence lifetime.** Issuance is gated by the
+short clocks (assessment `expiresAt`, lifecycle state); verifiability is gated by the long
+retention clock, and the two never share a timer.
+
 #### Configuration
 
 | Property | Default | Meaning |
 |----------|---------|---------|
 | `clientMaxAttestedKeys` | 2 | Maximum attested keys in a client's `jwks` (one steady-state key plus a rollover overlap) |
 | `attestationAllowAdminReEnrollment` | `true` | Whether the admin re-enrollment / revocation recovery path is enabled |
+| `agentExpiryAction` | `suspend` | Whether reaching `agentExpiresAt` moves the client to `suspended` or `decommissioned` |
+| `clientTombstoneAfterSeconds` | — (long) | Retention window after `decommissioned` before the client is reduced to a `tombstoned` identity marker; the `client_id` stays reserved forever |
+| `attestationRetentionSeconds` | — (long) | How long an expired/superseded `AttestationAssessment` and its stored verifier result are kept for historical verification — distinct from the issuance-freshness TTL |
 
 ## 10. JWT-SVID issuance at `/token`
 
@@ -1255,6 +1329,7 @@ In `TokenRestWebServiceImpl.requestAccessToken()` after `validateGrantType`, whe
 | A `resource` value is not permitted for this client: not in `ClientAttributes.allowedResources` (exact match, or prefix match when an entry ends with `/`) | `400 invalid_target`. A well-formed URI is not an authorisation to mint a token for that service; the operator decides at registration which audiences an agent may address, and an update-token or client-registration script may narrow (never widen) the list |
 | No DPoP thumbprint | already `invalid_dpop_proof` because `dpopBoundAccessToken` is forced |
 | DPoP key not a registered key (10.3) | `400 invalid_dpop_proof` |
+| Client `agentLifecycleState` not `active` (suspended / decommissioned / tombstoned, or past `agentExpiresAt`) — see section 9.9 | `403 client_suspended` / `403 client_decommissioned` |
 | No fresh affirming assessment for `(client_id, dpopJkt)` (10.4) | `400 attestation_required` |
 
 `resource` is read with `request.getParameterValues("resource")` (as `TokenExchangeService` does)
@@ -2153,7 +2228,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
 | `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
 | `RegisterValidatorTest` (extend) | `validateAttestation` by id; expired; wrong purpose; key not in `jwks`; missing DPoP proof on `/register`; proof key ≠ attested key; `allowed_resources` empty for `JWT-SVID`; `stale_evidence` has `challenge_id`; **multi-key / rollover (9.9):** a `jwks` with two attested keys is accepted and each key needs its own `affirming` assessment; adding a key without a fresh assessment → `attestation_required_for_new_key`; adding/removing a key requires an old-key-authorized proof outside the admin path; exceeding `clientMaxAttestedKeys` is rejected; the admin re-enrollment / revocation path binds a new key or revokes `K1` without old-key authorization |
-| `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, and not-in-`allowed_resources` (exact and prefix); freshness rule none / stale / fresh; inline paths; `attestation_required` body |
+| `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, and not-in-`allowed_resources` (exact and prefix); freshness rule none / stale / fresh; inline paths; `attestation_required` body; **lifecycle gate (§9.9):** issuance refused for `suspended` (`403 client_suspended`) and `decommissioned`/`tombstoned` (`403 client_decommissioned`), allowed again after `resume`, and refused once past `agentExpiresAt` per `agentExpiryAction` |
 | `AuthorizationGrantTest` (extend) | protected SVID claims re-applied after `modifyAccessToken()` alters or removes them; `WARN` logged; additive claims kept |
 | `DpopServiceTest` (extend) | `validateDpopKeyIsRegistered`: match, mismatch, no JWKS, `jwks_uri` |
 | `JwtSvidBuilderTest` | `sub` derivation; `aud` = resources only; `cnf.jkt`; the `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` pair is always present together, sourced correctly, and reused across renewals, with `txn` carrying the same execution-id value; `attestation`; `delegation` present / absent; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
@@ -2251,7 +2326,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **supersedes** any earlier approval at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
 | Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: `latestRelevant` returns the rejection; earlier approvals were marked `supersededBy` by per-entry CAS (10.4), so a racing `/token` on another node cannot settle on them. The agent must obtain a new `affirming` appraisal |
 | Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side |
-| Agent decommissioned or compromised | Admin disables the client: issuance stops; tokens die within the TTL; introspection reports `active: false` |
+| Agent suspended, decommissioned, or expired | The client's `agentLifecycleState` gates issuance (§9.9): `suspended` refuses `/token` reversibly (`403 client_suspended`), `decommissioned` refuses permanently and removes the keys, and reaching `agentExpiresAt` does one or the other per `agentExpiryAction`. In all cases outstanding SVIDs die within the TTL and introspection reports `active: false`. The `client_id` is never recycled; a decommissioned client becomes a `tombstoned` identity after `clientTombstoneAfterSeconds`, with its evidence retained |
 | Agent's hardware key `K` destroyed, lost, or compromised | No old-key-authorized rotation is possible, so recovery is the administrative path (section 9.9): an operator authorizes re-enrollment of a fresh attested key (destroyed/lost) or revokes `K` and enrolls a replacement (compromise). Issuance under `K` stops at once; a VM rebuild additionally changes `workload_instance_id`, which stays visible in the evidence. Recorded as `IDENTITY_ROTATED` (`key_lost` / `emergency`) |
 | Agent VM cloned or snapshotted | A clone cannot export the non-exportable `K`, so it holds no usable key and must enroll its own through the gate; detecting two live runtimes sharing one `jkt` (vTPM-in-snapshot case) is a Phase-4 instance-binding concern, out of scope here and stated so (section 9.9) |
 | Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out |
@@ -2330,6 +2405,13 @@ under that key. Until an instance-bound producer-key registration and that Lock-
   into `human_sponsor` and the execution, so the execution ties to a specific browser session; the
   signed `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` evidence and human credential recovery/revocation
   are the Auth/FIDO companion producers' deferred work, correlated back by `sid` (section 10.9).
+- **The client (agent identity) has an explicit lifecycle, and evidence outlives authorization.**
+  A client carries `agentLifecycleState` — `active` → `suspended` (reversible) → `decommissioned`
+  (terminal for issuance, keys removed) → `tombstoned` (identity permanently reserved) — consulted
+  on every `/token` (§9.9, §10.2). `client_id` is never recycled; owner transfer is an attributed
+  admin action, not a silent re-bind. Separately, **authorization lifetime ≠ evidence lifetime**: an
+  assessment's `expiresAt` bounds issuance, while the assessment, its verifier result, and retired
+  keys are kept for the longer `attestationRetentionSeconds` so past records stay verifiable (§9.9).
 - **A client may hold more than one attested key, and key lifecycle is specified.** "Exactly one
   key" is the common runtime state, not an enforced invariant; `jwks` MAY hold up to
   `clientMaxAttestedKeys` (default 2) for a rollover overlap, each key independently attested and
