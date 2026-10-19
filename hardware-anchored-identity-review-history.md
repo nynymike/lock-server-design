@@ -22,7 +22,7 @@ non-**resolved** guarantee as proven.
 | Item | What is still open |
 |------|--------------------|
 | Q8 — staged-commit evidence durability (fencing + recovery) | the fence-then-resolve ordering, the paused-writer cancellation interaction with **Commit**, and the recovery drain across **Intake → Stage → Commit → Resolve-abort** are specified as a transition table (§11.3) but the cancellation/fence protocol and its recovery edges are still being nailed down; the guarantee is not yet reducible to a settled algorithm a test can pin |
-| Q13 — fenced verifier worker (fencing + recovery) | the epoch-guarded ordering of the assessment / `completed` / state-overwrite writes under lease loss, and the recovery that resolves partial states by `challenge_id`, are not yet a fully settled algorithm; the "a fenced worker never records a verdict" guarantee is design-incomplete, not merely untested |
+| ~~Q13 — fenced verifier worker~~ | **Resolved by Q22** (algorithm now settled): the appraisal commit is a single atomic transaction (verifier call outside it; then lease re-check under row lock + assessment + state write-through + `completed` + evidence, all-or-nothing), so there are no "partial states" to order or recover. Now **partially resolved** (algorithm complete, pending the single-transaction fault test) rather than algorithm-incomplete |
 
 **Items currently partially resolved** (algorithm specified, tests pending):
 
@@ -35,7 +35,8 @@ non-**resolved** guarantee as proven.
 | Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
-| Q17 — aborted outcome wire contract | outcome records validate per operation kind and producer; bootstrap aborts under the right key | per-(kind × outcome) schema fixtures; `credential_fingerprint` present iff `committed`; bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
+| Q17 / Q21 — outcome wire contract | outcome records validate per **event kind × operation subtype × outcome**; bootstrap aborts under the right key | per-(subtype × outcome) schema fixtures; identifying artifact per the matrix (fingerprint only for SVID issuance/enrollment; appraisal and bootstrap carry none); bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
+| Q13 / Q22 — appraisal single-transaction commit | assessment + state write-through + `completed` + evidence commit atomically; no window where a negative verdict is durable while issuance reads the old positive state | single-transaction fault test (crash during verifier call / mid-transaction leaves nothing durable; fenced worker aborts at the lease re-check; superseded-generation skips write-through; `none`-outage writes evidence only) |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -287,12 +288,13 @@ agent," just not which human or the delegation credential.
 
 ## Q13. A batch of precision fixes across attestation, delegation, privacy, and signing
 
-**Status: mostly resolved** — items (2)–(7) are specified and testable directly; item (1), the
-**fenced verifier worker**, is **algorithm incomplete**: the epoch-guarded ordering of the
-assessment / `completed` / state-overwrite writes under lease loss, and the recovery that resolves
-partial states by `challenge_id`, are not yet a fully settled algorithm, so "a fenced worker never
-records a verdict" is design-incomplete rather than merely awaiting the
-stale-worker-insertion-after-fencing crash test.
+**Status: partially resolved** — items (2)–(7) are specified and testable directly; item (1), the
+**fenced verifier worker**, was formerly *algorithm incomplete* but is now **algorithm-settled by
+Q22**: the appraisal commit is a single atomic transaction (verifier call outside it; then lease
+re-check under row lock + assessment + state write-through + `completed` + evidence, all-or-nothing),
+which replaced the earlier "assessment → `completed` → state overwrite" ordering and its partial-state
+recovery. "A fenced worker never records a verdict" now reduces to "the worker aborts at the
+in-transaction `SELECT … FOR UPDATE` lease re-check," pending the single-transaction fault test.
 
 **Raised (seven items).** (1) §9.3c claimed a verdict and `completed` are "written in one operation"
 though challenge, assessment, state, and outbox are separate entities — and a verifier worker whose
@@ -555,11 +557,44 @@ drives `OutcomeRecordSchemaFixtureTest` (a fixture per subtype × outcome, asser
 both ways) and the Lock-compatibility confirmation (a schema that requires `credential_fingerprint`
 uniformly on `CREDENTIAL_PROVISIONED` is itself the contradiction, resolved Lock-side).
 
+## Q22. Appraisal persistence had two incompatible commit models
+
+**Status: resolved** — §9.3c and §11.3 now describe one appraisal commit protocol.
+
+**Raised.** §9.3c wrote the assessment, the `completed` challenge, and the authoritative
+`KeyAttestationState` overwrite as **separately recoverable, generation-guarded** operations, while
+§11.3's **Commit** bound the entity, the state write-through, the `IssuanceLog`, and the outbox
+transition into **one** transaction. The two models left different failure windows: under §9.3c a
+crash between the assessment write and the state overwrite could leave a **negative** assessment
+durable while issuance kept reading the **old positive** `KeyAttestationState`.
+
+**Change (§9.3c, §10.4, §11.3, appendix).** Chose one protocol — the §11.3 **Commit** model applied
+to appraisal. The slow **verifier call stays outside any transaction** (it is network I/O); then a
+**single SQL transaction in the issuer-side transaction domain** (a) re-reads and validates the
+challenge under `SELECT … FOR UPDATE`, confirming it is still `processing` under this worker's
+`leaseEpoch` (the fence, re-checked inside the transaction), (b) inserts the immutable
+`AttestationAssessment`, (c) applies the `KeyAttestationState` write-through — only for a
+`supersedesEligible` verdict whose `appraisalGeneration` is strictly newer (the §10.4 guard,
+evaluated in-transaction under `revision`), (d) transitions the challenge to `completed`, and
+(e) stages the §11.3 evidence commitment — **all-or-nothing**. A negative verdict's assessment and
+its state overwrite are now the *same* commit, so the flagged window is gone.
+
+Two cases are stated explicitly: **superseded generation** — a verdict whose generation is older at
+commit is recorded as evidence but **skips** the write-through (never regresses the row);
+**outage (`none`)** — a verifier-unreachable result is recorded as evidence, is **never** written
+through to state (neither grants nor revokes authority), keeps the challenge `processing → pending`
+for resubmission up to the retry limit, and returns `503 verifier_unavailable`. Recovery is
+resubmission: a crash before commit leaves nothing durable (lease repaired to `pending`, re-run
+under a new `leaseEpoch`); a crash after commit is a no-op re-submission (`challenge_used`). This
+also settles the algorithm that Q13's "fenced verifier worker" item had left open.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
-folded into the numbered sections of the main document (notably the §9.3c fenced verifier worker,
-the §9.5 enrollment transaction, the §9.7/§10.4 single-row state model with `revision` +
+folded into the numbered sections of the main document (notably the §9.3c appraisal single-transaction
+commit (verifier call outside the transaction, then assessment + state write-through + `completed` +
+evidence commit atomically; Q22, which unified §9.3c with §11.3 and closed the negative-verdict
+window), the §9.5 enrollment transaction, the §9.7/§10.4 single-row state model with `revision` +
 `appraisalGeneration`, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap and
 three-valued `key_binding_strength`, the §10.5/§8 JWT-SVID algorithm allowlist, the §10.6/§10.8
 delegation-expiry clamp and tenant-scoped principal binding, the §10.9 BE/BS-vs-hardware
@@ -571,5 +606,6 @@ ID-JAG, Resource AS redeems it and mints the execution pair; Q19), the §11.3 is
 transaction-boundary requirement (entity + evidence tables in one `jans-orm` SQL transaction domain,
 MySQL/PostgreSQL, Lock ingestion outside it; Q20), the §11.2 outcome schema keyed by event kind ×
 operation subtype × outcome with the field renamed `operation_outcome` (Q21, which corrected Q17's
-too-coarse "committed ⇒ fingerprint" rule), and the §16.1 key-revocation delay). This history
-preserves the original questions that drove them; for current behaviour, read the main document.
+too-coarse "committed ⇒ fingerprint" rule), the §9.3c/§11.3 unified appraisal commit (Q22), and the
+§16.1 key-revocation delay). This history preserves the original questions that drove them; for
+current behaviour, read the main document.

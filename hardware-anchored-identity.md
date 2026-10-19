@@ -1114,38 +1114,64 @@ Rules:
 - A node that crashes in `processing` leaves a lease (`attestationProcessingLeaseSeconds`, 30); the
   repair timer (same pattern as Lock's receipt repair timer) returns leased-out entries to
   `pending` with `retry_count++`.
-- **The verifier worker is fenced by its lease, and the outcome is written as recoverable
-  transitions — not "one operation."** The `pending → processing` CAS stamps the challenge with a
-  lease `{ holder, leaseEpoch, expires_at }` (`leaseEpoch` increments on every claim, as the journal
-  lease does, §11.3). The worker then does the slow work (call the verifier, verify the binding),
-  and **every** write it makes afterward — the immutable `AttestationAssessment`, the challenge's
-  `processing → completed`, and (only for a `supersedesEligible` eligible verdict) the
-  `KeyAttestationState` overwrite — is **conditioned on the challenge still carrying this worker's
-  `leaseEpoch`**. A worker whose lease expired and was repaired (the challenge went back to
-  `pending`, possibly reclaimed by another node at a higher `leaseEpoch`) therefore **cannot** write
-  any of them: its guarded writes are rejected as fenced-off, so a slow or zombie worker never
-  records a verdict for a challenge another worker has taken over. This is the same fence as the
-  journal writer (§11.3): the authoritative write checks the epoch, it is not checked after the
-  fact.
-- These are **separate entities written in order** (assessment → `completed` → optional state
-  overwrite): the assessment is immutable evidence written first, the `completed` flag closes the
-  challenge, and the state overwrite is a conditional CAS that lands only for an eligible verdict —
-  distinct writes with distinct conditions, not one blind atomic write. They are made recoverable
-  the same way the issuance path is (§11.3): each is
-  keyed and idempotent, and the challenge's state is the journal. On recovery / re-submission the
-  transitions resolve as follows, all keyed by `challenge_id`:
-  - **assessment written, `completed` not yet set** → the worker (or a resumer holding the current
-    lease) finishes: it finds the assessment by `challenge_id`, sets `completed`, and applies the
-    state overwrite if eligible. Re-doing is safe — the assessment is immutable and the state write
-    is generation-guarded (§10.4), so a replay cannot double-apply or regress.
-  - **`completed` set, state overwrite not yet applied** (eligible verdict, crash between the two)
-    → the state overwrite is redone from the assessment the `completed` challenge names; the
-    `appraisalGeneration` guard (§10.4) makes it idempotent and prevents a stale re-apply.
-  - **neither written, lease expired** → repaired to `pending`; a fresh submission re-runs under a
-    new `leaseEpoch`. The old worker is fenced out of all three writes above.
+- **The slow verifier call is outside the transaction; the verdict is committed in one atomic
+  transaction — the same commit model as §11.3.** The `pending → processing` CAS stamps the
+  challenge with a lease `{ holder, leaseEpoch, expires_at }` (`leaseEpoch` increments on every
+  claim, as the journal lease does, §11.3). The worker then does the **slow, side-effecting work
+  outside any transaction** — call the platform verifier, verify the key binding — because that is
+  network I/O that must not hold a database transaction open. *Then*, in **one SQL transaction in
+  the issuer-side transaction domain** (§11.3), it:
+  1. **re-reads and validates the challenge under a row lock** (`SELECT … FOR UPDATE` on the
+     `AttestationChallenge`), confirming the challenge is still `processing` and still carries **this
+     worker's `leaseEpoch`** — this is the fence, re-checked *inside* the transaction so a worker
+     whose lease was repaired/reclaimed aborts here and commits nothing;
+  2. **inserts the immutable `AttestationAssessment`** (carrying `challengeId`, `leaseEpoch`,
+     `appraisalGeneration`, `supersedesEligible`);
+  3. **applies the authoritative `KeyAttestationState` write-through** — but only for a
+     `supersedesEligible` verdict and only if the assessment's `appraisalGeneration g′` is strictly
+     newer than the row's current generation `g` (the §10.4 generation guard, evaluated *within* the
+     same transaction under the state row's `revision`); a non-eligible or stale verdict skips this
+     step and the row is left unchanged (it remains evidence only);
+  4. **transitions the challenge `processing → completed`**;
+  5. **stages the evidence commitment** (the appraisal's §11.3 **Commit** — the `operation_id`-keyed
+     `IssuanceLog` and the `staged → committed` outbox flip for the `CREDENTIAL_PROVISIONED`
+     appraisal record).
+
+  All five commit together or not at all. There is therefore **no window** in which a negative
+  assessment is durable while issuance still reads the old positive state: the assessment and the
+  state write-through are the *same* commit. This is deliberately the §11.3 **Commit** transition
+  applied to appraisal, not a separate "assessment → completed → state" sequence — the two sections
+  now describe one protocol.
+- **Recovery.** Because the verdict is one atomic transaction, a crash is all-or-nothing and recovery
+  is a resubmission, not a multi-step redo:
+  - **Crash before the transaction commits** (during the verifier call, or mid-transaction) → nothing
+    is durable: no assessment, no state change, no `completed`. The lease expires and the repair
+    timer returns the challenge to `pending` (`retry_count++`); a fresh submission re-runs the
+    verifier call and the transaction under a new `leaseEpoch`. The old worker, if it wakes, fails
+    the step-1 fence re-check and commits nothing.
+  - **Crash after the transaction commits** (before the HTTP response) → the verdict, the state
+    write-through, the `completed` flag, and the staged evidence are all durable; the agent simply
+    re-submits, gets `challenge_used` with a fresh challenge, and the already-staged appraisal record
+    is resolved/delivered by the §11.3 emitter. Re-running is a no-op.
   The assessment carries `challengeId` and `leaseEpoch`, so "which challenge, under which worker,
-  produced this verdict" is always answerable, and a verdict from a fenced worker is never
-  authoritative.
+  produced this verdict" is always answerable, and a verdict from a fenced worker is never durable.
+- **Superseded-generation case.** When the verifier call races another appraisal of the same key, the
+  guard in step 3 decides *inside the transaction*: the verdict with the newer `appraisalGeneration`
+  wins the state row, the older one is committed **as evidence** (immutable `AttestationAssessment`
+  with its `completed` challenge and its own staged record) but **does not** overwrite the row. So a
+  slow verifier call that finishes late can never regress the authoritative state, and both verdicts
+  remain in the evidence log with their generations (§10.4). A negative verdict that *is* the newest
+  generation overwrites the positive state in the same transaction that records it — closing the
+  failure window the reviewer flagged.
+- **Outage case (`status=none`).** If the platform verifier is unreachable or the script yields no
+  verdict, the worker produces a **`none`** verdict (§9.3). There is no authoritative state change:
+  `none` is recorded as evidence (so outages are visible in the trail) but is **never** written
+  through to `KeyAttestationState` — a standing positive state is neither overwritten nor refreshed,
+  and a standing negative state is not cleared. The transaction still commits (assessment + `none`,
+  challenge **kept** `processing → pending` with `retry_count++` rather than `completed`, up to
+  `attestationChallengeMaxRetries`, so the agent may resubmit the same evidence); the HTTP response
+  is `503 verifier_unavailable`. Beyond the retry limit the challenge `expires`. An outage therefore
+  neither grants nor revokes authority; it is logged, not acted on.
 - Expired entries are removed by the ORM TTL.
 
 ### 9.4 The interception script: `attestation`
@@ -1451,14 +1477,16 @@ authoritative row to order, so no transition ever has to update two entries atom
 | Transition | Who writes it | The CAS |
 |------------|---------------|---------|
 | **Initialize** the first state for a key | the **enrollment transaction** (`/register` or `updateClient` adding a key, §9.5), authorized by the DCR DPoP proof over `K` — **not** by the assessment's `supersedesEligible` | **Insert** `KeyAttestationState(clientId, jkt)` at `revision = 0` with `appraisalGeneration`/`status`/`appraisedAt`/`expiresAt`/`assessmentId` from the `affirming` assessment, **conditioned on absence**. If the row already exists it is a no-op success (idempotent re-enrollment). This is the only first-write, and the only state write an eligible-to-supersede appraisal is *not* required for |
-| **Overwrite** with a new authoritative verdict (section 10.4 write side) | `/attestation`, only for a `supersedesEligible == true` appraisal, **against an already-initialized row** | Read the row at `revision = r`, current generation `g`. Apply **only if the incoming appraisal's `appraisalGeneration` g′ > g** (newer evidence); write `status`/`appraisedAt`/`expiresAt`/`assessmentId`/`appraisalGeneration = g′`, reset `consumed = false`, **conditioned on `revision` still being `r`**, setting `revision = r + 1`. On a lost CAS the writer re-reads and **re-checks the generation**: if the row now holds `g′′ ≥ g′` it **drops** (does not overwrite newer evidence). So the `revision` CAS orders *writes* and the `g′ > g` guard orders *evidence* — a stale appraisal that finishes late can never overwrite a newer verdict, even by retrying |
+| **Overwrite** with a new authoritative verdict (section 10.4 write side) | `/attestation`, only for a `supersedesEligible == true` appraisal, **against an already-initialized row** — applied **inside the single appraisal transaction** (§9.3c), atomically with the assessment insert, the `completed` transition, and the evidence commitment | Read the row at `revision = r`, current generation `g`. Apply **only if the incoming appraisal's `appraisalGeneration` g′ > g** (newer evidence); write `status`/`appraisedAt`/`expiresAt`/`assessmentId`/`appraisalGeneration = g′`, reset `consumed = false`, **conditioned on `revision` still being `r`**, setting `revision = r + 1`. If the row no longer holds `revision = r` at commit (a concurrent write landed), the transaction aborts and retries from the row re-read; if the row then holds `g′′ ≥ g′` the write-through step is **skipped** (the verdict is still committed as evidence, it just does not overwrite newer evidence). So the `revision` guard orders *writes* and the `g′ > g` guard orders *evidence* — a stale appraisal that finishes late can never overwrite a newer verdict, even by retrying |
 | Claim the state for one issuance (section 10.4 read/commit side) | `/token`, when `attestationRequireFreshPerIssuance` | CAS `consumed = false → true, consumedByJti = :svidJti` **conditioned on `revision` still being the `r` the issuance evaluated**. Succeeds for exactly one concurrent `/token`; a loser (another issuance, or a rejection that bumped `revision`) gets `attestation_required`. |
 
-The CAS is a SQL `UPDATE … WHERE revision = :r`. A lost CAS means another node advanced the row
-first; the loser re-reads and re-evaluates against the new state rather than overwriting it. Because
-there is only one row per key, `revision` is a genuine total order — the earlier `(appraisedAt,
-version)` tie-break across separate assessment entries, which was **not** a total order (two entries
-could share both fields), is gone.
+The CAS is a SQL `UPDATE … WHERE revision = :r`. For an appraisal overwrite this runs **inside the
+appraisal transaction** (§9.3c), so a lost CAS aborts and retries that transaction (the verifier
+result is already in hand — only the DB body re-runs); the issuance-side consume CAS is its own
+single-row update. Either way a loser re-reads and re-evaluates against the new state rather than
+overwriting it. Because there is only one row per key, `revision` is a genuine total order — the
+earlier `(appraisedAt, version)` tie-break across separate assessment entries, which was **not** a
+total order (two entries could share both fields), is gone.
 
 **Authorization expiry vs. retention deletion are two different clocks.** An assessment / state
 stops being usable *for issuance* long before its evidence row is *deleted*, and conflating the two
@@ -3472,7 +3500,7 @@ in the cited section.
 | Delegated SVID `exp` is clamped to `≤ delegationExpiresAt`, so outstanding SVIDs expire no later than the delegation (subject to the verifier's `exp` clock tolerance), not merely stopping new issuance; expiry does not terminate an operation already admitted by a resource server | §10.6, §10.8 |
 | Principal binding for execution continuation includes `principalTenant` where the issuer scopes subjects per tenant (`(iss, sub)` is unique only within a tenant); required for tenant-scoped issuers | §10.8 |
 | `key_binding_strength` is a three-value outcome (`certified`/`measured_guest`/`none`); a failed AK binding does **not** auto-downgrade to `measured_guest` — that needs its own independent binding evidence, else the binding is `none` (`binding_unestablished`) and issuance does not proceed | §9.3a |
-| The verifier worker is fenced by its challenge lease epoch; the assessment / `completed` / state writes are separate, recoverable, epoch-guarded transitions, not "one operation" | §9.3c |
+| The verifier call runs **outside** any transaction; the verdict is then committed in **one SQL transaction** (the §11.3 **Commit** model applied to appraisal) that re-validates the challenge lease epoch under a row lock, inserts the immutable assessment, applies the generation-guarded `KeyAttestationState` write-through (eligible + newer generation only), transitions the challenge to `completed`, and stages the evidence — all-or-nothing. No window exists where a negative assessment is durable while issuance still reads the old positive state; superseded-generation and `none`-outage cases are defined explicitly | §9.3c, §10.4, §11.3 |
 | No-profile execution-id disclosure default is **omitted** (aligned with `svidDefaultClaims`); `same_domain` is the granularity once an audience opts in | §10.10 |
 | The ID-JAG is issued by the IdP AS and redeemed by a distinct Resource AS across a trust boundary (distinct `iss`/`aud`); the IdP never redeems its own ID-JAG, and a single-domain deployment with no boundary uses another delegation mechanism | §5 |
 | An ID-JAG is delegated authority, not per-execution human approval; per-operation consent, where required, is enforced by the PDP/PEP at the operation | §5, §10.8 |
