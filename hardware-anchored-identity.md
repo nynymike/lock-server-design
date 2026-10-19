@@ -2356,6 +2356,21 @@ New package `io.jans.as.server.trace`:
   How the sequence number and predecessor hash are chosen under concurrency is the append protocol
   below, not an implicit side effect of "insert".
 
+  **The chain is over durable *operation* records, and every allocated position is delivered —
+  including aborted outcomes.** A sequence number is allocated when an issuance is *attempted*
+  (stage time), before the outcome is known, so the chain Lock receives must account for every
+  attempted position or it would read a gap. This design therefore chooses the **"chain the
+  operation, with explicit aborted outcomes"** model, not the "assign the position only after the
+  outcome is known" model: once position *n* is allocated it is **always** emitted to Lock, either
+  as the committed `CREDENTIAL_PROVISIONED` (the operation succeeded) or as an explicit
+  **aborted-outcome record** at that same `sequence_number`/`prev_record_hash` (the operation never
+  committed). A position is never silently dropped. `prev_record_hash` chains over these durable
+  operation records, so an aborted position is a real, signed, delivered link — not a hole. The
+  alternative model (allocate the evidence-chain position only at the commit point) was rejected
+  because it would decouple sequence allocation from the stage-time append protocol and reintroduce
+  the concurrent-ordering problem that protocol solves; here the position is fixed early and its
+  *outcome* is filled in later.
+
 #### The outbox append protocol (how concurrent writers do not collide)
 
 Each `(producer_id, chain_id)` is **one serial chain per node**; `chain_id` is the node id, so two
@@ -2369,17 +2384,26 @@ node. The protocol makes that contention safe:
   key exists). Two threads that both compute sequence *n* cannot both commit — at most one insert
   survives.
 - **Serialized allocation with a fencing token.** A per-`(producer_id, chain_id)` **tail pointer**
-  (`jansTraceChainTail`, one entry per chain) carries `{ next_sequence, tail_record_hash, epoch }`.
-  A writer advances it with a **CAS**: read `{ next_sequence = n, tail_record_hash = h, epoch = e }`,
-  build the record with `sequence_number = n` and `prev_record_hash = h`, then CAS the tail to
-  `{ n+1, hash(record_n), e }` **conditioned on the tail still reading `(n, h, e)`**. The CAS and
-  the outbox insert are ordered: **insert the outbox entry first** (its unique index is the source
-  of truth for "position *n* is taken"), **then** CAS the tail. A writer that loses the tail CAS
-  but already inserted has still produced a valid, unique record; a writer that loses the unique
-  insert discards its record and retries at the re-read tail. `epoch` is the **fence**: an operator
-  repair (tail rebuild after corruption, forced truncation) bumps `epoch`, so a zombie thread
-  holding a stale `(n, h, e-1)` can never CAS the tail forward — its write is rejected as
-  fenced-off, not silently forked onto the chain.
+  (`jansTraceChainTail`, one entry per chain) carries `{ next_sequence, epoch }`. A writer advances
+  it with a **CAS**: read `{ next_sequence = n, epoch = e }`, build the record with
+  `sequence_number = n`, then CAS the tail to `{ n+1, e }` **conditioned on the tail still reading
+  `(n, e)`**. The CAS and the outbox insert are ordered: **insert the outbox entry first** (its
+  unique index is the source of truth for "position *n* is taken"), **then** CAS the tail. A writer
+  that loses the tail CAS but already inserted has still produced a valid, unique record; a writer
+  that loses the unique insert discards its record and retries at the re-read tail. `epoch` is the
+  **fence**: an operator repair (tail rebuild after corruption, forced truncation) bumps `epoch`, so
+  a zombie thread holding a stale `(n, e-1)` can never CAS the tail forward.
+- **The predecessor hash is bound at resolution, not at staging — so an aborted outcome does not
+  break the chain.** The tail pointer allocates only the *sequence number* eagerly; it does **not**
+  carry a `tail_record_hash`, because at stage time the content of record *n-1* (committed vs
+  aborted) may not be final, and chaining `n` over *n-1*'s not-yet-final content would be wrong if
+  *n-1* later resolves to aborted. Instead, `prev_record_hash` of record *n* is set to the
+  **`content_digest` of record *n-1* as it is finally delivered** (committed `CREDENTIAL_PROVISIONED`
+  *or* aborted-outcome record), at the point *n-1* resolves. Because the emitter delivers strictly
+  in `sequence_number` order and never posts an unresolved entry, *n* is never built-for-delivery or
+  posted before *n-1* has resolved and its digest is known; the forward link is therefore always
+  taken over the record Lock actually receives at *n-1*. The sequence number is fixed early (solving
+  concurrent ordering); the hash link is finalized late (solving outcome-dependence).
 - **Retry behavior.** On a lost CAS or a lost unique insert, the writer re-reads the tail and
   retries with the new `(n, h, e)`, bounded by a small attempt cap (default 5) and jittered backoff.
   Exhausting the cap is treated exactly like an outbox-write failure: `503 evidence_unavailable`
@@ -2389,9 +2413,11 @@ node. The protocol makes that contention safe:
   process saw the result — the retry's insert fails on the constraint and the writer adopts the
   already-inserted record rather than writing a second one.
 - **Recovery without a separate write.** If `jansTraceChainTail` is lost or stale, it is rebuilt by
-  scanning the outbox for the highest `sequence_number` on the chain and reading that entry's hash;
-  the outbox (with its unique index) remains the single source of truth, and the tail is only a
-  fast cursor. Rebuild bumps `epoch`.
+  scanning the outbox for the highest `sequence_number` on the chain and setting `next_sequence` to
+  one past it; the outbox (with its unique index) remains the single source of truth, and the tail
+  is only a fast cursor for the next number. The predecessor hash is not cached in the tail, so
+  rebuild never has to recover it — it is recomputed from the delivered content of the prior entry
+  at resolution. Rebuild bumps `epoch`.
 - `TraceEmitter`: durable outbox (`jansTraceOutbox`) + timer posting to Lock's planned
   `POST /api/v1/audit/trace` ingestion endpoint (a Lock dependency, not a current endpoint — see
   section 11.1) with a `trace.write` client-credentials token from this server; retry with backoff;
@@ -2419,15 +2445,17 @@ persisted.** Both directions matter — the first is completeness (no silent iss
 **no false success evidence** (no signed "provisioned" record for a credential that was never
 committed).
 
-To get the second direction, the signed record is **built and staged but held undelivered until the
-credential's own commit is established.** An outbox entry has three states:
+To get the second direction, the signed record is **held undelivered until the credential's own
+commit is established** — but, per the chain-model decision above, the position it occupies is
+**always** delivered, as either the success record or an explicit aborted record. An outbox entry
+has these states:
 
-| State | Meaning | Deliverable to Lock? |
-|-------|---------|----------------------|
-| `staged` | Record signed, outbox row inserted (chain position taken, append protocol above); the credential entity's commit is **not yet confirmed** — the outcome is **unresolved**, not "failed" | **No.** The emitter never posts a `staged` entry; it resolves it first |
-| `committed` | The credential entity's commit is confirmed (by atomic flip, or by probing the entity in recovery), so the record is now true | **Yes.** Eligible for the emitter |
-| `delivered` | Lock accepted it (`202` or idempotent replay) | terminal |
-| `voided` | Resolution found **positive evidence of non-commit** (no entity, no `IssuanceLog`, past the resolution-wait bound); nothing was provisioned | **No, terminal.** Retained for audit |
+| State | Meaning | Delivered to Lock at its position? |
+|-------|---------|------------------------------------|
+| `staged` | Outbox row inserted (sequence number taken, append protocol above); the credential entity's commit is **not yet confirmed** — the outcome is **unresolved**, not "failed" | **Not yet.** The emitter never posts a `staged` entry; it resolves it first |
+| `committed` | The entity commit is confirmed (by atomic flip, or by probing the entity in recovery); the position will carry the success `CREDENTIAL_PROVISIONED` | **Yes** — the success record |
+| `aborted` | Resolution found **positive evidence of non-commit** (no entity, no `IssuanceLog`, past the resolution-wait bound); nothing was provisioned, **but the sequence position was already allocated** | **Yes** — a signed **aborted-outcome record** at the same `sequence_number`/`prev_record_hash`, so the chain has no gap |
+| `delivered` | Lock accepted whichever record (success or aborted) occupies the position (`202` or idempotent replay) | terminal |
 
 The outbox entry, written **before** the credential, *is* the operation journal: its existence
 records that an issuance was attempted and names the exact entity (`jti`, `client_id`, `jkt`) whose
@@ -2440,16 +2468,18 @@ violating the invariant. A missing marker means **unresolved**, never "nothing h
 
 | Step | Order | Why |
 |------|-------|-----|
-| 1 | Build the record *as if the action succeeds* (`credential_fingerprint` is the SVID `jti`, known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later; signing early does **not** publish it |
-| 2 | Insert the outbox entry `state=staged` via the append protocol (unique position, tail CAS, fence). The entry carries the **entity locator** — `jti` / `client_id` / `jkt` / `kind` — of the credential it describes | Allocates the durable chain position **and** is the operation-journal record that an issuance was attempted. If it fails after the retry cap, the action is refused `503 evidence_unavailable` and nothing else is written |
+| 1 | Build the record *as if the action succeeds* (`credential_fingerprint` is the SVID `jti`, known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later; signing early does **not** publish it. The success record is one of the two possible contents the position may finally carry (the other is the aborted record, built at resolution) |
+| 2 | Insert the outbox entry `state=staged` via the append protocol (sequence number via tail CAS, fence). The entry carries the **entity locator** — `jti` / `client_id` / `jkt` / `kind` — of the credential it describes | Allocates the durable **sequence position** (always delivered, as success or aborted) **and** is the operation-journal record that an issuance was attempted. If it fails after the retry cap, the action is refused `503 evidence_unavailable` and nothing else is written |
 | 3 | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`). **Where the backend offers native multi-item atomicity (SQL, Couchbase), write the entity and the `staged → committed` flip in one transaction** (step 4 then coincides with this commit). On LDAP, the entity is a single durable write and step 4 is separate | The entity is the ground truth the invariant is about. Making the flip atomic with it on capable backends removes the gap entirely there |
 | 4 | **Promote the entry `staged → committed`** once the entity commit is confirmed — atomic with step 3 where possible, otherwise a CAS flip on the outbox row after the entity write returns success | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves the entry `staged` = **unresolved**, which recovery resolves by probing the entity (below), not by voiding |
 | 5 | Return the HTTP response | The client may or may not receive it; the record already says only "persisted," so a lost response changes nothing |
 | 6 | Emitter posts `committed` entries to Lock, marks `delivered` on `202` **or** on an idempotent-replay acceptance (Lock already has `record_id`) | At-least-once; Lock is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is never expected and is surfaced as an error, not treated as delivered |
 
-So a `staged` entry whose entity never committed is **never published** (no false success), and a
-`staged` entry whose entity *did* commit is **always resolved to `committed` and delivered** (no
-lost evidence) — because resolution reads the entity, not a separable marker.
+So the **success `CREDENTIAL_PROVISIONED`** is published only for a committed credential (no false
+success), a committed credential is **always** resolved and delivered (no lost evidence), and — the
+chain-integrity point — a never-committed position is delivered as an **aborted record**, not
+dropped, so Lock never sees a gap where sequence *n* was allocated (resolution reads the entity, not
+a separable marker).
 
 **Why staging rather than one transaction, and where the transaction is used.** The outbox insert
 (step 2) and the entity commit (step 3) cannot always be one atomic unit, because the Jans
@@ -2474,17 +2504,28 @@ distinguishable outcomes:
 
 | Probe result | Meaning | Action |
 |--------------|---------|--------|
-| Entity present, **or** `IssuanceLog` present | The credential committed (the entity may since have expired/been revoked, but the `IssuanceLog` proves it existed) | Promote `staged → committed` and deliver |
-| Entity absent **and** `IssuanceLog` absent **and** the entry is older than the **resolution-wait bound** (below) | The credential never committed — a crash between step 2 and a durable step 3 | Move to `voided` (retained for audit); never delivered; nothing was provisioned |
-| Entity absent **and** `IssuanceLog` absent **but** within the resolution-wait bound | **Unresolved** — the write may still be in flight, or this node is mid-recovery | Leave `staged`; retry on the next sweep. Never voided while unresolved |
+| Entity present, **or** `IssuanceLog` present | The credential committed (the entity may since have expired/been revoked, but the `IssuanceLog` proves it existed) | Promote `staged → committed`; the position carries the success record; deliver |
+| Entity absent **and** `IssuanceLog` absent **and** the entry is older than the **resolution-wait bound** (below) | The credential never committed — a crash between step 2 and a durable step 3 | Transition to `aborted`: **build and sign an aborted-outcome record at this entry's `sequence_number`**, with `prev_record_hash` chained over the delivered predecessor, and **deliver it** so position *n* is not a gap. Nothing was provisioned |
+| Entity absent **and** `IssuanceLog` absent **but** within the resolution-wait bound | **Unresolved** — the write may still be in flight, or this node is mid-recovery | Leave `staged`; retry on the next sweep. Never aborted while unresolved |
 
 The `IssuanceLog` is no longer the *decider* — the entity is — but it remains valuable precisely
 because a short-lived `TokenEntity` can be issued, persist, and then **expire or be revoked** before
 recovery runs: once the entity is gone, the `IssuanceLog` is the durable positive proof that it
-*did* commit, so "entity absent" alone never forces a void. Token **absence is never read as failed
-issuance.** The only path to `voided` is "no entity **and** no `IssuanceLog` **and** past the
-resolution-wait bound" — i.e. positive evidence of non-commit plus enough elapsed time that an
+*did* commit, so "entity absent" alone never forces an abort. Token **absence is never read as
+failed issuance.** The only path to `aborted` is "no entity **and** no `IssuanceLog` **and** past
+the resolution-wait bound" — positive evidence of non-commit plus enough elapsed time that an
 in-flight write cannot still be pending.
+
+**The aborted record, so the chain is honest about what happened.** It is a signed record at the
+allocated position whose event states the operation did not complete — a `CREDENTIAL_PROVISIONED`
+with `provisioning_outcome=aborted` (no `credential_fingerprint`, reason `not_committed`), carrying
+the same `trace_execution_id` and `parent_record_ids` the success record would have. It occupies
+sequence *n* with its `prev_record_hash` over *n-1*'s delivered digest, and *n+1* chains over the
+aborted record's digest — so Lock receives an unbroken chain in which position *n* truthfully says
+"attempted, not provisioned" rather than silently vanishing (which would show as a
+`coverage_gap`/`chain_link_failure`). This is the difference between *this* case — a staged position
+whose outcome is known *before* first delivery — and the orphan-compensation case below, which
+repairs an *already-delivered* success record found inconsistent later.
 
 One residual edge is closed by ordering and bounds rather than left silent: on LDAP (the only
 non-transactional backend), the `IssuanceLog` is written **immediately after** the entity and
@@ -2502,11 +2543,12 @@ does not exist.)
 maxExpectedDowntimeSeconds + reconciliationIntervalSeconds`, so that a marker or journal entry is
 never garbage-collected while its operation is still unresolved or while the node that could resolve
 it is down. A `staged` entry is **never** expired by TTL — only transitioned to `committed` or
-`voided` by resolution — so an unresolved operation cannot be silently dropped by the retention
-sweep. `resolutionWaitSeconds` (default a few minutes, ≥ the longest entity-write + replication
-latency) is the window in the third row above: it must exceed the time a durable entity write can
-lag its outbox entry on the slowest backend, so that "still absent after the wait" genuinely means
-"never committed," not "not yet visible."
+`aborted` by resolution, and in both cases delivered — so an unresolved operation can neither be
+silently dropped by the retention sweep nor leave a gap in the chain Lock receives.
+`resolutionWaitSeconds` (default a few minutes, ≥ the longest entity-write + replication latency) is
+the window in the third row above: it must exceed the time a durable entity write can lag its outbox
+entry on the slowest backend, so that "still absent after the wait" genuinely means "never
+committed," not "not yet visible."
 
 A genuine orphan — a `committed`/`delivered` record whose entity and `IssuanceLog` are *both* later
 found missing when one should exist (a partial write that slipped past step 4 on a non-transactional
@@ -2549,7 +2591,7 @@ later — inline is a latency optimization, never a weakening of the hold-until-
 | `traceRecordAllIssuance` | `false` | Also record non-SVID issuance |
 | `traceEmitIssuanceDecision` | `false` | Also emit a separate `AUTHORIZATION_DECISION` (real `(action, resource_type)`) alongside the `CREDENTIAL_PROVISIONED`, for deployments that want an explicit issuance-policy decision record |
 | `traceOutboxAppendMaxRetries` | 5 | Append-protocol attempts (lost tail CAS or unique-insert collision) before the write is treated as failed (11.3) |
-| `resolutionWaitSeconds` | 300 | Minimum age before an unresolved `staged` entry with no entity and no `IssuanceLog` may be `voided`; MUST exceed the slowest backend's durable entity-write + replication lag, so "still absent after the wait" means "never committed," not "not yet visible" (11.3) |
+| `resolutionWaitSeconds` | 300 | Minimum age before an unresolved `staged` entry with no entity and no `IssuanceLog` may be resolved to `aborted` (and an aborted-outcome record delivered at its position); MUST exceed the slowest backend's durable entity-write + replication lag, so "still absent after the wait" means "never committed," not "not yet visible" (11.3) |
 | `issuanceLogRetentionSeconds` | 2592000 (30 d) | How long the TTL-independent `IssuanceLog` marker is kept, independent of SVID lifetime; MUST be ≥ `resolutionWaitSeconds + maxExpectedDowntimeSeconds + reconciliationIntervalSeconds` so a marker is never collected while its operation is unresolved or its resolver is down (11.3) |
 | `maxExpectedDowntimeSeconds` | 86400 (1 d) | Planning input to the retention lower bound above — the longest outage after which a node must still be able to resolve its `staged` entries from surviving entities/markers (11.3) |
 
@@ -2732,8 +2774,8 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Attestation script accepts everything | Core verifies the `AttestationResultJWT` against the server-configured verifier profile, extracts nonce and key itself, verifies the `TPM2_Certify` chain, and caps the status at its own binding verdict (9.3b); a permissive script can only make policy looser, never name a different key or skip the nonce |
 | ID-JAG stolen | Audience- and client-bound, short-lived (existing); the SVID carries `delegation.credential_id` and the records show which agent used it |
 | Outbox full or evidence store unavailable | `JWT-SVID` issuance refused with `503 evidence_unavailable` (`fail-closed`); other traffic per `traceOutboxFullPolicy`, with a `coverage_gap` marker on the next record so the chain is visibly incomplete rather than silently short |
-| Crash between record staging and credential persistence | The outbox entry is `staged` = **unresolved**. Recovery resolves it by **probing the entity**, not by a marker's absence: if the `TokenEntity` (or `IssuanceLog`) is present the record is promoted to `committed` and **delivered** — so a credential that *did* persist before the crash never loses its evidence; if neither exists and the entry is past `resolutionWaitSeconds` it is `voided` (nothing was provisioned); if neither exists but still within the wait it stays unresolved and is retried. On SQL/Couchbase the entity write and the flip are one native transaction, so this window does not exist there (11.3) |
-| Crash **after** the credential persisted but **before** the marker/flip (the subtle case) | Resolved to `committed` and delivered, **not** voided: recovery finds the committed `TokenEntity` by the `staged` entry's locator. This is the gap a naive "absent marker ⇒ void" rule would have violated — a persisted credential with no evidence — and is why resolution reads the authoritative entity, treating a missing marker as *unresolved*, never as *nothing happened* (11.3) |
+| Crash between record staging and credential persistence | The outbox entry is `staged` = **unresolved** and already owns a sequence position. Recovery resolves it by **probing the entity**, not by a marker's absence: if the `TokenEntity` (or `IssuanceLog`) is present the record is `committed` and the success record is **delivered** at its position — so a credential that *did* persist never loses its evidence; if neither exists past `resolutionWaitSeconds` the position is resolved to `aborted` and an **aborted-outcome record is delivered at that same position**, so the chain Lock receives has no gap; if neither exists but still within the wait it stays unresolved and is retried. On SQL/Couchbase the entity write and the flip are one native transaction, so this window does not exist there (11.3) |
+| Crash **after** the credential persisted but **before** the marker/flip (the subtle case) | Resolved to `committed` and delivered, **not** aborted: recovery finds the committed `TokenEntity` by the `staged` entry's locator. This is the gap a naive "absent marker ⇒ nothing happened" rule would have violated — a persisted credential with no evidence — and is why resolution reads the authoritative entity, treating a missing marker as *unresolved*, never as *nothing happened* (11.3) |
 | SVID issued, persisted, then expired or revoked before reconciliation | **Not** flagged as a failed issuance. Token absence is not failure evidence; the TTL-independent `IssuanceLog` marker (retained `issuanceLogRetentionSeconds`) records the commit, so reconciliation sees a real past issuance that simply aged out, not an orphan (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
@@ -3041,7 +3083,8 @@ in the cited section.
 | One profile per record (`tag:jans.io,2026:trace-v1`); canonicalization/signing/digest from the shared `jans-trace-core` (or byte-identical to its vectors), no jans-local fork | §11.1, §11.3 |
 | Evidence before action: a durable local outbox commit is the accountable record (Lock delivery is async at-least-once); `JWT-SVID` issuance fails closed when evidence cannot be durably committed | §11.3 |
 | The staged outbox entry is the operation journal with a **three-valued** outcome (committed / not-committed / **unresolved**); recovery resolves by probing the authoritative entity, never by a separate marker's absence, so a crash after the entity committed cannot void its evidence. Marker/journal retention ≥ resolution-wait + downtime + reconciliation interval | §11.3 |
-| Outbox append protocol: per-node serial chain, unique `(producer_id, chain_id, sequence_number)` index, tail-pointer CAS with an `epoch` fence, bounded retry | §11.3 |
+| **Chain the operation, with explicit aborted outcomes** (not "assign the position only after the outcome is known"): every allocated sequence position is delivered — a committed one as the success record, a never-committed one as a signed aborted-outcome record at the same position — so the chain Lock receives has no gap. `prev_record_hash` is bound at resolution over the predecessor's delivered digest; delivery is strictly in sequence order | §11.3 |
+| Outbox append protocol: per-node serial chain, unique `(producer_id, chain_id, sequence_number)` index, tail-pointer CAS (sequence + `epoch` only, no cached hash) with an `epoch` fence, bounded retry | §11.3 |
 | Availability posture is per-capability-risk tier, fail-closed by default (untiered = `critical`); degraded issuance is recorded as degraded | §16.9 |
 | Trust domain is pinned on first start and never re-derived | §8 |
 | Update-token script may add but not remove the SVID's identity, binding, and correlation claims | §10.5 |
@@ -3147,7 +3190,8 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **Settlement / Evidence Packet / lineage checkpoint** | Lock-side assurance layers (Phase 2/4), referenced for phase scoping (§11.1). |
 | **`jans-trace-core`** | The shared Rust library for canonicalization / Ed25519 signing / digest, with normative cross-language vectors (§11.3). |
 | **Outbox append protocol** | How a record's chain position is chosen under concurrency: a unique index on `(producer_id, chain_id, sequence_number)`, a per-chain tail pointer advanced by CAS, an `epoch` fence against stale writers, and bounded retry (§11.3). |
-| **Record states `staged` / `committed` / `delivered` / `voided`** | The outbox lifecycle: signed but held, commit-confirmed and deliverable, accepted by Lock, or discarded because its credential never committed. A `staged` entry is never delivered (§11.3). |
+| **Record states `staged` / `committed` / `aborted` / `delivered`** | The outbox lifecycle: `staged` = position allocated, outcome unresolved, not yet posted; `committed` = entity confirmed, success record will be delivered; `aborted` = positive evidence of non-commit, an aborted-outcome record is delivered **at the same sequence position** so the chain has no gap; `delivered` = Lock accepted whichever record occupies the position. Every allocated position is delivered (§11.3). |
+| **Aborted-outcome record** | A signed `CREDENTIAL_PROVISIONED` with `provisioning_outcome=aborted` (reason `not_committed`, no `credential_fingerprint`) delivered at an allocated sequence position whose operation never committed, so the hash chain Lock receives is gapless (§11.3). |
 | **`IssuanceLog`** | A TTL-independent marker (keyed by `record_id`) proving a credential was committed; it outlives the SVID so **token absence is never read as failed issuance** (§11.3). |
 | **Persisted vs. delivered** | "Credential persisted" (committed by the issuer, what a record attests) vs. "response received by the client" (unobservable by the server, never asserted) (§11.3). |
 | **Operation binding** | `request_digest` / `input_digest` / `tool_call_digest` / `result_digest` + proof-of-possession binding — the Phase-3 same-operation proof (§3; `design.md`). |

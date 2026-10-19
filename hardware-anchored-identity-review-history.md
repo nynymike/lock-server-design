@@ -125,9 +125,10 @@ exhaustion.
 
 - **Append protocol.** Each `(producer_id, chain_id)` is one serial chain per node; a unique index
   on `(producer_id, chain_id, sequence_number)` makes a position un-double-writable; a per-chain
-  tail pointer carrying `{ next_sequence, tail_record_hash, epoch }` is advanced by CAS with the
-  outbox unique-insert as the authority; `epoch` fences a stale thread after an operator repair;
-  lost-CAS / lost-insert retry up to `traceOutboxAppendMaxRetries`.
+  tail pointer carrying `{ next_sequence, epoch }` is advanced by CAS with the outbox unique-insert
+  as the authority; `epoch` fences a stale thread after an operator repair; lost-CAS / lost-insert
+  retry up to `traceOutboxAppendMaxRetries`. (A later round removed the cached `tail_record_hash`;
+  see the gapless-chain note below.)
 - **Hold delivery until commit.** The signed record is `staged`, not published, until the
   credential's entity write is confirmed committed (a `staged → committed` CAS flip), closing the
   false-success-evidence hole. "Persisted credential" and "response received by the client" are
@@ -140,6 +141,14 @@ exhaustion.
   and the commit flip in one native transaction on SQL/Couchbase. A missing marker means
   *unresolved* (retry), never *nothing happened*; retention covers unresolved operations and
   downtime.
+- **Gapless chain: aborted positions are delivered, not dropped.** A further round noted that a
+  sequence number is allocated at stage time, so a never-committed position that was simply voided
+  would leave a hole in the chain Lock receives. The design now chooses the **"chain the operation
+  with explicit aborted outcomes"** model: every allocated position is delivered — a committed one
+  as the success record, a never-committed one as a signed aborted-outcome record at the same
+  position. `prev_record_hash` is bound at resolution over the predecessor's *delivered* digest
+  (not at stage time, since the predecessor's final content is not yet known), and delivery is
+  strictly in sequence order. The tail pointer therefore no longer caches a record hash (§11.3).
 
 Delivery to Lock is at-least-once (idempotent on `record_id`; a content-mismatch `409` is an error,
 never treated as delivered).
