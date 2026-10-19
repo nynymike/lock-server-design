@@ -2535,7 +2535,12 @@ New package `io.jans.as.server.trace`:
 
 - `TraceRecordBuilder`: envelope, RFC 8785 canonicalisation, Ed25519 signature, and
   `content_digest` — all produced by the **shared `jans-trace-core`** library, not a jans-local
-  reimplementation. Canonicalization/signing/digest are exactly the deterministic operations that
+  reimplementation. **The builder finalizes and signs a record exactly once, at resolution** —
+  after the record's `sequence_number`, `prev_record_hash`, and `provisioning_outcome` are all
+  known — never at intake. The signature therefore covers the complete record including its chain
+  position and predecessor link; there is no earlier "partial" signature over a record missing those
+  fields (the intake content it starts from is **unsigned**, §11.3). Signing is deterministic, so
+  the canonical signed bytes are persisted once and reused unchanged on every delivery retry. Canonicalization/signing/digest are exactly the deterministic operations that
   crate owns (`jans-trace-core-mvp-design.md`), and the production path uses it directly (via its
   Java/JNI binding) or, if native packaging is unacceptable for a deployment, a Java implementation
   that **passes `jans-trace-core`'s normative cross-language test vectors byte-for-byte** — the same
@@ -2568,13 +2573,13 @@ New package `io.jans.as.server.trace`:
   operation, with explicit aborted outcomes"** model, not the "assign the position only after the
   outcome is known" model: once position *n* is allocated it is **always** emitted to Lock, either
   as the committed `CREDENTIAL_PROVISIONED` (the operation succeeded) or as an explicit
-  **aborted-outcome record** at that same `sequence_number`/`prev_record_hash` (the operation never
-  committed). A position is never silently dropped. `prev_record_hash` chains over these durable
-  operation records, so an aborted position is a real, signed, delivered link — not a hole. The
-  alternative model (allocate the evidence-chain position only at the commit point) was rejected
-  because it would decouple sequence allocation from the stage-time append protocol and reintroduce
-  the concurrent-ordering problem that protocol solves; here the position is fixed early and its
-  *outcome* is filled in later.
+  **aborted-outcome record** at that same `sequence_number` (the operation never committed). A
+  position is never silently dropped. Each delivered record is built and signed once at resolution
+  (below), so `prev_record_hash` chains over real, signed, delivered records and an aborted position
+  is a genuine link, not a hole. The position is **assigned** early (fixing chain order under
+  concurrency), but the record is **finalized and signed** late, once its outcome and predecessor
+  are known; so sequence allocation stays on the append protocol while the signature still covers
+  the complete record.
 
 #### The outbox append protocol: a per-chain single-writer journal
 
@@ -2593,9 +2598,11 @@ do not touch the chain; they record their intent and hand it to the journal writ
 - **Operation identity and ownership.** Every issuance allocates an `operation_id` (a fresh UUID,
   distinct from the record's eventual `record_id`) at step 1 and writes a durable **intake row**
   (`jansTraceIntake`, keyed by `operation_id`, carrying the entity locator, the producer role, and
-  the as-if-success record content) **before** anything touches the chain. The intake row is
-  *unordered* — it has no sequence number — so two concurrent issuances never contend for a chain
-  position; they only insert their own `operation_id`-keyed row, which cannot collide. Ownership is
+  the **unsigned** event content the record will assert — *not* a signed record, and with no
+  `sequence_number`, `prev_record_hash`, or final outcome yet) **before** anything touches the
+  chain. The intake row is *unordered* — it has no sequence number — so two concurrent issuances
+  never contend for a chain position; they only insert their own `operation_id`-keyed row, which
+  cannot collide. Ownership is
   explicit: a chain entry records the `operation_id` it was created for, so "is there a position for
   my operation?" is answered by an `operation_id` lookup, never by inspecting or adopting a record
   some other thread wrote.
@@ -2618,13 +2625,27 @@ do not touch the chain; they record their intent and hand it to the journal writ
   `(producer_id, chain_id, sequence_number)` remains as a backstop invariant, but it is never the
   primary contention mechanism; a healthy chain never relies on it to reject a duplicate, because
   the single writer never produces one.
-- **The predecessor hash is bound at resolution, not at staging.** The writer assigns
-  `sequence_number` eagerly but leaves `prev_record_hash` to be set when position *n-1* resolves,
-  over the **`content_digest` of record *n-1* as finally delivered** (committed `CREDENTIAL_PROVISIONED`
-  or aborted-outcome record). Because delivery is strictly in `sequence_number` order and no
-  unresolved entry is posted, *n* is never built-for-delivery before *n-1*'s digest is known; the
-  forward link is always over the record Lock actually receives. (Sequence fixed early solves
-  ordering; hash finalized late solves outcome-dependence, § model above.)
+- **The record is finalized and signed once, at resolution — predecessor and outcome included.**
+  The writer assigns `sequence_number` eagerly (so chain order is fixed early), but the record is
+  **not built or signed** until its outcome resolves and its predecessor's delivered digest is
+  known. At that point the builder assembles the complete record — the resolved event
+  (`provisioning_outcome` = success / aborted / indeterminate), `sequence_number`, and
+  `prev_record_hash` over the **`content_digest` of record *n-1* as finally delivered** — signs it
+  **once**, and **persists the exact canonical signed bytes on the outbox entry**. Delivery sends
+  those stored bytes verbatim, and every at-least-once retry re-sends the identical bytes (so Lock's
+  `record_id`/content idempotency holds and a retry never produces a second signature). Because
+  delivery is strictly in `sequence_number` order and no unresolved entry is posted, *n* is never
+  finalized before *n-1*'s digest is known. The signature thus covers position and linkage with no
+  qualification — there is nothing signed before those fields exist.
+- **Optional signed intent (not the record's signature).** A deployment that wants a producer-signed
+  artifact *at attempt time* — e.g. to prove "this issuer intended to provision credential `jti`
+  under `operation_id`" before the outcome is known — MAY carry a separate **signed intent object**
+  on the intake row (`intent`: a small signed statement over `operation_id` + entity locator +
+  timestamp, with its own type, never an `eat_profile` TRACE record). It is explicitly **not** the
+  record's signature and never stands in for it: the delivered chain record is always the step-7
+  signature over the complete record. v1 does not emit an intent object; the hook exists so an early
+  signature, if ever needed, is a distinct object with distinct semantics rather than a premature
+  signature over an incomplete record.
 - **Lease loss / failover.** If the writer's node dies or its lease expires, another node's journal
   writer acquires the lease (bumping `epoch`) and resumes draining the same durable `jansTraceIntake`
   — so the chain has a writer again without any shared-position race, because the old holder's stale
@@ -2694,13 +2715,14 @@ outcome means **unresolved**, never "nothing happened."
 
 | Step | Who | Order | Why |
 |------|-----|-------|-----|
-| 1 | issuance thread | Allocate `operation_id`; build the record *as if the action succeeds* (`credential_fingerprint` is the SVID `jti`, known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later; signing early does **not** publish it. The success record is one of the two possible contents the position may finally carry (the other is the aborted record, built at resolution) |
-| 2 | issuance thread | Write the **intake row** `jansTraceIntake` keyed by `operation_id`, carrying the entity locator (`jti`/`client_id`/`jkt`/`kind`), producer role, and the signed success content | Records that an issuance was attempted, **without** touching the chain — so no two issuances contend for a position. If this write fails the action is refused `503 evidence_unavailable` and nothing else is written |
+| 1 | issuance thread | Allocate `operation_id`; assemble the **unsigned** event content the record will assert (`credential_fingerprint` = the SVID `jti`, known because `tokenReferenceId` is generated before persistence). **Nothing is signed here** | The content is not yet a complete record — it has no `sequence_number`, `prev_record_hash`, or final outcome. Signing is deferred to step 7, when those exist |
+| 2 | issuance thread | Write the **intake row** `jansTraceIntake` keyed by `operation_id`, carrying the entity locator (`jti`/`client_id`/`jkt`/`kind`), producer role, and the unsigned content | Records that an issuance was attempted, **without** touching the chain — so no two issuances contend for a position. If this write fails the action is refused `503 evidence_unavailable` and nothing else is written |
 | 3 | journal writer | Under its fenced lease, drain the intake row: assign the next `sequence_number` and insert the outbox entry `state=staged` with the guarded (epoch-checked) write; stamp its `operation_id` | The single writer assigns positions serially, so uniqueness is structural; the fence is enforced *in* this insert, so a stale writer never creates an authoritative row |
-| 4 | issuance thread | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`), **carrying the issuance fact (`record_id` + `operation_id`) as a field of the entity itself, written in the same single-entity write** — not as a separate marker. The write also carries the issuance thread's `fenceToken` (below). **Where the backend offers native multi-item atomicity (SQL, Couchbase), also write the durable `IssuanceLog` and the `staged → committed` flip in the same transaction.** On LDAP the entity (with its embedded fact) is one durable write, and `IssuanceLog` + the flip follow | The issuance fact lives **inside** the entity, so "entity present ⇒ its issuance fact present" is a single atomic truth with no second write to miss. The entity is the ground truth the invariant is about |
-| 5 | journal writer / resolver | **Promote the entry `staged → committed`** once the entity commit is confirmed — atomic with step 4 where possible, otherwise a flip after the entity write returns success. The flip records the writer's `fenceToken` | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves the entry `staged` = **unresolved**, resolved below, never dropped. The `fenceToken` is what lets resolution later *cancel* a paused writer rather than race it |
-| 6 | issuance thread | Return the HTTP response | The client may or may not receive it; the record already says only "persisted," so a lost response changes nothing |
-| 7 | emitter | Post `committed`/`aborted` positions to Lock in sequence order, mark `delivered` on `202` **or** idempotent-replay acceptance | At-least-once; Lock is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is surfaced as an error, not treated as delivered |
+| 4 | issuance thread | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`), **carrying the issuance fact (`record_id` + `operation_id`) as a field of the entity itself, written in the same single-entity write** — not as a separate marker. The write also carries the issuance thread's `fenceToken`. **Where the backend offers native multi-item atomicity (SQL, Couchbase), also write the durable `IssuanceLog` and the `staged → committed` flip in the same transaction.** On LDAP the entity (with its embedded fact) is one durable write, and `IssuanceLog` + the flip follow | The issuance fact lives **inside** the entity, so "entity present ⇒ its issuance fact present" is a single atomic truth with no second write to miss. The entity is the ground truth the invariant is about |
+| 5 | journal writer / resolver | **Resolve the outcome** `staged → committed` (entity commit confirmed, atomic with step 4 where possible) / `aborted` / `indeterminate`, recording the writer's `fenceToken` | The outcome, not the content, is what resolution decides. A crash before this leaves the entry `staged` = **unresolved**, resolved below, never dropped. The `fenceToken` lets resolution *cancel* a paused writer rather than race it |
+| 6 | issuance thread | Return the HTTP response | The client may or may not receive it; the record will say only "persisted," so a lost response changes nothing |
+| 7 | journal writer | **Finalize and sign the complete record, once per position:** combine the resolved outcome, the `sequence_number`, and `prev_record_hash` over position *n-1*'s delivered digest; sign with the role key; **persist the exact canonical signed bytes on the outbox entry** | This is the only signature. It covers position, linkage, and outcome because all three now exist. The stored bytes are the authoritative record |
+| 8 | emitter | Post the stored signed bytes for `committed` / `aborted` / `indeterminate` positions to Lock in sequence order; mark `delivered` on `202` **or** idempotent-replay acceptance; **retries re-send the identical stored bytes** | At-least-once; Lock is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is surfaced as an error — it cannot arise from a retry, since retries send byte-identical content |
 
 So the **success `CREDENTIAL_PROVISIONED`** is published only for a committed credential (no false
 success), a committed credential is **always** resolved and delivered (no lost evidence), and — the

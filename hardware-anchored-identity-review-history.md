@@ -23,6 +23,7 @@ its guarantee as proven until its tests pass on every backend.
 | Q11 — evidence precedence / plural in-flight | stale positive never restores approval; bounded in-flight exposure | delayed-positive-after-rejection; plural-in-flight |
 | Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
 | Q13 — fenced verifier worker | a fenced worker never records a verdict | stale-worker insertion after fencing |
+| Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -290,6 +291,25 @@ delegation expiry revokes access, not merely new issuance. (7) §10.10: chose **
 no-profile execution-disclosure default (aligned with `svidDefaultClaims`), with `same_domain` the
 granularity once an audience opts in; aligned table, config, and tests.
 
+## Q14. Signing happened before the record was complete
+
+**Status: partially resolved** — algorithm specified (§11.3); guarantee pending the
+sign-once-at-resolution and byte-identical-retry tests.
+
+**Raised.** Step 1 signed the success record, but `sequence_number`, `prev_record_hash`, and the
+final outcome were assigned later. If those fields are signature-covered the early signature cannot
+authenticate the final record; if they are excluded, the chain-position/linkage protection is
+unqualified-but-false.
+
+**Change (§11.3).** The intake row is now explicitly **unsigned** event content (no sequence, hash,
+or outcome). The complete TRACE record is **finalized and signed once, at resolution** (new step 7),
+after its `sequence_number`, `prev_record_hash`, and `provisioning_outcome` are known, so the single
+signature covers position, linkage, and outcome with no qualification. The canonical signed bytes
+are persisted on the outbox entry before delivery and re-sent **byte-identically** on every retry
+(so a `409` content-mismatch cannot arise from a retry). An optional **signed intent object** is
+defined as a separate, distinctly-typed artifact for deployments that want an attempt-time
+signature — never the record's signature, and not emitted in v1.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -298,5 +318,6 @@ the §9.5 enrollment transaction, the §9.7/§10.4 single-row state model with `
 `appraisalGeneration`, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap and
 three-valued `key_binding_strength`, the §10.5/§8 JWT-SVID algorithm allowlist, the §10.6/§10.8
 delegation-expiry clamp and tenant-scoped principal binding, the §10.9 BE/BS-vs-hardware
-distinction, the §10.10 token-privacy scope, and the §16.1 key-revocation delay). This history
-preserves the original questions that drove them; for current behaviour, read the main document.
+distinction, the §10.10 token-privacy scope, the §11.3 sign-once-at-resolution rule, and the §16.1
+key-revocation delay). This history preserves the original questions that drove them; for current
+behaviour, read the main document.
