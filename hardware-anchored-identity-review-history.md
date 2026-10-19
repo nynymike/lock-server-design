@@ -6,27 +6,41 @@ produced. It is a history, not a specification: the authoritative behaviour is i
 document's numbered sections, which these entries point to. Keep new review rounds here so the main
 document stays a clean specification rather than a running changelog.
 
-**Status legend.** Each item is **resolved** (the algorithm is specified *and* its guarantee is
-established by a passing test); **partially resolved** (the algorithm is specified and the failure
-behaviour is defined, but the guarantee depends on crash-point / concurrency fault tests that are
-not yet written or passing — design-complete, not verification-complete); or **algorithm
-incomplete** (the design does not yet fully pin the behaviour — e.g. the fencing / crash-recovery
-ordering is still being specified, so a test cannot yet be written against a settled algorithm).
-An **algorithm-incomplete** item is a stronger caveat than *partially resolved*: it is **not**
-design-complete, and its guarantee must not be treated as proven or even as test-ready. See
-"Crash-point and concurrency fault tests" in the implementation appendix. Do not treat any
-non-**resolved** guarantee as proven.
+**Status legend.** An item's status is tracked on **three independent axes**, because "the design
+is decided" is not the same claim as "a test proves it" or "an external system accepts it":
+
+- **Design decided (D)** — the design settles the behaviour. For an editorial, scope, or
+  structural decision (e.g. "SQL is the only backend," "the ID-JAG is redeemed by the Resource AS,"
+  the field rename) this is the *whole* claim: there is no runtime guarantee a test could add.
+- **Implementation verified (V)** — for an item that asserts a *runtime* guarantee (atomicity,
+  ordering, crash recovery, idempotency), a **named test passes**. An item can be D-but-not-V:
+  design-complete, verification-pending.
+- **External compatibility confirmed (X)** — where the item depends on another system accepting a
+  wire change (Lock's per-kind schema), that acceptance is **confirmed against the real system**.
+  Applies only to items with such a dependency.
+
+A plain **resolved** means every axis that applies to the item is met: a scope decision is resolved
+at **D** alone (no V/X apply); a runtime-guarantee item is resolved only at **D + V** (plus **X**
+where it has an external dependency). The weaker states name the missing axis:
+
+- **design decided, tests pending** — D met, V not yet (the former "partially resolved"). Do not
+  treat the runtime guarantee as proven.
+- **algorithm incomplete** — **D not yet met**: the behaviour is not fully pinned, so a test cannot
+  even be written against a settled algorithm. A stronger caveat than tests-pending.
+
+See "Crash-point and concurrency fault tests" in the implementation appendix for the V-axis tests.
+Do not treat a runtime guarantee as proven until its V (and any X) is met.
 
 **Items currently algorithm-incomplete** (behaviour not yet fully pinned, not merely untested):
 
 | Item | What is still open |
 |------|--------------------|
 | Q8 — staged-commit evidence durability (fencing + recovery) | the fence-then-resolve ordering, the paused-writer cancellation interaction with **Commit**, and the recovery drain across **Intake → Stage → Commit → Resolve-abort** are specified as a transition table (§11.3) but the cancellation/fence protocol and its recovery edges are still being nailed down; the guarantee is not yet reducible to a settled algorithm a test can pin |
-| ~~Q13 — fenced verifier worker~~ | **Resolved by Q22** (algorithm now settled): the appraisal commit is a single atomic transaction (verifier call outside it; then lease re-check under row lock + assessment + state write-through + `completed` + evidence, all-or-nothing), so there are no "partial states" to order or recover. Now **partially resolved** (algorithm complete, pending the single-transaction fault test) rather than algorithm-incomplete |
+| ~~Q13 — fenced verifier worker~~ | **Resolved by Q22** (algorithm now settled): the appraisal commit is a single atomic transaction (verifier call outside it; then lease re-check under row lock + assessment + state write-through + `completed` + evidence, all-or-nothing), so there are no "partial states" to order or recover. Now **design decided, tests pending** (D met, V pending the single-transaction fault test) rather than algorithm-incomplete |
 
-**Items currently partially resolved** (algorithm specified, tests pending):
+**Items currently design decided, tests pending** (D met; V — a named test — not yet):
 
-| Item | Guarantee awaiting test | Tests |
+| Item | Runtime guarantee awaiting its V-axis test | Tests |
 |------|-------------------------|-------|
 | Q3 — single-row attestation state | a rejection is authoritative; no issuance resurrects an overwritten approval | delayed-positive-after-rejection; crash-point on the state write |
 | Q10 — enrollment transaction | first-enrollment state initialization; idempotent redo | first-enrollment init; crash between `KeyEnrollment` and state init |
@@ -40,8 +54,10 @@ non-**resolved** guarantee as proven.
 | Q15 / Q23 — key-replacement wire format | the key change is an RFC 7592 `PUT`; old-key auth, new-key possession, and the signed mutation occupy distinct, defined locations | `RegisterValidatorTest` (`htm=PUT` accepted, `POST` rejected; `attested_key_pop` body member; `change_digest` on both proofs matches the body, mismatch → `key_change_not_signed`) |
 | Q15 / Q24 — enrollment HTTP-retry idempotency | a lost-response retry keyed by client-held `(attestation_id, K)` replays the committed enrollment; a different client or wrong key is refused | enrollment HTTP-retry idempotency (lost-response replay without the internal `operationId`; `attestation_id` + proof-key == `claimedJkt` binding; crash-before-commit re-runs fresh) |
 
-These become **resolved** when the named tests pass. The entries below describe the raised question
-and the change; the status marker on each says whether verification is complete.
+These reach **resolved** when their V-axis test passes (and any X-axis confirmation lands). The
+entries below describe the raised question and the change; each entry's status line names the axes
+met and still outstanding. Items that are pure design/scope decisions (e.g. Q18–Q24) are **resolved
+at D** with no V/X to add.
 
 ## Q1. Key named in evidence ≠ hardware-protected key
 
@@ -79,7 +95,7 @@ paths.
 
 ## Q3. `latestAffirming()` can ignore a newer rejection
 
-**Status: partially resolved** — algorithm specified (§9.7/§10.4); guarantee pending the
+**Status: design decided, tests pending** — D: algorithm specified (§9.7/§10.4); V pending the
 delayed-positive-after-rejection and state-write crash-point tests.
 
 **Raised.** An agent could receive `contraindicated` and keep obtaining tokens with an earlier,
@@ -163,7 +179,7 @@ yet a fully settled algorithm: the cancel-then-resolve ordering, the paused-writ
 interaction with **Commit**, and the recovery drain across **Intake → Stage → Commit → Resolve-abort**
 still need to be pinned before a test can assert the guarantee. Treat the durability guarantee as
 design-incomplete, not merely untested. (The narrower gapless-chain-under-abort claim is tracked
-separately as partially resolved.)
+separately as design decided, tests pending.)
 
 **Raised.** Updating chain state and the outbox together prevents some chain failures but does not
 ensure every successful issuance has an evidence record unless issuance and evidence persistence
@@ -226,8 +242,8 @@ EAT shape it would take.
 
 ## Q10. Enrollment had no complete transition into authoritative state
 
-**Status: partially resolved** — enrollment transaction specified (§9.5), including the atomic
-`attestation_id` claim that enforces one-assessment-one-client (Q15); guarantee pending the
+**Status: design decided, tests pending** — D: enrollment transaction specified (§9.5), including
+the atomic `attestation_id` claim that enforces one-assessment-one-client (Q15); V pending the
 first-enrollment-init, concurrent-enrollment, and enrollment crash-point tests.
 
 **Raised.** A pre-enrollment attestation has no `client_id` and requires no DPoP, so it is
@@ -251,9 +267,9 @@ replacement key reuses the same transaction (Q15).
 
 ## Q11. Attestation ordering needs rules beyond CAS
 
-**Status: partially resolved** — `appraisalGeneration` precedence and the plural-in-flight exposure
-specified (§9.3/§10.4); guarantee pending the delayed-positive-after-rejection and plural-in-flight
-tests.
+**Status: design decided, tests pending** — D: `appraisalGeneration` precedence and the
+plural-in-flight exposure specified (§9.3/§10.4); V pending the delayed-positive-after-rejection and
+plural-in-flight tests.
 
 **Raised.** A monotonic `revision` orders *writes* but not which *evidence* should win: an older
 positive appraisal can finish slowly, lose a CAS to a newer rejection, retry, and overwrite that
@@ -290,9 +306,9 @@ agent," just not which human or the delegation credential.
 
 ## Q13. A batch of precision fixes across attestation, delegation, privacy, and signing
 
-**Status: partially resolved** — items (2)–(7) are specified and testable directly; item (1), the
-**fenced verifier worker**, was formerly *algorithm incomplete* but is now **algorithm-settled by
-Q22**: the appraisal commit is a single atomic transaction (verifier call outside it; then lease
+**Status: design decided, tests pending** — items (2)–(7) are specified and testable directly; item
+(1), the **fenced verifier worker**, was formerly *algorithm incomplete* but its D is now **settled
+by Q22**: the appraisal commit is a single atomic transaction (verifier call outside it; then lease
 re-check under row lock + assessment + state write-through + `completed` + evidence, all-or-nothing),
 which replaced the earlier "assessment → `completed` → state overwrite" ordering and its partial-state
 recovery. "A fenced worker never records a verdict" now reduces to "the worker aborts at the
@@ -324,8 +340,8 @@ granularity once an audience opts in; aligned table, config, and tests.
 
 ## Q14. Signing happened before the record was complete
 
-**Status: partially resolved** — algorithm specified (§11.3); guarantee pending the
-sign-once-at-resolution and byte-identical-retry tests.
+**Status: design decided, tests pending** — D: algorithm specified (§11.3; refined by Q25); V
+pending the sign-once-at-resolution and freeze-input/install-once tests.
 
 **Raised.** Step 1 signed the success record, but `sequence_number`, `prev_record_hash`, and the
 final outcome were assigned later. If those fields are signature-covered the early signature cannot
@@ -350,8 +366,9 @@ signature — never the record's signature, and not emitted in v1.
 
 ## Q15. "One assessment enrolls one client" had no atomic mechanism; key replacement under-specified
 
-**Status: partially resolved** — atomic claim and the two replacement proofs specified (§9.5);
-guarantee pending the concurrent-same-`attestation_id` enrollment and enrollment crash-point tests.
+**Status: design decided, tests pending** — D: atomic claim and (via Q23) the key-replacement wire
+format specified (§9.5); V pending the concurrent-same-`attestation_id` enrollment and enrollment
+crash-point tests.
 
 **Raised.** The enrollment transaction asserted that a second enrollment naming the same
 `attestation_id` for a different `client_id` is refused, but the `KeyEnrollment` binding was keyed
@@ -391,8 +408,8 @@ key (`htm=POST`/`htu`/`iat`/`jti`, `jwk` thumbprint = `attested_jkt`, carried as
 
 ## Q16. Recovery conflated "an entity exists" with "this operation committed"
 
-**Status: partially resolved** — operation-receipt rule specified (§11.3); guarantee pending the
-operation-receipt-discrimination and crash-point tests.
+**Status: design decided, tests pending** — D: operation-receipt rule specified (§11.3); V pending
+the operation-receipt-discrimination and crash-point tests.
 
 **Raised.** Recovery resolved a `staged` entry by probing the authoritative entity by its locator
 identifiers (`jti`/`client_id`/`jkt`) and treating existence as proof of commit. But finding a
@@ -416,9 +433,9 @@ not identifier existence.
 
 ## Q17. Aborted/indeterminate outcomes were not a complete wire contract
 
-**Status: partially resolved** — the outcome wire contract and per-producer rule are specified
-(§11.2/§11.3); guarantee pending the per-(kind × outcome) schema-fixture tests and confirmation
-against Lock's actual schema.
+**Status: design decided, tests pending (+ X pending)** — D: the outcome wire contract and
+per-producer rule are specified (§11.2/§11.3, matrix form via Q21); V pending the
+per-(kind × outcome) schema-fixture tests; **X** pending confirmation against Lock's actual schema.
 
 **Raised.** The design introduced a `CREDENTIAL_PROVISIONED` with `provisioning_outcome=aborted` and
 no `credential_fingerprint`, but the implementation appendix still said no event-format changes were
@@ -451,8 +468,8 @@ with Lock's conformance suite.
 
 ## Q18. SQL is the only persistence backend (Ledger drops LDAP and Couchbase)
 
-**Status: resolved** — the design targets SQL only; the backend-portability caveats and the
-LDAP-only `indeterminate` outcome are removed.
+**Status: resolved (D)** — a scope decision: the design targets SQL only; the backend-portability
+caveats and the LDAP-only `indeterminate` outcome are removed. No V/X axis applies.
 
 **Raised.** Ledger will not support LDAP or Couchbase; the only backend needed is SQL. Earlier
 rounds had carried portability caveats because the Jans `PersistenceEntryManager` abstraction
@@ -488,8 +505,8 @@ establishes the issuer-side `Commit` atomicity: the entity + `IssuanceLog` + out
 
 ## Q19. The ID-JAG two-server correction had not propagated through all documents
 
-**Status: resolved** — every passage now reflects the two-AS model and the artifacts each server
-actually holds.
+**Status: resolved (D)** — an editorial/consistency decision: every passage now reflects the two-AS
+model and the artifacts each server actually holds. No V/X axis applies.
 
 **Raised.** The revised §5 diagram correctly shows the **Resource AS (jans)** opening the execution
 when it **redeems** the ID-JAG, while the ID-JAG is **issued** by a separate **IdP AS** across a
@@ -526,8 +543,10 @@ aligned every passage to it:
 
 ## Q20. The one-transaction `Commit` needs an explicit issuer-side transaction boundary
 
-**Status: resolved** — §11.3 states the requirement, names the database and transaction API, and
-answers the deployment question; §9.5 and the appendix are aligned.
+**Status: resolved (D)** — a requirement/deployment-scope decision: §11.3 states the issuer-side
+transaction-boundary requirement, names the database and transaction API, and answers the deployment
+question; §9.5 and the appendix are aligned. (The atomicity it requires is exercised by the V-axis
+tests of Q20's dependents — Q10, Q13/Q22 — not a separate test here.)
 
 **Raised.** The protocol depends on the issuer's entity (`TokenEntity` / `Client`+`KeyEnrollment` /
 `AttestationAssessment`+`KeyAttestationState`), the `IssuanceLog`, and the outbox state committing in
@@ -552,8 +571,9 @@ transaction and the appendix schema/fault-test rows now reference this boundary.
 
 ## Q21. The outcome schema contradicted the success event definitions
 
-**Status: resolved** — the required identifying artifact is now defined by event kind × operation
-subtype × outcome (§11.2 matrix); the field is renamed `operation_outcome`.
+**Status: resolved (D)** — a schema-design/rename decision: the required identifying artifact is now
+defined by event kind × operation subtype × outcome (§11.2 matrix) and the field is renamed
+`operation_outcome`. Its V (schema fixtures) and X (Lock schema) are tracked under Q17/Q21.
 
 **Raised.** Q17's invariant required `credential_fingerprint` on *every* `committed` record, but two
 success shapes already defined in §11.2 have no credential fingerprint: a **bare-key appraisal**
@@ -583,7 +603,9 @@ uniformly on `CREDENTIAL_PROVISIONED` is itself the contradiction, resolved Lock
 
 ## Q22. Appraisal persistence had two incompatible commit models
 
-**Status: resolved** — §9.3c and §11.3 now describe one appraisal commit protocol.
+**Status: design decided, tests pending** — D: §9.3c and §11.3 now describe one appraisal commit
+protocol (the two-models inconsistency is resolved at the design level); V pending the
+single-transaction fault test (tracked as Q13/Q22).
 
 **Raised.** §9.3c wrote the assessment, the `completed` challenge, and the authoritative
 `KeyAttestationState` overwrite as **separately recoverable, generation-guarded** operations, while
@@ -614,8 +636,9 @@ also settles the algorithm that Q13's "fenced verifier worker" item had left ope
 
 ## Q23. Key rotation assigned two proofs to one header and hard-coded POST
 
-**Status: resolved** — §9.5 defines a concrete RFC 7592 wire format for the key change, distinct from
-the first-enrollment `/register` flow.
+**Status: design decided, tests pending** — D: §9.5 defines a concrete RFC 7592 wire format for the
+key change, distinct from the first-enrollment `/register` flow; V pending the `RegisterValidatorTest`
+assertions (tracked as Q15/Q23).
 
 **Raised.** The key-replacement rule (Q15) said the update carries both a **new-key** proof and an
 **old-key** authorization "in different request locations," but both were specified as **DPoP** — and
@@ -647,8 +670,9 @@ naming a different `target_jkt` than the body is refused).
 
 ## Q24. Enrollment retry idempotency had no client-visible key
 
-**Status: resolved** — the idempotency key is the client-held `(attestation_id, K)`, with request
-binding, retention, and replay behaviour defined (§9.5).
+**Status: design decided, tests pending** — D: the idempotency key is the client-held
+`(attestation_id, K)`, with request binding, retention, and replay behaviour defined (§9.5); V
+pending the enrollment HTTP-retry idempotency test (tracked as Q15/Q24).
 
 **Raised.** Q15 made an enrollment retry idempotent "because the claim carries the `operationId`" —
 a retry would "find the claim already present with its own `operationId`." But `operationId` is a
@@ -679,8 +703,9 @@ An optional client-chosen `Idempotency-Key` header MAY be stored on the claim an
 
 ## Q25. "Re-finalizing produces byte-identical bytes" was unqualified
 
-**Status: resolved** — §11.3 freezes the signing input and installs the final bytes once; retries
-adopt the stored winner.
+**Status: design decided, tests pending** — D: §11.3 freezes the signing input and installs the
+final bytes once, with retries adopting the stored winner; V pending the freeze-input/install-once
+test (tracked as Q14/Q25).
 
 **Raised.** The §11.3 **Finalize-and-sign** transition claimed re-finalizing a resolved entry
 produces byte-identical bytes "idempotent and deterministic." But Ed25519 signature determinism does

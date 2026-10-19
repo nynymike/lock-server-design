@@ -1276,8 +1276,8 @@ assessment that justifies it was, by construction, taken **before** any `client_
   denial-of-service concern that only applies once a client *has* standing state. It does **not**
   govern **initialization**: creating the *first* state for a key at enrollment is authorized by a
   different, stronger proof — the **DPoP proof over `K` presented at `/register`** — not by the
-  assessment having been eligible to supersede. Conflating the two was the gap: a pre-enrollment
-  assessment is never `supersedesEligible`, yet enrollment must still be able to initialize state.
+  assessment having been eligible to supersede. So a pre-enrollment assessment is never
+  `supersedesEligible`, yet enrollment still initializes state, authorized by that proof.
 
 The resolution is an explicit, recoverable **enrollment transaction** (`AttestationService.enrollKey`),
 ordered so a crash at any point leaves a state recovery can complete or safely redo. The transaction
@@ -1375,9 +1375,9 @@ assessment that justified it is never mutated, and the new key's authoritative s
 exactly as at first enrollment. Each newly added key also needs its own fresh `affirming` assessment
 (else `invalid_client_metadata`, `attestation_required_for_new_key`).
 
-Three concerns must be kept distinct, and the earlier draft conflated them by assigning two DPoP
-proofs to the one `DPoP` header and by assuming request authentication also signs the mutation. The
-concrete wire format separates them:
+Three concerns are kept distinct — authenticating the updater, proving possession of the new key,
+and signing the exact mutation (a DPoP proof and `private_key_jwt` authenticate the request but do
+not sign its body). The concrete wire format gives each its own location:
 
 - **(a) Authenticate the updater — normal RFC 7592 auth, old key.** The `PUT` is authenticated the
   way any registration-management request is: with the client's **registration access token**. When
@@ -2989,29 +2989,35 @@ observe whether the agent received it, so no record ever claims delivery to the 
 persisted-but-undelivered credential is benign (the agent retries). The record attests
 *persistence*, never client receipt.
 
-**What the table establishes** (each claim follows from a single row, not from repetition):
+**What the table is required to guarantee** (each requirement follows from a single row). The first
+three rest only on the atomic **Commit** transaction, which is settled; the last two additionally
+depend on the **fencing / crash-recovery** path still being pinned down (the acknowledged Q8 gap, see
+review history), so they are stated as **requirements the protocol must meet**, not yet as
+established facts, until that algorithm is settled and its fault test passes:
 
-- **No false success.** A `committed` position exists only after the **Commit** transaction, whose
-  witness is the `operation_id`-keyed `IssuanceLog`; a success record is signed (**Finalize-and-sign**)
-  and delivered (**Deliver**) only for a `committed` entry. A position that never committed is
-  **Resolve-abort**'d, so no success record names an uncommitted credential.
-- **No lost evidence.** Once **Intake** lands, the journal writer owes the chain a position
-  (**Stage**) and a resolved outcome; a `staged` entry is never TTL-expired, only resolved to
-  `committed` or `aborted`, and both are delivered — so a committed operation always yields a
+- **No false success** (established). A `committed` position exists only after the **Commit**
+  transaction, whose witness is the `operation_id`-keyed `IssuanceLog`; a success record is signed
+  (**Finalize-and-sign**) and delivered (**Deliver**) only for a `committed` entry. A position that
+  never committed is **Resolve-abort**'d, so no success record names an uncommitted credential.
+- **No lost evidence** (established). Once **Intake** lands, the journal writer owes the chain a
+  position (**Stage**) and a resolved outcome; a `staged` entry is never TTL-expired, only resolved
+  to `committed` or `aborted`, and both are delivered — so a committed operation always yields a
   delivered record.
-- **No chain gap.** Every reserved `sequence_number` is delivered — as the success record or an
-  explicit aborted-outcome record (same `sequence_number`/`prev_record_hash`, the operation's own
-  kind/producer per §11.2). Lock never sees a hole.
-- **Non-commit is decidable, not guessed.** Because **Commit** binds entity + `IssuanceLog` + flip
-  into one SQL transaction, the `IssuanceLog` survives the token and a committed operation *always*
-  left it. **Resolve-abort**'s precondition — `IssuanceLog` absent past `resolutionWaitSeconds`, after
-  fencing — is therefore proof of non-commit, not "witness unavailable." Token absence is never read
-  as failure; the decision rests on the `IssuanceLog`. The decision is made on the `operation_id`
-  receipt, never on a same-identifier entity from another operation.
-- **A paused writer cannot race recovery.** **Resolve-abort** cancels (fences) the entry before
-  declaring a terminal outcome, and **Commit** is conditioned on the unchanged `fence`; a writer that
-  committed before cancellation leaves the `IssuanceLog` (→ `committed`), and one cancelled before
-  committing can never commit afterward (→ safe to abort).
+- **No chain gap** (established). Every reserved `sequence_number` is delivered — as the success
+  record or an explicit aborted-outcome record (same `sequence_number`/`prev_record_hash`, the
+  operation's own kind/producer per §11.2). Lock never sees a hole.
+- **Non-commit must be decidable, not guessed** (requirement). Because **Commit** binds entity +
+  `IssuanceLog` + flip into one SQL transaction, a committed operation *always* left the
+  token-outliving `IssuanceLog`; the protocol therefore **requires** **Resolve-abort**'s precondition
+  — `IssuanceLog` absent past `resolutionWaitSeconds`, after fencing — to be read as proof of
+  non-commit, never "witness unavailable," and the decision to rest on the `operation_id` receipt,
+  never on a same-identifier entity from another operation. This holds once the fencing order is
+  settled (Q8).
+- **A paused writer must not race recovery** (requirement). **Resolve-abort** cancels (fences) the
+  entry before declaring a terminal outcome, and **Commit** is conditioned on the unchanged `fence`,
+  so a writer that committed before cancellation leaves the `IssuanceLog` (→ `committed`) and one
+  cancelled before committing cannot commit afterward (→ safe to abort). The exact cancel-then-resolve
+  ordering is the open part of Q8; this is the behaviour that path **must** deliver.
 
 **The aborted record, so the chain is honest about what happened.** It is a signed record at the
 allocated position whose event states the operation did not complete, with
