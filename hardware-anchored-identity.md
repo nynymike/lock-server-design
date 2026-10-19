@@ -873,7 +873,7 @@ own evidence. These are the vendor-neutral checks; the generic-TPM instance is t
 vectors targeted first (implementation appendix, PR 3), and check (2) is exactly what those vectors
 must demonstrate.
 
-#### The Azure AK-binding gap (stated honestly, unproven until vectors)
+#### The Azure AK-binding gap (unproven until vectors)
 
 The Azure `certified` claim rests on one step this repository has **not** substantiated: that the
 AK which signed the `TPM2_Certify` over `K` is the vTPM AK *of the specific VM Azure Attestation
@@ -912,9 +912,8 @@ appraised*. The documented MAA result does not hand this over for free:
     `binding_unestablished` and the verdict is **not** `affirming` for key custody (it is
     `contraindicated`/`warning` per policy, or the profile is refused). Issuance never proceeds on
     an unestablished binding dressed up as `measured_guest`.
-  So the honest fallback is "downgrade to `measured_guest` **only if** its binding is independently
-  demonstrated; otherwise reject and report the binding as unestablished" — never an automatic
-  relabel.
+  So: downgrade to `measured_guest` **only if** its binding is independently demonstrated; otherwise
+  reject and report the binding as unestablished — never an automatic relabel.
 
 What a `certified` profile establishes, in words a relying party can rely on: *"The private half of
 `K` was generated inside, and cannot be exported from, hardware whose launch/image measurement the
@@ -1240,9 +1239,9 @@ idempotent on `(client_id, jkt)`):
 | Step | What | Property |
 |------|------|----------|
 | 1 | **Verify the registration proof against the assessed key.** `validateAttestation()` has already checked `status=affirming`, unexpired, `purpose=enroll`, `attested_jkt ∈ jwks`, and the `/register` **DPoP proof key == `attested_jkt`**. This proof — not the assessment's `supersedesEligible` — is the authorization to initialize state for this key | The registrant demonstrably holds `K`; a third party who merely learned an `attestation_id` cannot enroll around it |
-| 2 | **Preserve the original assessment unchanged.** The `AttestationAssessment` is **immutable** (§9.7); `clientId` is **not** written back onto it. (This removes the earlier contradiction where DCR set `clientId` on the assessment.) | The evidence log stays append-only and re-verifiable exactly as appraised |
+| 2 | **Preserve the original assessment unchanged.** The `AttestationAssessment` is **immutable** (§9.7); `clientId` is **not** written back onto it | The evidence log stays append-only and re-verifiable exactly as appraised |
 | 3 | **Create a separate enrollment binding.** A new `KeyEnrollment` entity (`ou=keyEnrollments`, `jansKeyEnroll`; key `(clientId, jkt)`) records `{ clientId, jkt, attestationId, enrolledAt, enrolledByProofJti }` — the durable link from this client+key to the assessment that justified it, kept **outside** the immutable assessment | The client↔key↔assessment binding lives in its own mutable-by-append record, not by mutating evidence |
-| 4 | **Initialize `(client_id, jkt)` authoritative state.** Insert `KeyAttestationState` for `(clientId, jkt)` at `revision = 0` with `status`/`appraisedAt`/`expiresAt`/`assessmentId` copied from the assessment — an **insert conditioned on absence** (§10.4 first-write). This is the enrollment-authorized initialization; it is the only `KeyAttestationState` write that does not require the writing appraisal to be `supersedesEligible`, because the DCR proof (step 1) supplies the equivalent possession guarantee | Issuance (§10.4) now finds a state row for the key — closing the dead end where a freshly enrolled client could never issue |
+| 4 | **Initialize `(client_id, jkt)` authoritative state.** Insert `KeyAttestationState` for `(clientId, jkt)` at `revision = 0` with `status`/`appraisedAt`/`expiresAt`/`assessmentId` copied from the assessment — an **insert conditioned on absence** (§10.4 first-write). This is the enrollment-authorized initialization; it is the only `KeyAttestationState` write that does not require the writing appraisal to be `supersedesEligible`, because the DCR proof (step 1) supplies the equivalent possession guarantee | Issuance (§10.4) finds a state row for the key, so a freshly enrolled client can issue |
 | 5 | **Record the client attribute and emit evidence.** `ClientAttributes.attestation = { attestationId, jkt, platform, measurement, policyVersion, appraisedAt }` (a copy for display/introspection, not the authority); `dpopBoundAccessToken` forced `true`; the enrollment TRACE record is emitted via the §11.3 path | Enrollment is itself accountable evidence |
 
 **Recovery across the two writes (steps 3–4).** On a backend with a native transaction (SQL,
@@ -1515,7 +1514,7 @@ self-service (which would reintroduce the hijack the old-key rule prevents):
 | **VM rebuild / re-image** (same logical agent, new runtime instance) | A new vTPM means a new key and a new `workload_instance_id` | Treated as re-enrollment of the same logical `client_id` with a new attested key and instance; the `workload_instance_id` change is visible in the evidence (and is exactly why instance binding is a separate assessment — section 15). No old-key authorization is possible or expected |
 | **Suspected compromise / emergency replacement** | `K1` may still be usable, but must not be trusted | An operator **revokes** `K1` out of band: an administrative action overwrites the `(client_id, K1)` `KeyAttestationState` row to `contraindicated` under CAS (`supersedesEligible=true`, admin-authorized) and removes `K1` from `jwks`, so issuance under `K1` stops at once and outstanding SVIDs die within the TTL. A fresh `K2` is enrolled by the normal attested path. Recorded as `IDENTITY_ROTATED` reason `emergency` |
 
-#### Clone and snapshot detection (a limit, stated honestly)
+#### Clone and snapshot detection (a limit)
 
 A VM snapshot/clone can carry a *copy* of the runtime but, for a non-exportable hardware key,
 **not** a copy of `K`'s private half — so a clone cannot produce DPoP proofs for `K1` and simply
@@ -1749,8 +1748,8 @@ generation, so on retry the guard **rejects** it — it cannot overwrite the new
 Newer evidence wins regardless of which writer's CAS happens to commit first; the slow writer gains
 nothing by finishing late.
 
-**Default-mode exposure, stated honestly.** The two commit modes differ, and the flag-off case is
-**plural**, not singular:
+**Default-mode exposure.** The two commit modes differ, and the flag-off case admits **plural**
+in-flight issuance:
 
 - With `attestationRequireFreshPerIssuance` **on**, the commit is a mutating CAS that also consumes
   the state (`consumed = false → true`), so it succeeds for **exactly one** concurrent issuance and
@@ -1759,9 +1758,9 @@ nothing by finishing late.
 - With the flag **off**, the commit is a `stillCurrent(r)` read-check, not a mutating CAS.
   **Multiple** concurrent issuances can each read `revision = r`, each pass `stillCurrent(r)`, and
   each proceed to mint — so a rejection that commits just after they pass the check does **not**
-  retract them. The honest statement is therefore: a rejection is authoritative for every issuance
-  whose authorization point has **not yet passed**, but issuances **already authorized and in
-  flight — potentially several, not one — complete.** Their exposure is bounded only by the short
+  retract them. A rejection is authoritative for every issuance whose authorization point has **not
+  yet passed**, but issuances **already authorized and in flight — potentially several — complete.**
+  Their exposure is bounded only by the short
   SVID TTL and by the rejection stopping all *subsequent* issuance. An operator who cannot tolerate
   plural in-flight issuance after a rejection sets `attestationRequireFreshPerIssuance=true` (or a
   `critical`-tier policy, §16.9), which collapses the window to the single-CAS case.
@@ -1777,10 +1776,7 @@ provisioning (or, if the entity never persisted, as an aborted position — §11
 stands as the authoritative state for the next issuance. "Authorized," "persisted," and "evidenced"
 are three ordered points, and a rejection only governs issuances that have not passed the first.
 
-This single-row model is what the previous per-assessment-entry CAS could not give: updating several
-assessment entries one at a time left a window open even under `attestationRequireFreshPerIssuance`
-(a reader passed on entry A while a writer marked entry A superseded), and separate entries sharing
-`(appraisedAt, version)` were not even totally ordered. One row, one `revision` for write order, one
+The model rests on a single row per key with two orders: `revision` for write order and
 `appraisalGeneration` for evidence order.
 
 **Recorded observation vs. authoritative issuance state.** The denial-of-service defence rests on
@@ -2114,8 +2110,8 @@ catalog is three kinds and defers authentication/FIDO events). Likewise, **human
 recovery and revocation** — lost/replaced passkey, backup authenticator, synced-vs-device-bound
 policy, and the effect of revoking a human credential on in-flight ID-JAGs and executions — are the
 FIDO/Auth Server lifecycle concern, not this plan's; this plan bounds the blast radius only through
-the ID-JAG's short lifetime and the execution's `traceExecutionMaxAgeSeconds`. The honest statement
-is: this plan makes the human assurance *checkable and recorded*, and gates delegation on it; the
+the ID-JAG's short lifetime and the execution's `traceExecutionMaxAgeSeconds`. In scope: this plan
+makes the human assurance *checkable and recorded*, and gates delegation on it; the
 *signed ceremony evidence* and *credential-lifecycle* for the human are the companion producers'
 deferred work, correlated back to this execution by `sid`.
 
@@ -2400,8 +2396,8 @@ beyond that requires an external anchor (SCITT, section 19), which is out of sco
 ### 11.2 Records emitted
 
 Every record uses the authoritative GovOps/Jans record schema, not a bespoke shape: `subject`
-carries `workload_id` / `workload_instance_id` / `human_sponsor` (never the ad-hoc
-`agent` / `principal` / `hardware` sub-objects of an earlier draft), hardware/appraisal evidence
+carries `workload_id` / `workload_instance_id` / `human_sponsor` (not ad-hoc
+`agent` / `principal` / `hardware` sub-objects), hardware/appraisal evidence
 travels in `attestation_ref` and `posture_assessment_ref`, and **no record signs a
 `capability_id`** — that label is Lock-derived from the signed facts (section 11.5). The four
 server events map onto existing event kinds rather than inventing one:
@@ -2582,14 +2578,9 @@ New package `io.jans.as.server.trace`:
 
 #### The outbox append protocol: a per-chain single-writer journal
 
-An earlier draft let any issuance thread append to the chain directly under a unique-index +
-tail-CAS scheme. That was wrong in three ways: the authoritative act (the unique insert that takes
-position *n*) happened **before** the epoch-checked tail CAS, so a fenced/stale writer could insert
-an authoritative record and only *afterward* discover it was fenced — and rejecting its tail update
-does not undo its insert; a writer that lost the unique insert "adopted" the colliding record
-**without proving it was the same operation**, so it could attribute another thread's record to
-itself; and there was no operation identity to decide ownership. The fix is to remove the
-concurrency from the chain entirely rather than add more compare-and-set epicycles.
+A chain has no concurrent writers: one fenced writer appends to it, and issuance threads enqueue
+work rather than append. This removes position contention, ownership ambiguity, and the fence-timing
+problem a multi-writer scheme would carry.
 
 **One writer appends to a chain at a time; issuance threads never append directly.** Each
 `(producer_id, chain_id)` chain (`chain_id` identifies the chain; by default the originating node)
@@ -2613,9 +2604,9 @@ do not touch the chain; they record their intent and hand it to the journal writ
   expires_at }`) via CAS and renews it; `epoch` increments on every acquisition. It then loops:
   pick the oldest unprocessed intake row, assign it the next `sequence_number`, and insert the
   outbox entry **in a single authoritative write that carries the lease `epoch`** (below). Because
-  exactly one lease holder assigns numbers, no two entries ever compute the same `sequence_number`
-  in the first place — the uniqueness problem the old design handled *after the fact* with a
-  constraint and "adopt" simply does not arise.
+  exactly one lease holder assigns numbers, no two entries ever compute the same `sequence_number`;
+  the unique index on `(producer_id, chain_id, sequence_number)` is a backstop invariant, not the
+  mechanism that resolves contention.
 - **The fence is enforced at the authoritative append, not after it.** The outbox insert is
   **conditional on the writer's `epoch` still being the current chain epoch** — one atomic
   store operation, not insert-then-check. Concretely: the insert is guarded by a compare against
@@ -2640,10 +2631,9 @@ do not touch the chain; they record their intent and hand it to the journal writ
   `epoch` now fails the guarded insert. A lease is never two-held effectively: even if both believe
   they hold it, only the one matching the stored `epoch` can append.
 
-**Recovery: intake written, but the position assignment did or did not happen.** The dangerous
-window the old design could not describe cleanly — "insert succeeded but the tail update never
-happened" — is now a well-defined, idempotent intake-drain step keyed by `operation_id`. For each
-intake row the recovering writer resolves by `operation_id`, which has exactly three outcomes:
+**Recovery: intake written, position assignment incomplete.** Recovery is an idempotent intake-drain
+keyed by `operation_id`. For each intake row the recovering writer resolves by `operation_id`, which
+has exactly three outcomes:
 
 | State found | Meaning | Action |
 |-------------|---------|--------|
@@ -2653,13 +2643,8 @@ intake row the recovering writer resolves by `operation_id`, which has exactly t
 
 Because assignment is `operation_id`-keyed and idempotent, a crash between "insert committed" and
 "intake marked processed" is harmless: re-draining finds the existing entry (first row) and does not
-insert a second. There is no "adopt an unknown colliding record" step anywhere — a record is only
-ever matched to an operation by its recorded `operation_id`. The outbox remains the single source of
-truth for which positions exist; the lease serializes *who may create* them.
-
-A single-writer journal is also easier to review than a multi-writer CAS scheme: the append path has
-no concurrent interleaving to reason about, the fence is one guarded write, and ownership is a
-stored `operation_id` rather than an inference.
+insert a second. A record is matched to an operation only by its recorded `operation_id`. The outbox
+is the single source of truth for which positions exist; the lease serializes *who may create* them.
 - `TraceEmitter`: durable outbox (`jansTraceOutbox`) + timer posting to Lock's planned
   `POST /api/v1/audit/trace` ingestion endpoint (a Lock dependency, not a current endpoint — see
   section 11.1) with a `trace.write` client-credentials token from this server; retry with backoff;
@@ -2702,12 +2687,9 @@ has these states:
 The **intake row** (written before the credential, keyed by `operation_id`) and the chain entry the
 journal writer derives from it together *are* the operation journal: the intake records that an
 issuance was attempted and names the exact entity (`jti`, `client_id`, `jkt`) whose persistence
-decides the outcome. Recovery never infers the outcome from a *second* marker's presence or absence;
-it resolves each unfinished entry by probing the **authoritative entity itself**. This is the
-correction to an earlier draft that wrote a separate `IssuanceLog` marker and treated its absence as
-proof of non-commit — a crash after the entity committed but before the marker was written would
-then void evidence for a credential that *did* persist, violating the invariant. A missing marker
-means **unresolved**, never "nothing happened."
+decides the outcome. Recovery resolves each unfinished entry by probing the **authoritative entity
+itself**, not by the presence or absence of a separate marker. A `staged` entry with no probeable
+outcome means **unresolved**, never "nothing happened."
 
 | Step | Who | Order | Why |
 |------|-----|-------|-----|
@@ -2726,7 +2708,7 @@ dropped, so Lock never sees a gap where sequence *n* was allocated. If the issua
 step 2 (no intake row), no position is ever allocated and nothing is owed to the chain; once the
 intake row exists, the journal writer guarantees a position and an outcome for it.
 
-**Why staging rather than one transaction, and where the transaction is used.** The outbox insert
+**Atomicity across the writes, and where a native transaction is used.** The outbox insert
 (step 2) and the entity commit (step 3) cannot always be one atomic unit, because the Jans
 `PersistenceEntryManager` abstraction does not expose a portable multi-entry transaction spanning
 LDAP, SQL, and Couchbase (the datastores differ: SQL has transactions, **Couchbase has supported
@@ -2866,9 +2848,8 @@ versioned capability mapping in the policy store and stores it as the Lock-deriv
 `design.md`: Capability Resolution). This plan therefore does **not** define
 `urn:jans:capability:*` values as signed fields; where this server acts as the PDP for an issuance
 policy and wants a decision record, it signs a real `(action, resource_type)` pair (e.g.
-`Jans::Action::"IssueSvid"` / `Jans::AgentCredential`) and lets Lock map it to a capability. The
-earlier draft's record-level `capability_ids` arrays and `urn:jans:capability:*` identifiers are
-removed for this reason.
+`Jans::Action::"IssueSvid"` / `Jans::AgentCredential`) and lets Lock map it to a capability.
+Records therefore carry no `capability_ids` array and no `urn:jans:capability:*` identifier.
 
 ## 12. What's new inside jans-auth-server
 
@@ -3023,7 +3004,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | ID-JAG stolen | Audience- and client-bound, short-lived (existing); the SVID carries `delegation.credential_id` and the records show which agent used it |
 | Outbox full or evidence store unavailable | `JWT-SVID` issuance refused with `503 evidence_unavailable` (`fail-closed`); other traffic per `traceOutboxFullPolicy`, with a `coverage_gap` marker on the next record so the chain is visibly incomplete rather than silently short |
 | Crash between record staging and credential persistence | The outbox entry is `staged` = **unresolved** and already owns a sequence position. Recovery resolves it by **probing the entity**, not by a marker's absence: if the `TokenEntity` (or `IssuanceLog`) is present the record is `committed` and the success record is **delivered** at its position — so a credential that *did* persist never loses its evidence; if neither exists past `resolutionWaitSeconds` the position is resolved to `aborted` and an **aborted-outcome record is delivered at that same position**, so the chain Lock receives has no gap; if neither exists but still within the wait it stays unresolved and is retried. On SQL/Couchbase the entity write and the flip are one native transaction, so this window does not exist there (11.3) |
-| Crash **after** the credential persisted but **before** the marker/flip (the subtle case) | Resolved to `committed` and delivered, **not** aborted: recovery finds the committed `TokenEntity` by the `staged` entry's locator. This is the gap a naive "absent marker ⇒ nothing happened" rule would have violated — a persisted credential with no evidence — and is why resolution reads the authoritative entity, treating a missing marker as *unresolved*, never as *nothing happened* (11.3) |
+| Crash **after** the credential persisted but **before** the commit flip | Resolved to `committed` and delivered: recovery finds the committed `TokenEntity` by the `staged` entry's locator and promotes it. A `staged` entry with no probeable entity is *unresolved* and retried, never silently treated as "nothing happened" (11.3) |
 | SVID issued, persisted, then expired or revoked before reconciliation | **Not** flagged as a failed issuance. Token absence is not failure evidence; the TTL-independent `IssuanceLog` marker (retained `issuanceLogRetentionSeconds`) records the commit, so reconciliation sees a real past issuance that simply aged out, not an orphan (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
@@ -3091,9 +3072,9 @@ or implied. Each is normative for a production deployment; a demo MAY relax the 
     and a `cnf`-checking RP additionally requires a valid DPoP proof, so a stolen *signing* key
     alone does not let an attacker present a token against a hardware key it does not hold.
 
-  So the honest statement is: key removal stops **new** issuance at jans at once and stops
-  verification at a given RP within that RP's maximum bundle cache age (≤ `spiffeBundleRefreshHintSeconds`,
-  or the tier's `bundleMaxCachedAgeSeconds`); it is **not** instantaneous at verifiers. A deployment
+  Key removal stops **new** issuance at jans at once and stops verification at a given RP within
+  that RP's maximum bundle cache age (≤ `spiffeBundleRefreshHintSeconds`, or the tier's
+  `bundleMaxCachedAgeSeconds`); it is **not** instantaneous at verifiers. A deployment
   that needs a hard upper bound sets the refresh hint and the critical-tier max cached age to the
   longest acceptable revocation delay, and relies on the short SVID TTL and DPoP binding to cover
   the interval. A compromised TRACE producer key is revoked in Lock's registry so later records

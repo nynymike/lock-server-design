@@ -53,6 +53,12 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 (`WebKeysConfiguration`, `AppConfiguration`, `ConfigurationFactory`, `AbstractCryptoProvider`,
 `CommonUtils` are mocks or `mockStatic`).
 
+The "Covers" column lists **required behaviors each test must assert**, not guarantees already
+established. A behavior stated here is a test obligation; the durability and ordering behaviors
+(single-row state, journal fencing, staged-commit recovery, enrollment init) are only *established*
+once the crash-point and concurrency fault tests below pass on every backend. Until then the review
+history marks those items partially resolved.
+
 | Test class | Covers |
 |------------|--------|
 | `AccessTokenTypeTest` (model) | `fromString` variants; unknown → `null`; wire values |
@@ -98,3 +104,53 @@ verifying against the fetched bundle. Classes: `SpiffeBundleEndpointHttpTest`,
 `JwtSvidIssuanceHttpTest` (including `attestation_required`, attest-and-issue, introspection),
 `JwtSvidRoundTripHttpTest`, `TraceEmissionHttpTest` (against a Lock instance in the CI profile).
 Nothing in the suite calls a host the project does not control.
+
+## Crash-point and concurrency fault tests
+
+The durability and ordering guarantees in §§9.3c, 9.5, 9.7, 10.4, and 11.3 hold only if these tests
+pass; until they do, treat the corresponding claims as **asserted-but-unverified** (the review
+history marks the items partially resolved). These tests run on **every supported backend** — SQL,
+LDAP, Couchbase — because the single-entry-CAS vs native-transaction difference (§9.7) is exactly
+what they probe. Crashes are simulated by a fault-injecting `PersistenceEntryManager` wrapper that
+aborts after a named write.
+
+- **Crash point between every durable write.** For each ordered multi-write sequence, inject a
+  crash after each individual write and assert recovery reaches a correct terminal state with no
+  lost or duplicated effect. The sequences and their required recovered outcomes:
+  - **Enrollment (§9.5):** `KeyEnrollment` written / not; `KeyAttestationState` initialized / not.
+    Crash after `KeyEnrollment` only → recovery completes the state init (issuance refused until it
+    exists); crash before `KeyEnrollment` → clean re-register; both present → idempotent no-op.
+  - **Issuance (§11.3 steps 2–5):** crash after intake, after the journal insert (`staged`), after
+    the entity commit, after the flip (`committed`). Each is resolved by the entity probe to exactly
+    one of `committed`/`aborted`/still-`unresolved`, and **a credential that committed is never
+    `aborted`, a credential that did not commit is never delivered as success.**
+  - **Verifier worker (§9.3c):** crash after the assessment write, after `completed`, after the
+    state overwrite. Recovery (under the current lease) finishes the remaining steps idempotently;
+    `appraisalGeneration`/immutability make replays safe.
+  - **Attestation state write (§10.4):** crash between the state overwrite and the TRACE emission
+    for that overwrite; the two reconcile without double-applying.
+- **Voided/aborted middle-record chain test.** Allocate positions *n-1, n, n+1*; let *n* resolve to
+  `aborted` (its credential never committed). Assert Lock receives a **gapless** chain: *n* is
+  delivered as an aborted-outcome record, `prev_record_hash` of *n+1* is over *n*'s delivered
+  digest, and no `coverage_gap`/`chain_link_failure` is raised. Repeat with the crash injected
+  between *n*'s resolution and *n+1*'s hash binding.
+- **Stale-worker insertion after fencing.** A verifier worker (or journal writer) whose lease
+  expired and was reclaimed at a higher `epoch` attempts its guarded write; assert it is **rejected
+  at the write** (no fenced-but-committed row, no forked chain position, no out-of-order state
+  overwrite), and that the reclaiming worker's write is the one that lands.
+- **Delayed-positive-after-rejection.** A slow `affirming` appraisal with generation `g′` arrives
+  after a `contraindicated` with generation `g″ > g′` has been written; assert the slow write is
+  **dropped** by the `appraisalGeneration` guard and the row stays `contraindicated` (§10.4). Also
+  the inverse: a genuinely newer `affirming` (`> ` the current generation) does overwrite.
+- **First-enrollment state initialization.** From no `KeyAttestationState` row, a first enrollment
+  initializes it at `revision = 0` and a subsequent `/token` issues; a pre-enrollment assessment
+  that is `supersedesEligible=false` still initializes (authorized by the DCR proof, §9.5), and a
+  second enrollment of the same `attestation_id` for a different client is refused
+  (`assessment_already_enrolled`).
+- **Plural in-flight after rejection (flag off).** Several concurrent `/token` calls that pass
+  `stillCurrent(r)` before a rejection commits all complete; assert the count is bounded by
+  concurrency (not unbounded re-issuance), that every subsequent call is refused, and that with
+  `attestationRequireFreshPerIssuance=true` only one of the same concurrent set succeeds.
+
+Each test asserts the **recovered terminal state**, not intermediate prose guarantees; a guarantee
+in §§9–11 that lacks a passing test here is not yet established.

@@ -6,6 +6,27 @@ produced. It is a history, not a specification: the authoritative behaviour is i
 document's numbered sections, which these entries point to. Keep new review rounds here so the main
 document stays a clean specification rather than a running changelog.
 
+**Status legend.** Each item is **resolved** (the algorithm is specified *and* its guarantee is
+established by a passing test) or **partially resolved** (the algorithm is specified and the failure
+behaviour is defined, but the guarantee depends on crash-point / concurrency fault tests that are
+not yet written or passing — see "Crash-point and concurrency fault tests" in the implementation
+appendix). A partially-resolved item is design-complete but not verification-complete; do not treat
+its guarantee as proven until its tests pass on every backend.
+
+**Items currently partially resolved** (algorithm specified, tests pending):
+
+| Item | Guarantee awaiting test | Tests |
+|------|-------------------------|-------|
+| Q3 — single-row attestation state | a rejection is authoritative; no issuance resurrects an overwritten approval | delayed-positive-after-rejection; crash-point on the state write |
+| Q8 — staged-commit evidence durability | no persisted credential lacks evidence; no false-success record | crash-point between every durable write (issuance steps 2–5) |
+| Q10 — enrollment transaction | first-enrollment state initialization; idempotent redo | first-enrollment init; crash between `KeyEnrollment` and state init |
+| Q11 — evidence precedence / plural in-flight | stale positive never restores approval; bounded in-flight exposure | delayed-positive-after-rejection; plural-in-flight |
+| Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
+| Q13 — fenced verifier worker | a fenced worker never records a verdict | stale-worker insertion after fencing |
+
+These become **resolved** when the named tests pass. The entries below describe the raised question
+and the change; the status marker on each says whether verification is complete.
+
 ## Q1. Key named in evidence ≠ hardware-protected key
 
 **Raised.** A key named in attestation evidence is not automatically a hardware-protected key.
@@ -41,6 +62,9 @@ failure-mode row points to agent-runtime measurement or behavioural TRACE eviden
 paths.
 
 ## Q3. `latestAffirming()` can ignore a newer rejection
+
+**Status: partially resolved** — algorithm specified (§9.7/§10.4); guarantee pending the
+delayed-positive-after-rejection and state-write crash-point tests.
 
 **Raised.** An agent could receive `contraindicated` and keep obtaining tokens with an earlier,
 still-fresh positive assessment. Use the latest relevant assessment and define which failures
@@ -116,6 +140,9 @@ concurrent claim gets `challenge_in_progress` without a fresh nonce; `completed`
 
 ## Q8. Evidence durability was only partially specified
 
+**Status: partially resolved** — algorithm and failure behaviour specified (§11.3); guarantee
+pending the crash-point-between-every-durable-write and voided/aborted-middle-record tests.
+
 **Raised.** Updating chain state and the outbox together prevents some chain failures but does not
 ensure every successful issuance has an evidence record unless issuance and evidence persistence
 have a defined commit relationship. Explain crash recovery, duplicate delivery, and outbox
@@ -171,6 +198,9 @@ EAT shape it would take.
 
 ## Q10. Enrollment had no complete transition into authoritative state
 
+**Status: partially resolved** — enrollment transaction specified (§9.5); guarantee pending the
+first-enrollment-init and enrollment crash-point tests.
+
 **Raised.** A pre-enrollment attestation has no `client_id` and requires no DPoP, so it is
 `supersedesEligible=false`; but only a `supersedesEligible=true` assessment could populate
 `KeyAttestationState`, and issuance requires that state — so a freshly enrolled client could never
@@ -188,6 +218,10 @@ table gained a distinct enrollment-initialization row. One assessment enrolls ex
 (`assessment_already_enrolled` otherwise), and adding a replacement key reuses the same transaction.
 
 ## Q11. Attestation ordering needs rules beyond CAS
+
+**Status: partially resolved** — `appraisalGeneration` precedence and the plural-in-flight exposure
+specified (§9.3/§10.4); guarantee pending the delayed-positive-after-rejection and plural-in-flight
+tests.
 
 **Raised.** A monotonic `revision` orders *writes* but not which *evidence* should win: an older
 positive appraisal can finish slowly, lose a CAS to a newer rejection, retry, and overwrite that
@@ -223,6 +257,10 @@ across audiences by design (the agent is one identity), so colluding RPs can sti
 agent," just not which human or the delegation credential.
 
 ## Q13. A batch of precision fixes across attestation, delegation, privacy, and signing
+
+**Status: mostly resolved** — items (2)–(7) are specified and testable directly; item (1), the
+fenced verifier worker, is **partially resolved** pending the stale-worker-insertion-after-fencing
+crash test.
 
 **Raised (seven items).** (1) §9.3c claimed a verdict and `completed` are "written in one operation"
 though challenge, assessment, state, and outbox are separate entities — and a verifier worker whose
