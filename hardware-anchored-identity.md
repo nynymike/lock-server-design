@@ -1365,9 +1365,18 @@ state to reconcile. The two concerns the transaction keeps separate are:
     - **Included:** the client-supplied registration metadata members that define the client's
       identity and contract — `redirect_uris`, `grant_types`, `response_types`, `token_endpoint_auth_method`,
       `jwks`/`jwks_uri`, `allowed_resources`/audiences, the SVID disclosure settings, and any other
-      member the deployment treats as contract-defining — each **canonicalized**: absent-vs-empty
-      normalized to absent, arrays **sorted** (order-insensitive), strings compared post-`%`-decode,
-      and the whole projected to RFC 8785 canonical JSON before digesting.
+      member the deployment treats as contract-defining.
+    - **Normalization is conservative and semantics-preserving.** The projection **preserves parsed
+      JSON string values, array order, and the absent-vs-empty distinction** — it does **not**
+      blanket-sort arrays, percent-decode strings, or equate absent with empty, because those are
+      **not** universally semantics-preserving: `/a%2Fb` and `/a/b` need not identify the same
+      resource (RFC 3986 distinguishes reserved-character encoding from safe normalization), array
+      order can be significant, and absent can differ from empty. A transformation is applied **only
+      where a named metadata field explicitly defines two forms as equivalent** (e.g. a field whose
+      spec says its array is an unordered set, or that is case-insensitive) — that field-specific
+      processing runs first, and **RFC 8785 (JCS) canonical JSON is applied after it**. JCS itself
+      preserves array order and object-member values; it canonicalizes serialization, not semantics,
+      and never turns an array into a set.
     - **Excluded:** everything the *server* supplies or that is transient — server-assigned fields
       (`client_id`, `client_id_issued_at`, registration-management credentials), defaulted values the
       client did not send, and the request's transient proof/transport fields (the DPoP proof, the
@@ -3136,16 +3145,18 @@ persisted-but-undelivered credential is benign (the agent retries). The record a
 *persistence*, never client receipt.
 
 **What the table is required to guarantee** (each requirement follows from a single row). Only the
-commit-side property rests solely on the atomic **Commit** transaction and holds unconditionally; the
-rest depend on **recovery, finalization, retained signing material, and delivery**, so they are
-stated as the **durable local obligation plus the conditions eventual delivery needs** — not as
-unconditional "no gap at Lock" facts:
+commit-side property rests solely on the atomic **Commit** transaction; even it holds only under its
+stated assumptions — **the Commit writes all participate in the one issuer-side SQL transaction (the
+"Database execution rules" above) and the committed rows are durably stored and not later lost to a
+retention/restore inconsistency.** The rest additionally depend on **recovery, finalization, retained
+signing material, and delivery**, so they are stated as the **durable local obligation plus the
+conditions eventual delivery needs** — not as unconditional "no gap at Lock" facts:
 
-- **No false success** (holds on **Commit** alone). A `committed` position exists only after the
-  **Commit** transaction, whose witness is the `operation_id`-keyed `IssuanceLog`; a success record
-  is signed (**Finalize-and-sign**) and delivered (**Deliver**) only for a `committed` entry. A
-  position that never committed is **Resolve-abort**'d, so no success record ever names an
-  uncommitted credential.
+- **No false success** (holds on **Commit** alone, under the assumptions above). A `committed`
+  position exists only after the **Commit** transaction, whose witness is the `operation_id`-keyed
+  `IssuanceLog`; a success record is signed (**Finalize-and-sign**) and delivered (**Deliver**) only
+  for a `committed` entry. A position that never committed is **Resolve-abort**'d, so no success
+  record ever names an uncommitted credential.
 - **Durable local evidence obligation, not guaranteed delivery.** **Every committed operation has a
   durable local evidence obligation**: once **Intake** lands and **Stage** reserves a position, that
   position is recorded locally and is never TTL-expired, only resolved to `committed` or `aborted`.
@@ -3200,16 +3211,24 @@ is **not** evidence that issuance never happened. Under the atomic **Commit** mo
 the entity, and the flip commit together, so a delivered success record implies the operation *did*
 commit; a subsequently-missing receipt indicates an **integrity, retention, or restore
 inconsistency** (a lost/rolled-back-restore of the evidence table, a mis-expired receipt, a backup
-gap), not a non-persistence. The design therefore records an **integrity finding**, not a
-non-persistence claim: a separately-signed `CREDENTIAL_PROVISIONED` with reason
-**`commit_receipt_missing`** and a `parent_record_ids` link to the affected record, stating that the
-receipt expected for a delivered success record was absent at reconciliation. It makes **no** claim
-that the credential was never provisioned or never activated. Asserting non-persistence
-(`not_persisted` / never-activated / a supersession) requires **independent evidence** that the
-operation did not commit — e.g. the entity confirmably absent *and* a retained token-outliving
-witness confirmably absent by a path that would have proved commit — and is a separate, deliberate
-finding, never the automatic consequence of one missing receipt. The original record is never
-rewritten.
+gap), not a non-persistence.
+
+This is handled as an **operational alert, not a TRACE provisioning event.** It is deliberately
+**not** encoded as a `CREDENTIAL_PROVISIONED` record: that would fail this document's own §11.2
+outcome contract — `reason` is permitted only on an `aborted` record (value `not_committed`), and
+none of the four `operation_kind` values describes an integrity finding — so emitting one would be a
+record the validator must reject. Until a **compatible finding schema is defined with Lock** (a
+distinct event kind or finding type, out of scope here), a later-missing receipt on a delivered
+record raises a `commit_receipt_missing` **operational alert** (metric + `ERROR` log, for
+operator/audit follow-up), referencing the affected `record_id`; it does not synthesize a TRACE
+event. The original record is never rewritten.
+
+The alert makes **no** claim that the credential was never provisioned. In particular, **an absent
+entity together with an absent witness does not prove historical non-commit** under the atomic
+model: after a retention or restore inconsistency both can be absent even though issuance really
+occurred. Asserting non-persistence is therefore never the automatic consequence of absence; it
+requires positive, independent evidence that the operation did not commit, and is a separate,
+deliberate determination — not something recovery infers from two missing rows.
 
 Outbox exhaustion: the outbox is bounded (`traceOutboxMaxEntries`, default 100 000, and
 `traceOutboxMaxAgeSeconds`). When full, behaviour follows `traceOutboxFullPolicy`:
@@ -3590,7 +3609,7 @@ transaction-boundary requirement) — including clustered deployments. Attestati
 single-entry `revision` CAS because all of a key's state lives in one row (so no transition updates
 two entries), and the issuance/enrollment journal binds its multi-entry commit (`IssuanceLog` +
 entity + flip) into one native local SQL transaction over that single datasource (11.3). Fault tests MUST cover: a node crash between the outbox write and entity persistence
-(resolved by the §11.3 recovery drain; a later-missing receipt on a delivered record is recorded as a `commit_receipt_missing` **integrity finding**, not a non-persistence claim, 11.3); the **rejection-vs-in-flight-issuance race**
+(resolved by the §11.3 recovery drain; a later-missing receipt on a delivered record raises a `commit_receipt_missing` **operational alert**, not a TRACE provisioning event and not a non-persistence claim, 11.3); the **rejection-vs-in-flight-issuance race**
 — a `contraindicated` and a concurrent `/token` contending for the same `(client_id, jkt)` row,
 asserting the issuance's `revision` CAS fails when the rejection commits first and that no
 interleaving issues an SVID against an overwritten approval (10.4); a lost supersession/consume CAS
@@ -3853,13 +3872,13 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **`capability_id`** | The governance label Lock *derives* from signed `(action, resource_type)` facts — never signed by a producer (§11.5). |
 | **Settlement / Evidence Packet / lineage checkpoint** | Lock-side assurance layers (Phase 2/4), referenced for phase scoping (§11.1). |
 | **`jans-trace-core`** | The shared Rust library for canonicalization / Ed25519 signing / digest, with normative cross-language vectors (§11.3). |
-| **Outbox append protocol** | A per-chain **single-writer journal**: issuance threads enqueue unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially under a **`SELECT … FOR UPDATE` lock on the lease row** (Stage validates ownership, allocates the sequence, inserts, and advances the cursor in one transaction; lease transfer locks the same row), so a stale writer never creates a record. Commit and Resolve-abort are competing conditional updates on the one operation row (§11.3). |
-| **`operation_id` / journal lease** | The per-issuance identity that ties an intake row to its chain entry (ownership is never inferred from a colliding record), and the per-chain `epoch`-fenced lease that makes exactly one writer append at a time (§11.3). |
-| **Record states `staged` / `committed` / `aborted` / `delivered`** | The outbox lifecycle: `staged` = position allocated, outcome unresolved, not yet posted; `committed` = entity confirmed, success record to be delivered; `aborted` = positive evidence of non-commit, an aborted-outcome record to be delivered **at the same sequence position**; `delivered` = Lock accepted whichever record occupies the position. Every allocated position carries a **durable local delivery obligation**; actual gapless delivery to Lock additionally needs recovery to complete, signing material retained, and Lock reachable (§11.3). |
-| **`operation_kind`** | The **signed wire discriminator** ∈ `{svid_issuance, key_enrollment, bare_key_appraisal, execution_bootstrap}` on every TRACE provisioning/bootstrap record. The validator selects the per-kind schema from it — the subtype is **never** inferred from which artifacts are present (impossible on an `aborted` record). Several kinds share one `event_kind`/`provisioning_kind`; `operation_kind` disambiguates them (§11.2). |
-| **`operation_outcome`** | The `event.operation_outcome` discriminator ∈ `{committed, aborted}` (default `committed`), on `CREDENTIAL_PROVISIONED` **and** `EXECUTION_STARTED` — named `operation_outcome` (not `provisioning_outcome`) because a bootstrap starts an execution rather than provisioning a credential. The required identifying artifact is keyed on the signed `operation_kind` × `operation_outcome` (§11.2), not on outcome alone: `credential_fingerprint` for committed `svid_issuance`/`key_enrollment` only; `attestation_id` + assessed-key `jkt` for a `bare_key_appraisal`; execution pair + source-grant reference for an `execution_bootstrap` (§11.2, §11.3). |
-| **Aborted-outcome record** | A signed record with `operation_outcome=aborted` (reason `not_committed`, no `credential_fingerprint`) delivered at an allocated sequence position whose operation never committed, so the hash chain Lock receives is gapless. It uses the operation's **own `event_kind` and producer key** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer` for issuance/enrollment/appraisal, `EXECUTION_STARTED`/`jans-auth` for a bootstrap — never a cross-producer kind (§11.2, §11.3). |
-| **`IssuanceLog`** | A TTL-independent witness (**keyed by `operation_id`**) proving a specific operation committed; it outlives the SVID so **token absence is never read as failed issuance**, and recovery matches it by `operation_id` rather than by credential identifiers (§11.3). |
+| **Outbox append protocol** | The per-chain **single-writer journal** that assigns gapless sequence numbers to TRACE records under a fenced lease; the Intake→Stage→Commit→Resolve-abort→Finalize→Deliver transition table and locking rules are authoritative in §11.3. |
+| **`operation_id` / journal lease** | The per-issuance identity tying an intake row to its chain entry, and the per-chain `epoch`-fenced lease that admits exactly one writer at a time (§11.3). |
+| **Record states `staged` / `committed` / `aborted` / `delivered`** | The outbox lifecycle states: position allocated / entity confirmed / positive non-commit / Lock accepted the record at that position. Each allocated position carries a durable local delivery obligation; full state semantics and the conditions for gapless delivery are in §11.3. |
+| **`operation_kind`** | The **signed wire discriminator** ∈ `{svid_issuance, key_enrollment, bare_key_appraisal, execution_bootstrap}` selecting the per-kind schema; never inferred from present artifacts. Full matrix in §11.2. |
+| **`operation_outcome`** | The signed discriminator ∈ `{committed, aborted}` (default `committed`) on `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED`; the required identifying artifact is keyed on `operation_kind` × `operation_outcome` per the §11.2 matrix. |
+| **Aborted-outcome record** | A signed record with `operation_outcome=aborted` (reason `not_committed`) delivered at an allocated position whose operation never committed, using the operation's own `event_kind` and producer key so the chain stays gapless (§11.2, §11.3). |
+| **`IssuanceLog`** | A TTL-independent witness keyed by `operation_id` proving a specific operation committed, so token absence is never read as failed issuance; recovery matches by `operation_id` (§11.3). |
 | **Persisted vs. delivered** | "Credential persisted" (committed by the issuer, what a record attests) vs. "response received by the client" (unobservable by the server, never asserted) (§11.3). |
 | **Operation binding** | `request_digest` / `input_digest` / `tool_call_digest` / `result_digest` + proof-of-possession binding — the Phase-3 same-operation proof (§3; `design.md`). |
 

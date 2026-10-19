@@ -1,7 +1,5 @@
 # Hardware-Anchored Identity — Review History
 
-# Hardware-anchored identity — review history
-
 This document records review questions raised against
 [`hardware-anchored-identity.md`](./hardware-anchored-identity.md) and the change each one
 produced. It is a history, not a specification: the authoritative behaviour is in the main design

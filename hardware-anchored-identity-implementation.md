@@ -209,10 +209,15 @@ The crash tests fall into **two distinct expectation types** — do not conflate
   (`400 invalid_client_metadata`, `enrollment_conflict`), directing the change to `updateClient` on
   the recovered `client_id`.
 - **Projection-digest reproducibility (§9.5).** Assert a retry that resends the **same
-  contract-defining metadata but differs only in** server-defaulted fields, array ordering, absent-vs-
-  empty members, `%`-encoding, or the transient proof/`attestation`/`Idempotency-Key` fields
-  **still replays** (same canonical projection digest) — the digest must not be computed over the
-  *accepted* record or over the raw request including defaults/normalization.
+  contract-defining metadata but differs only in** server-defaulted fields or the transient
+  proof/`attestation`/`Idempotency-Key` fields **still replays** (same canonical projection digest) —
+  the digest is over the client-supplied projection, not the *accepted* record or the raw request
+  including defaults. **Conversely assert the projection is semantics-preserving:** a retry that
+  **reorders a `redirect_uris` array, changes `%`-encoding (`/a%2Fb` vs `/a/b`), or sends empty where
+  the original omitted** is treated as **different** (→ `enrollment_conflict`), **not** silently
+  replayed — arrays are not blanket-sorted, strings are not percent-decoded, and absent ≠ empty,
+  except where a named field explicitly defines the forms equivalent (test that field-specific
+  equivalence separately, then JCS after it).
 - **Replay has no side effects (§9.5).** After the enrollment, `suspend` the client / remove a key /
   rotate its registration-management credential, then replay the original enrollment: assert the
   replay returns the original accepted registration but does **not** reactivate the suspended client,
