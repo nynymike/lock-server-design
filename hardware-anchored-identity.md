@@ -1233,55 +1233,92 @@ assessment that justifies it was, by construction, taken **before** any `client_
   assessment is never `supersedesEligible`, yet enrollment must still be able to initialize state.
 
 The resolution is an explicit, recoverable **enrollment transaction** (`AttestationService.enrollKey`),
-ordered so a crash at any point leaves a state recovery can complete or safely redo (it is
-idempotent on `(client_id, jkt)`):
+ordered so a crash at any point leaves a state recovery can complete or safely redo. The transaction
+has two distinct keys: the **claim** (step 1) is keyed by `attestation_id` and is the single
+serialization point that makes "this assessment is spoken for" atomic; the remaining writes are
+keyed by `(client_id, jkt)` and are idempotent. A lookup of "is this `attestation_id` already
+enrolled?" followed by an insert is **not** sufficient — two concurrent registrations naming the
+same `attestation_id` for different client IDs would both read "not yet enrolled" and both proceed.
+The claim replaces the lookup with a write that one and only one enroller can win:
 
 | Step | What | Property |
 |------|------|----------|
-| 1 | **Verify the registration proof against the assessed key.** `validateAttestation()` has already checked `status=affirming`, unexpired, `purpose=enroll`, `attested_jkt ∈ jwks`, and the `/register` **DPoP proof key == `attested_jkt`**. This proof — not the assessment's `supersedesEligible` — is the authorization to initialize state for this key | The registrant demonstrably holds `K`; a third party who merely learned an `attestation_id` cannot enroll around it |
-| 2 | **Preserve the original assessment unchanged.** The `AttestationAssessment` is **immutable** (§9.7); `clientId` is **not** written back onto it | The evidence log stays append-only and re-verifiable exactly as appraised |
-| 3 | **Create a separate enrollment binding.** A new `KeyEnrollment` entity (`ou=keyEnrollments`, `jansKeyEnroll`; key `(clientId, jkt)`) records `{ clientId, jkt, attestationId, enrolledAt, enrolledByProofJti }` — the durable link from this client+key to the assessment that justified it, kept **outside** the immutable assessment | The client↔key↔assessment binding lives in its own mutable-by-append record, not by mutating evidence |
-| 4 | **Initialize `(client_id, jkt)` authoritative state.** Insert `KeyAttestationState` for `(clientId, jkt)` at `revision = 0` with `status`/`appraisedAt`/`expiresAt`/`assessmentId` copied from the assessment — an **insert conditioned on absence** (§10.4 first-write). This is the enrollment-authorized initialization; it is the only `KeyAttestationState` write that does not require the writing appraisal to be `supersedesEligible`, because the DCR proof (step 1) supplies the equivalent possession guarantee | Issuance (§10.4) finds a state row for the key, so a freshly enrolled client can issue |
-| 5 | **Record the client attribute and emit evidence.** `ClientAttributes.attestation = { attestationId, jkt, platform, measurement, policyVersion, appraisedAt }` (a copy for display/introspection, not the authority); `dpopBoundAccessToken` forced `true`; the enrollment TRACE record is emitted via the §11.3 path | Enrollment is itself accountable evidence |
+| 1 | **Claim the assessment atomically by `attestation_id`.** Insert a `KeyEnrollmentClaim` entity (`ou=keyEnrollmentClaims`, `jansEnrollClaim`; **key `attestationId`**) recording `{ attestationId, claimingClientId, operationId, claimedAt, state=pending }` as an **insert conditioned on absence**. The insert is the commit point for "this assessment is now bound to exactly one enrollment": if a row already exists for this `attestation_id`, the insert fails and enrollment is refused (`invalid_client_metadata`, `assessment_already_enrolled`) — *unless* the existing claim names this same `operationId`, in which case this is a crash-retry of our own transaction and we proceed to finish it. Two concurrent enrollers naming the same `attestation_id` therefore race on this one insert; exactly one wins | Uniqueness is enforced by the write that conflicts, not by a lookup that can be stale under concurrency — the race cannot produce two bindings |
+| 2 | **Verify the registration proof against the assessed key.** `validateAttestation()` has already checked `status=affirming`, unexpired, `purpose=enroll`, `attested_jkt ∈ jwks`, and the `/register` **DPoP proof key == `attested_jkt`**. This proof — not the assessment's `supersedesEligible` — is the authorization to initialize state for this key | The registrant demonstrably holds `K`; a third party who merely learned an `attestation_id` cannot enroll around it |
+| 3 | **Preserve the original assessment unchanged.** The `AttestationAssessment` is **immutable** (§9.7); `clientId` is **not** written back onto it | The evidence log stays append-only and re-verifiable exactly as appraised |
+| 4 | **Create a separate enrollment binding.** A new `KeyEnrollment` entity (`ou=keyEnrollments`, `jansKeyEnroll`; key `(clientId, jkt)`) records `{ clientId, jkt, attestationId, operationId, enrolledAt, enrolledByProofJti }` — the durable link from this client+key to the assessment that justified it, kept **outside** the immutable assessment. It carries the same `operationId` as the claim so recovery can match binding to claim | The client↔key↔assessment binding lives in its own mutable-by-append record, not by mutating evidence |
+| 5 | **Initialize `(client_id, jkt)` authoritative state.** Insert `KeyAttestationState` for `(clientId, jkt)` at `revision = 0` with `status`/`appraisedAt`/`expiresAt`/`assessmentId` copied from the assessment — an **insert conditioned on absence** (§10.4 first-write). This is the enrollment-authorized initialization; it is the only `KeyAttestationState` write that does not require the writing appraisal to be `supersedesEligible`, because the DCR proof (step 2) supplies the equivalent possession guarantee | Issuance (§10.4) finds a state row for the key, so a freshly enrolled client can issue |
+| 6 | **Mark the claim committed, record the client attribute, and emit evidence.** Flip the `KeyEnrollmentClaim` `state` to `committed`; set `ClientAttributes.attestation = { attestationId, jkt, platform, measurement, policyVersion, appraisedAt }` (a copy for display/introspection, not the authority); force `dpopBoundAccessToken` `true`; emit the enrollment TRACE record via the §11.3 path | The claim's `committed` flag is the durable marker that recovery is finished; enrollment is itself accountable evidence |
 
-**Recovery across the two writes (steps 3–4).** On a backend with a native transaction (SQL,
-Couchbase) steps 3 and 4 are one commit. On LDAP they are two ordered writes — `KeyEnrollment`
-first, then `KeyAttestationState` — and every step is keyed by `(clientId, jkt)` and idempotent, so
-a crash in between is recoverable by **redo**, never by a half-enrolled state:
+**Recovery across the writes (steps 1–6).** On a backend with a native transaction (SQL, Couchbase)
+steps 1–6 are one commit and recovery is trivial. On LDAP they are ordered writes — claim, then
+`KeyEnrollment`, then `KeyAttestationState`, then claim-commit — and the claim keyed by
+`attestation_id` is the serialization point, while every subsequent write is keyed by
+`(client_id, jkt)` and idempotent, so a crash is recoverable by **redo** scoped to the one enroller
+the claim names, never by a half-enrolled state. Recovery keys off the claim and its `operationId`:
 
-- `KeyEnrollment` present, `KeyAttestationState` absent → finish the enrollment: insert the state
-  row from the assessment the binding names (step 4). Issuance is refused (`attestation_required`)
-  until it exists, so no token is ever issued against a key whose state was not initialized.
-- Both present → a no-op success; re-registering the same key re-runs the transaction and changes
-  nothing.
-- `KeyEnrollment` absent → enrollment did not take; the client simply re-registers. Nothing partial
-  is left behind to clean up, because the binding is written first and is the thing that commits the
-  enrollment.
+- **Claim absent** → nothing took; the client simply re-registers. The claim is written first and is
+  what makes the assessment spoken-for, so nothing partial is left behind.
+- **Claim `pending`, `KeyEnrollment` absent** → the winning enroller crashed before binding. Only
+  the enroller holding the claim's `operationId` may finish (replay steps 4–6); any other enroller
+  reading this `attestation_id` is refused `assessment_already_enrolled`. A claim that is still
+  `pending` past `enrollmentClaimTimeoutSeconds` with no matching binding is reclaimable (the
+  original enroller is presumed dead) by the same `operationId` on retry, or expired by the
+  administrative path — it is never silently handed to a different client.
+- **Claim `pending`, `KeyEnrollment` present, `KeyAttestationState` absent** → finish the enrollment:
+  insert the state row from the assessment the binding names (step 5), then commit the claim
+  (step 6). Issuance is refused (`attestation_required`) until the state exists, so no token is ever
+  issued against a key whose state was not initialized.
+- **Claim `pending`, both present** → the state was initialized but the claim-commit did not land;
+  re-run step 6 (idempotent) to mark the claim `committed`.
+- **Claim `committed`** → a no-op success; re-registering the same key re-runs the transaction, sees
+  its own `operationId` on the claim, and changes nothing.
 
 Existing `ClientRegistrationType` scripts still run after the gate and can read
 `context.getAttestationAssessment()`.
 
 **Can one assessment enroll multiple clients?** **No.** An `affirming` pre-enrollment assessment for
-a key may initialize state for **exactly one** `(client_id, jkt)`: the first enrollment consumes it
-by creating the `KeyEnrollment` binding, and a second enrollment naming the *same* `attestation_id`
-for a *different* `client_id` is refused (`invalid_client_metadata`, `assessment_already_enrolled`).
-This prevents one appraisal from being fanned out to many client identities (which would let a
-single hardware check back several distinct agents). Re-attestation is cheap; each client enrolls
-with its own assessment. (A key legitimately appearing in two clients is out of scope and would
-itself require a fresh assessment per client.)
+a key may initialize state for **exactly one** `(client_id, jkt)`. This is enforced by the atomic
+claim keyed by `attestation_id` (step 1), not by a lookup: the first enrollment to insert a
+`KeyEnrollmentClaim` for the `attestation_id` wins, and any concurrent or later enrollment naming
+the *same* `attestation_id` for a *different* `client_id` fails the conditional insert and is refused
+(`invalid_client_metadata`, `assessment_already_enrolled`). Because uniqueness is decided by the
+write that conflicts rather than by read-then-insert, two simultaneous registrations cannot both
+succeed. This prevents one appraisal from being fanned out to many client identities (which would
+let a single hardware check back several distinct agents). Re-attestation is cheap; each client
+enrolls with its own assessment. (A key legitimately appearing in two clients is out of scope and
+would itself require a fresh assessment per client.)
 
 #### Adding or replacing a key uses the same transaction
 
-`updateClient` adds a key through the **same enrollment transaction** (steps 1–5 for the new
-`(client_id, jkt)`), so a replacement/rollover key gets its own `KeyEnrollment` binding and its own
-initialized `KeyAttestationState` — the assessment that justified it is never mutated, and the new
-key's authoritative state is initialized by the update's proof, exactly as at first enrollment. Each
-**newly added** key needs its own fresh `affirming` assessment (else `invalid_client_metadata`,
-`attestation_required_for_new_key`), and — outside the administrative recovery paths — the update
-must be **old-key-authorized**, i.e. signed by a proof over a key already trusted for the client, so
-only the current key holder can add or remove a key. Removing a key retires its `KeyEnrollment` and
-its `KeyAttestationState` (the evidence log entries remain). The full multiplicity, dual-key
-rollover, and destroyed-key / emergency recovery rules are section 9.9.
+`updateClient` adds a key through the **same enrollment transaction** (steps 1–6 for the new
+`(client_id, jkt)`, including the atomic `attestation_id` claim), so a replacement/rollover key gets
+its own `KeyEnrollment` binding and its own initialized `KeyAttestationState` — the assessment that
+justified it is never mutated, and the new key's authoritative state is initialized exactly as at
+first enrollment. A key replacement therefore requires **two distinct proofs**, each presented in a
+different part of the request and validated by `DpopService`:
+
+- **New-key proof (initializes the added key).** A DPoP proof **over the key being added** (`K_new`),
+  carried as the `DPoP` header on the `updateClient` request exactly as at first enrollment:
+  `htm=POST`, `htu=<register/configuration endpoint>`, fresh `iat`, unseen `jti`, and a `jwk` whose
+  thumbprint equals the new key's `attested_jkt`. This is step 2 of the enrollment transaction for
+  `(client_id, jkt_new)`; it proves possession of `K_new` and authorizes initializing its state.
+  Each newly added key also needs its own fresh `affirming` assessment (else
+  `invalid_client_metadata`, `attestation_required_for_new_key`).
+- **Old-key authorization (authorizes the mutation).** Separately, the `updateClient` operation
+  itself must be **old-key-authorized**: a proof over a key **already trusted for the client**
+  (`K_old`), demonstrating that the current key holder sanctions the change. This is the
+  authentication on the configuration request — either the DPoP proof binding the
+  registration-management access token to `K_old` (`htm`/`htu`/`iat`/`jti` as above, plus the `ath`
+  claim over the access token), or, for clients using `private_key_jwt`, a `private_key_jwt`
+  client assertion signed by `K_old`. Without it the update is refused; only the current key holder
+  can add or remove a key.
+
+Outside the administrative recovery paths (destroyed/compromised `K_old`, §9.9) both proofs are
+mandatory. Removing a key retires its `KeyEnrollment` and its `KeyAttestationState` (the evidence log
+entries remain, and its `KeyEnrollmentClaim` stays as the record that its assessment was consumed).
+The full multiplicity, dual-key rollover, and destroyed-key / emergency recovery rules are section
+9.9.
 
 **At `/token`** (section 10.4).
 
@@ -1607,6 +1644,7 @@ retention clock, and the two never share a timer.
 | `agentExpiryAction` | `suspend` | Whether reaching `agentExpiresAt` moves the client to `suspended` or `decommissioned` |
 | `clientTombstoneAfterSeconds` | — (long) | Retention window after `decommissioned` before the client is reduced to a `tombstoned` identity marker; the `client_id` stays reserved forever |
 | `attestationRetentionSeconds` | — (long) | How long an expired/superseded `AttestationAssessment` and its stored verifier result are kept for historical verification; it sets the row's `retentionExpiresAt` ORM TTL (`appraisedAt + this`), which is the **only** deletion clock — distinct from `expiresAt`, the read-time authorization-validity comparison that stops issuance (§9.7) |
+| `enrollmentClaimTimeoutSeconds` | 300 | How long a `pending` `KeyEnrollmentClaim` with no matching `KeyEnrollment` binding is held before it is reclaimable on retry by the same `operationId` or expirable by the administrative path; a claim is never silently reassigned to a different client (§9.5) |
 
 ## 10. JWT-SVID issuance at `/token`
 
@@ -3349,7 +3387,7 @@ in the cited section.
 | Proof of possession of `K` gates negative-verdict supersession; an anonymous negative verdict is evidence (`supersedesEligible=false`) but never reaches issuance state, so it cannot deny service | §9.3, §10.4 |
 | Single authoritative `KeyAttestationState` row per `(client_id, jkt)` with **two orders**: a monotonic `revision` orders *writes* (CAS), and a per-key `appraisalGeneration` (stamped at challenge issuance) orders *evidence* — a state write lands only if its evidence generation is strictly newer, so a stale `affirming` can never overwrite a newer `contraindicated`. Issuance commits under the `revision` CAS; expired state is a read-time check, not deletion | §9.3, §9.7, §10.4 |
 | Default mode (`attestationRequireFreshPerIssuance=false`) commits on a read-check, so **plural** already-authorized in-flight issuances can complete after a rejection; stated exposure, bounded by SVID TTL. The flag (or a `critical` tier) collapses it to one via a mutating consume-CAS. Authorized / persisted / evidenced are three ordered points; a rejection governs only issuances not yet past the first | §10.4, §11.3 |
-| Enrollment is an explicit idempotent transaction that **initializes** the first `KeyAttestationState` for a key — authorized by the DCR DPoP proof over `K`, not by the assessment's `supersedesEligible` (which only governs *overwriting* an existing client's state). The pre-enrollment assessment is left immutable; the client↔key↔assessment link is a separate `KeyEnrollment` binding, never a mutation of the evidence row. One assessment enrolls exactly one client. Adding a replacement key uses the same transaction | §9.5, §9.7, §10.4 |
+| Enrollment is an explicit idempotent transaction that **initializes** the first `KeyAttestationState` for a key — authorized by the DCR DPoP proof over `K`, not by the assessment's `supersedesEligible` (which only governs *overwriting* an existing client's state). The pre-enrollment assessment is left immutable; the client↔key↔assessment link is a separate `KeyEnrollment` binding, never a mutation of the evidence row. One assessment enrolls exactly one client, enforced by an **atomic `KeyEnrollmentClaim` keyed by `attestation_id`** (insert-conditioned-on-absence — concurrent same-`attestation_id` enrollers race on one insert, not a lookup). A replacement key uses the same transaction and requires **two proofs**: a new-key DPoP proof over the added key and old-key authorization of the `updateClient` mutation | §9.5, §9.7, §10.4 |
 | Authorization lifetime is separate from evidence lifetime: `expiresAt` bounds issuance; `retentionExpiresAt` (the only deletion TTL) keeps evidence for `attestationRetentionSeconds` | §9.7, §9.9 |
 | A client may hold up to `clientMaxAttestedKeys` attested keys; rotation is old-key-authorized; destroyed/compromised keys use an administrative re-enrollment/revocation path (`IDENTITY_ROTATED`) | §9.9 |
 | Client lifecycle `active → suspended → decommissioned → tombstoned`, consulted on every `/token`; `client_id` never recycled; owner transfer is an attributed admin action | §9.9, §10.2 |
@@ -3520,7 +3558,8 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **`K`** | The agent's hardware keypair — the durable credential; its private half never leaves the secure element (§5). |
 | **`AttestationAssessment` (`attestation_id`)** | An immutable, append-only evidence-log entry: one attestation verdict as appraised at a point in time. Never mutated; not read for issuance (§9.7). |
 | **`KeyAttestationState`** | The **single authoritative row per `(client_id, jkt)`**, carrying the current verdict and a monotonic `revision`. **Initialized** by the enrollment transaction (authorized by the DCR proof over `K`); thereafter **overwritten** only by a supersession-eligible verdict under CAS; issuance reads it, and the `revision` CAS serializes rejection against in-flight issuance (§9.5, §9.7, §10.4). |
-| **`KeyEnrollment`** | The separate binding `(clientId, jkt) → attestationId` created at enrollment, recording which client+key the assessment justified — kept outside the immutable `AttestationAssessment` so evidence is never mutated. One assessment enrolls one client (§9.5). |
+| **`KeyEnrollment`** | The separate binding `(clientId, jkt) → attestationId` created at enrollment, recording which client+key the assessment justified — kept outside the immutable `AttestationAssessment` so evidence is never mutated (§9.5). |
+| **`KeyEnrollmentClaim`** | The **atomic uniqueness mechanism** for enrollment: a row keyed by `attestation_id` (not `(clientId, jkt)`), inserted conditioned on absence as step 1 of the enrollment transaction. It is the single serialization point that makes "this assessment is spoken for" a write that one and only one enroller can win, so concurrent registrations naming the same `attestation_id` for different clients cannot both succeed. Carries `operationId` for crash-retry and a `pending`/`committed` state (§9.5). |
 | **`supersedesEligible`** | Whether a verdict may **overwrite** an existing client's authoritative `KeyAttestationState` — true only with proof of possession of `K`. It does **not** govern enrollment **initialization** of a key's first state, which the DCR proof authorizes instead; a non-eligible verdict is evidence only and can never overwrite state or block issuance (§9.3, §9.5, §10.4). |
 | **`appraisalGeneration`** | A strictly monotonic per-key number stamped on each challenge, carried to the assessment and state row. It orders *evidence* (which appraisal is newer), as distinct from `revision` which orders *writes*. A state overwrite lands only with a strictly newer generation, so a slow stale appraisal cannot restore approval over a newer rejection (§9.3, §10.4). |
 | **`revision` vs `appraisalGeneration`** | Two orders on `KeyAttestationState`: `revision` serializes concurrent *writes* (the CAS token); `appraisalGeneration` is the precedence of the *evidence* a write carries. Both are needed — CAS alone orders writes but not which evidence should win (§10.4). |

@@ -24,6 +24,7 @@ its guarantee as proven until its tests pass on every backend.
 | Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
 | Q13 — fenced verifier worker | a fenced worker never records a verdict | stale-worker insertion after fencing |
 | Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
+| Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -203,8 +204,9 @@ EAT shape it would take.
 
 ## Q10. Enrollment had no complete transition into authoritative state
 
-**Status: partially resolved** — enrollment transaction specified (§9.5); guarantee pending the
-first-enrollment-init and enrollment crash-point tests.
+**Status: partially resolved** — enrollment transaction specified (§9.5), including the atomic
+`attestation_id` claim that enforces one-assessment-one-client (Q15); guarantee pending the
+first-enrollment-init, concurrent-enrollment, and enrollment crash-point tests.
 
 **Raised.** A pre-enrollment attestation has no `client_id` and requires no DPoP, so it is
 `supersedesEligible=false`; but only a `supersedesEligible=true` assessment could populate
@@ -213,14 +215,17 @@ issue. Separately, DCR said to set `clientId` on the assessment while §9.7 said
 immutable (a direct contradiction).
 
 **Change (§§9.5, 9.7, 10.4).** Enrollment is now an explicit, idempotent **enrollment transaction**:
-(1) verify the `/register` DPoP proof against the assessed key; (2) leave the assessment
-**immutable** — no `clientId` back-fill; (3) create a separate **`KeyEnrollment`** binding
-`(clientId, jkt) → attestationId`; (4) **initialize** `KeyAttestationState(clientId, jkt)` at
-`revision = 0`, authorized by the DCR proof rather than by `supersedesEligible`; (5) record the
-client attribute and emit the enrollment TRACE record. `supersedesEligible` now governs only
-*overwriting* an existing client's state, not *initializing* a key's first state; the write-side CAS
-table gained a distinct enrollment-initialization row. One assessment enrolls exactly one client
-(`assessment_already_enrolled` otherwise), and adding a replacement key reuses the same transaction.
+(1) atomically **claim** the assessment via a `KeyEnrollmentClaim` keyed by `attestation_id`
+(insert-conditioned-on-absence, the uniqueness point — see Q15); (2) verify the `/register` DPoP
+proof against the assessed key; (3) leave the assessment **immutable** — no `clientId` back-fill;
+(4) create a separate **`KeyEnrollment`** binding `(clientId, jkt) → attestationId`; (5)
+**initialize** `KeyAttestationState(clientId, jkt)` at `revision = 0`, authorized by the DCR proof
+rather than by `supersedesEligible`; (6) commit the claim, record the client attribute, and emit the
+enrollment TRACE record. `supersedesEligible` now governs only *overwriting* an existing client's
+state, not *initializing* a key's first state; the write-side CAS table gained a distinct
+enrollment-initialization row. One assessment enrolls exactly one client — enforced by the atomic
+claim, not a lookup (`assessment_already_enrolled` for a losing concurrent enroller) — and adding a
+replacement key reuses the same transaction (Q15).
 
 ## Q11. Attestation ordering needs rules beyond CAS
 
@@ -309,6 +314,32 @@ are persisted on the outbox entry before delivery and re-sent **byte-identically
 (so a `409` content-mismatch cannot arise from a retry). An optional **signed intent object** is
 defined as a separate, distinctly-typed artifact for deployments that want an attempt-time
 signature — never the record's signature, and not emitted in v1.
+
+## Q15. "One assessment enrolls one client" had no atomic mechanism; key replacement under-specified
+
+**Status: partially resolved** — atomic claim and the two replacement proofs specified (§9.5);
+guarantee pending the concurrent-same-`attestation_id` enrollment and enrollment crash-point tests.
+
+**Raised.** The enrollment transaction asserted that a second enrollment naming the same
+`attestation_id` for a different `client_id` is refused, but the `KeyEnrollment` binding was keyed
+by `(clientId, jkt)`, so two concurrent registrations with the same `attestation_id` but different
+client IDs would create two distinct bindings — neither insert conflicts, and a lookup of "already
+enrolled?" followed by an insert is not atomic under concurrency. Separately, key replacement said
+it both *reuses the enrollment transaction* (which demands a proof from the **new** key) and must be
+*old-key-authorized* (a proof from the **old** key), without specifying both proofs or their formats.
+
+**Change (§9.5).** Enrollment now begins with an atomic claim: a **`KeyEnrollmentClaim`** keyed by
+`attestation_id` (not `(clientId, jkt)`), inserted **conditioned on absence** as step 1, is the
+single serialization point — concurrent enrollers naming the same `attestation_id` race on one
+insert and exactly one wins; the loser is refused `assessment_already_enrolled` by the conflicting
+write, not by a stale lookup. The claim carries an `operationId` (so only the original enroller can
+complete a crashed transaction) and a `pending`/`committed` state (the durable recovery marker);
+recovery is re-specified across claim → `KeyEnrollment` → `KeyAttestationState` → claim-commit. Key
+replacement now names **two distinct proofs** with formats: a **new-key DPoP proof** over the added
+key (`htm=POST`/`htu`/`iat`/`jti`, `jwk` thumbprint = `attested_jkt`, carried as the request's
+`DPoP` header) that initializes the added key's state, and **old-key authorization** of the
+`updateClient` mutation (a DPoP proof over a currently-trusted key with the `ath` claim, or a
+`private_key_jwt` assertion signed by the old key), both validated by `DpopService`.
 
 ## Later review rounds
 
