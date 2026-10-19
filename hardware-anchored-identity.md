@@ -1250,6 +1250,7 @@ share both fields), is gone.
 | `attestationChallengeMaxRetries` | 3 | `processing → pending` transitions allowed per challenge (9.3c) |
 | `attestationProcessingLeaseSeconds` | 30 | Lease a node holds on a `processing` challenge |
 | `traceExecutionMaxAgeSeconds` | 86400 | Open-execution lifetime (section 3) |
+| `idJagDelegationMaxLifetimeSeconds` | 3600 | Maximum time an agent may keep issuing SVIDs against one human delegation, independent of SVID renewal (§10.8); `delegationExpiresAt = min(openedAt + this, ID-JAG exp)` and is never extended by a renewal |
 | `traceOutboxMaxEntries` / `traceOutboxMaxAgeSeconds` | 100000 / 604800 | Outbox bounds (11.3) |
 | `traceOutboxFullPolicy` | `fail-closed` | `fail-closed` or `fail-open` when the outbox is full |
 | `traceCheckpointIntervalSeconds` | 300 | Idle checkpoint record cadence per producer chain (11.1) |
@@ -1446,6 +1447,8 @@ In `TokenRestWebServiceImpl.requestAccessToken()` after `validateGrantType`, whe
 | DPoP key not a registered key (10.3) | `400 invalid_dpop_proof` |
 | Client `agentLifecycleState` not `active` (suspended / decommissioned / tombstoned, or past `agentExpiresAt`) — see section 9.9 | `403 client_suspended` / `403 client_decommissioned` |
 | No fresh affirming assessment for `(client_id, dpopJkt)` (10.4) | `400 attestation_required` |
+| A presented `txn` names an execution not bound to this grant: wrong client, wrong `execution_authority`, or a principal/delegation that does not match the opener (§10.8) | `400 invalid_grant` (`execution_binding_mismatch`) |
+| A presented `txn` is bound correctly but its delegation has expired (`now >= delegationExpiresAt`, §10.8), even if SVIDs would still be in lifetime | `400 invalid_grant` (`delegation_expired`) |
 
 `resource` is read with `request.getParameterValues("resource")` (as `TokenExchangeService` does)
 and carried on `ExecutionContext` (new `List<String> resources`).
@@ -1662,7 +1665,7 @@ parties receive a value they can use to correlate the human across services.
 | `iat`, `nbf`, `exp` | from `accessToken`; lifetime per 10.6 | |
 | `jti` | `context.getTokenReferenceId()` | |
 | `cnf.jkt` | `context.getDpop()` | always present here |
-| `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` is the ID-JAG's execution id for a JWT-bearer grant; otherwise the `txn` request parameter when it names an open execution of this `client_id`; otherwise freshly minted. `execution_authority` is this server's configured authority (its issuer by default). Both are returned in the token response so renewals reuse them. | *Role:* the authoritative correlation binding PDP/PEP read. *Rule:* the two MUST travel together — one pair per execution, not per token. *Disclosure (§10.10):* raw only to a same-domain audience; a cross-domain audience gets a pairwise/opaque reference, never the global id. |
+| `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` is the ID-JAG's execution id for a JWT-bearer grant; otherwise the `txn` request parameter when it names an open execution this grant is **bound to** — same client, same execution authority, same principal/delegation, and inside the delegation-validity window (§10.8); otherwise freshly minted. `execution_authority` is this server's configured authority (its issuer by default). Both are returned in the token response so renewals reuse them. | *Role:* the authoritative correlation binding PDP/PEP read. *Rule:* the two MUST travel together — one pair per execution, not per token. A presented `txn` that fails the §10.8 binding is `invalid_grant` (`execution_binding_mismatch`), never silently re-minted as a fresh execution. *Disclosure (§10.10):* raw only to a same-domain audience; a cross-domain audience gets a pairwise/opaque reference, never the global id. |
 | `txn` | Same value as `execution_id`, kept for the existing transaction-token machinery. | An application alias for `execution_id`, not a separate correlation key. Shares the execution id's per-audience disclosure rule (§10.10). |
 | `attestation` | The assessment that satisfied 10.4 — the hardware state the token was issued under. | *Disclosure (§10.10):* default is `status`-only (`{status, appraised_at}`). `platform` / `measurement` / `policy_version` / `id` go only to an audience whose profile is `full`, since raw measurements are fingerprinting material. |
 | `delegation` | *Contains:* `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` (the ID-JAG token-type URI), and `credential_id` (the ID-JAG `jti`). Omitted for pure `client_credentials`. | *Role:* ties the human to the agent inside the token. *Why not `act`:* RFC 8693 `act` names the *current actor* acting for `sub` (that would read as "Alice acts for the agent"), and `may_act` names a party allowed to *become* an actor — neither means "the principal who delegated." So the SPIFFE agent stays `sub`, and the delegator is a separate, explicit reference to the credential that carried the delegation. *Disclosure (§10.10):* omitted unless the audience opts in; `principal_sub` is **pairwise** per `(audience, human)` unless the audience is authorized for the raw subject, so unrelated RPs cannot correlate the human. The raw identity otherwise lives only in access-controlled TRACE evidence, resolved by `sid`. |
@@ -1699,17 +1702,55 @@ that did not supply an execution learns the pair it is in and reuses both on ren
 
 `IdJagService` stamps the canonical correlation pair on every ID-JAG it issues — the
 `https://jans.io/trace/execution_id` claim (fresh unless the exchange request carries `txn` /
-`execution_id` naming an open execution of the same client) and
+`execution_id` naming an open execution this exchange is bound to: same client, same
+`execution_authority`, same principal as the exchange's own subject, and inside the
+delegation-validity window — the §10.8 binding, not merely the same client) and
 `https://jans.io/trace/execution_authority` (this server's configured authority), with `txn` set to
 the same execution-id value as the compatibility alias. The two claims travel together. This puts
 the human's login at the root of the execution: the ID-JAG `jti` appears in `tokens[]` and its
 `sub` in `subject.human_sponsor` of every later record.
 
 Open executions are tracked in a small persistent registry (`jansTraceExecution`: `txn`,
-`clientId`, `principal`, `sid`, `sessionIssuer`, `acr`, `amr`, `openedAt`, `expiresAt`, `closed`)
-so that `/token` can validate a presented `txn` (same client, not closed, not expired) and so that
-an auditor can list executions per client. Entries expire by ORM TTL at
-`traceExecutionMaxAgeSeconds`.
+`clientId`, `principalIss`, `principalSub`, `delegationCredentialId`, `executionAuthority`, `sid`,
+`sessionIssuer`, `acr`, `amr`, `authTime`, `openedAt`, `expiresAt`, `delegationExpiresAt`,
+`closed`) so that an auditor can list executions per client and so that `/token` can validate a
+presented `txn` — and the validation is **not** merely "same client."
+
+**Why "same client" is not enough.** A single `client_id` can be a *shared, multi-tenant agent*
+serving many humans. If continuing an execution required only that the presented `txn` belongs to
+this `client_id`, then any request from that agent — carrying a **different** human's ID-JAG, or no
+human at all — could continue an execution a different human opened. Attribution would then be a
+lie: the records on that execution name the opener's `human_sponsor`, but the continuation acted for
+someone else. So continuation of a human-rooted execution requires a **consistent principal,
+delegation, and authority binding**, not just a client match. `/token` accepts a presented `txn`
+only when **all** of these hold (otherwise `invalid_grant`, `execution_binding_mismatch`):
+
+| Must match the registry entry | Against | Why |
+|-------------------------------|---------|-----|
+| `clientId` | the requesting client | The agent is the one that opened it |
+| `executionAuthority` | this server's configured authority | An execution id is only meaningful under the authority that minted it; a `txn` from another authority is not this execution |
+| `principalIss` + `principalSub` | the delegation of the **current** grant (the presenting ID-JAG's `iss`/`sub`), compared on the *raw* subject, not a pairwise alias | The human continuing the execution must be the human who opened it |
+| `delegationCredentialId` | the presenting ID-JAG `jti`, **or** a renewal within the same `sid` + `sessionIssuer` + unbroken delegation chain (below) | Ties the continuation to the same delegation act, not merely the same person re-authenticating into an unrelated session |
+| execution not `closed`, `now < expiresAt`, **and `now < delegationExpiresAt`** | the registry entry | Freshness, and the delegation-validity bound below |
+
+A `client_credentials` (no-human) grant may continue only a `client_credentials`-opened execution
+(both `principalSub` null); it can never continue a human-rooted one, and a human-delegated grant
+can never continue a `client_credentials` execution. Mixing the two is `execution_binding_mismatch`.
+
+**Delegation validity is bounded independently of token renewal.** An SVID is short-lived and
+renewed often; the *delegation* behind it must not become immortal just because the agent keeps
+minting fresh SVIDs against the same open execution. The registry records `delegationExpiresAt` =
+`min(openedAt + idJagDelegationMaxLifetimeSeconds, the ID-JAG's own exp)` at the time the execution
+is opened (and it is **never extended by an SVID renewal**). Once `now >= delegationExpiresAt`,
+`/token` stops issuing against that execution with `invalid_grant`, `delegation_expired`, even if
+individual SVIDs would still be inside their own lifetime and the execution's
+`traceExecutionMaxAgeSeconds` has not elapsed. Continuing requires a **fresh human delegation** (a
+new ID-JAG from a current authentication), which opens a new execution (or, where policy allows
+continuation across re-authentication, refreshes `delegationExpiresAt` only when the new ID-JAG
+carries the same `principalIss`/`principalSub` and `sid`). This makes "how long may an agent keep
+acting for a human on one delegation" an explicit, policy-set bound rather than an emergent
+property of token TTLs. Entries expire by ORM TTL at `traceExecutionMaxAgeSeconds`;
+`delegationExpiresAt` is the stricter, delegation-scoped bound inside that window.
 
 ### 10.9 Human assurance: establish it, don't just correlate it
 
@@ -1719,22 +1760,34 @@ posture (sections 9, 15) and the human's authentication strength are **independe
 and this plan must not let a strong hardware binding paper over a weak human login. Three things
 make the human side explicit.
 
-**1. A configurable human-assurance policy, phishing-resistant by default.** The ID-JAG is only
-issued when the subject token's authentication meets a configured bar. Following AIMS §10.4.1
-("Users SHOULD be authenticated using phishing-resistant authentication mechanisms such as a
-passkey"), the default bar requires a phishing-resistant `amr` (a WebAuthn/passkey method), and an
-operator may set a minimum `acr` and an allowed `amr` set per deployment or per capability risk
-tier:
+**1. A configurable human-assurance policy, phishing-resistant by default — with no assumption that
+`acr` values are ordered.** The ID-JAG is only issued when the subject token's authentication meets
+a configured bar. Following AIMS §10.4.1 ("Users SHOULD be authenticated using phishing-resistant
+authentication mechanisms such as a passkey"), the default bar requires a phishing-resistant `amr`
+(a WebAuthn/passkey method).
+
+The subtle point is **`acr` has no universal ordering.** An `acr` is an opaque, issuer-defined
+string (an authentication-context-class *reference*); `"2"` from one IdP is not "stronger than"
+`"1"` from another, and `"urn:...:loa3"` and `"phr"` are not comparable at all. A `idJagMinAcr`
+"floor" compared with `>=` is therefore meaningless across issuers. Instead the policy maps each
+**trusted issuer's** `acr` (and/or `amr`) values to a small, server-defined **assurance level** via
+`idJagAssuranceMappings`, and the gate compares *that*:
 
 | Property | Default | Meaning |
 |----------|---------|---------|
 | `idJagRequirePhishingResistant` | `true` | The subject token's `amr` must include a phishing-resistant method (passkey / WebAuthn) for the ID-JAG to issue |
-| `idJagMinAcr` | — | Minimum achieved `acr` the subject authentication must carry |
+| `idJagAssuranceMappings` | — | Per-issuer map from the issuer's `acr`/`amr` values to a server assurance level (e.g. `low` / `substantial` / `high`). Keyed by the subject token's `iss`; an issuer with no mapping is treated as `unknown` → below any floor |
+| `idJagMinAssuranceLevel` | `substantial` | The minimum *mapped* level the subject authentication must reach; compared on the server's own ordered levels, never on raw `acr` strings |
 | `idJagAllowedAmr` | — | Allowed `amr` values; empty means "any that satisfies `idJagRequirePhishingResistant`" |
 
-A subject token that does not meet the bar is refused the ID-JAG (`invalid_grant`,
-`human_assurance_insufficient`), so a human-delegated execution cannot start under an authentication
-weaker than policy — the gate is at delegation time, not discovered later at audit.
+So a deployment that trusts two IdPs declares, per issuer, which of *their* `acr`/`amr` values count
+as `substantial` or `high`; the comparison is then over the server's own ordered levels, which do
+have a defined order, rather than over the issuers' incomparable strings. A subject token whose
+issuer is unmapped, or whose mapped level is below `idJagMinAssuranceLevel`, or that fails the
+phishing-resistance or `amr` check, is refused the ID-JAG (`invalid_grant`,
+`human_assurance_insufficient`) — the gate is at delegation time, not discovered later at audit. The
+raw `acr`/`amr`/`iss` and the **mapped level** are both recorded (item 2), so an auditor sees both
+what the issuer asserted and how this deployment graded it.
 
 **2. The achieved assurance is carried and recorded, not inferred.** The ID-JAG carries the
 subject authentication's `acr`, `amr`, and `auth_time`, and the `sid` (OIDC session id) and session
@@ -1746,15 +1799,26 @@ session identifier an `id_token` carries, so the execution ties to a **specific 
 session**, and a later `AUTHENTICATION_EVENT` / `FIDO_CEREMONY` for that `sid` (the Auth Server and
 FIDO Server producers) resolves *which ceremony, with which authenticator* established it.
 
-**3. Synced vs device-bound passkeys are materially different, and the distinction is preserved.**
-Jans FIDO supports hardware security keys, platform authenticators, and **synchronized** passkeys
-(`research/fido-docs.txt`), and a synced passkey (copied across a vendor cloud) carries weaker
-device-binding assurance than a device-bound authenticator. This plan does not collapse them: the
-`amr`/`acr` and the referenced `FIDO_CEREMONY` carry the authenticator properties
-(`authenticator_attachment`, and — in the FIDO full design — attestation/MDS trust detail), so a
-high-risk capability's policy can demand a device-bound or enterprise-attested authenticator while a
-low-risk one accepts a synced passkey. The grading is the verifier's / PDP's to apply from the
-recorded facts; this plan's job is to carry them honestly, never to assert "MFA" generically.
+**3. Synced vs device-bound passkeys are materially different, and the distinction is drawn from the
+right signal.** Jans FIDO supports hardware security keys, platform authenticators, and
+**synchronized** passkeys (`research/fido-docs.txt`), and a synced passkey (copied across a vendor
+cloud) carries weaker device-binding assurance than a device-bound authenticator. The common mistake
+is to infer this from `authenticator_attachment` (`platform` vs `cross-platform`) — but **that field
+does not say whether a credential is synchronized.** A `platform` authenticator can hold a synced
+passkey, and a `cross-platform` security key can be device-bound; attachment describes *how the
+authenticator connects*, not *whether the private key is replicated to a cloud*.
+
+The signal that actually distinguishes them is the WebAuthn **backup eligibility (BE)** and **backup
+state (BS)** flags in the authenticator data (WebAuthn Level 3, §6.1): `BE=1` means the credential
+*may* be backed up / synchronized (it is a multi-device/"passkey" credential), and `BS=1` means it
+*currently is* backed up. A single-device, hardware-bound credential has `BE=0`. So this plan
+carries, on the `FIDO_CEREMONY` evidence and in what the policy reads, the **BE/BS** flags (plus, in
+the FIDO full design, attestation/MDS trust detail) — not `authenticator_attachment` as a proxy. A
+high-risk capability's policy can then demand `BE=0` (device-bound) or enterprise-attested
+authenticators while a low-risk one accepts `BE=1`/`BS=1` synced passkeys. The grading is the
+verifier's / PDP's to apply from the recorded BE/BS and attestation facts; this plan's job is to
+carry them honestly, never to assert "MFA" generically or to read sync-state off the wrong field.
+(`authenticator_attachment` is still recorded as context, but it is not the sync signal.)
 
 **What is in scope here vs. deferred to the companions.** This plan establishes and records the
 human-assurance *inputs* at delegation: the policy gate, the `acr`/`amr`/`auth_time`, and the
@@ -2509,7 +2573,8 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `TraceExecutionRegistryTest` | open / validate / close; foreign `client_id` refused; expiry |
 | `AbstractAuthorizationGrantTest` (extend) | SVID lifetime source, cap, key-regeneration interaction |
 | `IntrospectionWebServiceTest` (extend) | SPIFFE `sub`, `cnf`, `txn`, `attestation`, `delegation` |
-| `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or when `acr` is below `idJagMinAcr`, or `amr` is outside `idJagAllowedAmr`; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry |
+| `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or `amr` is outside `idJagAllowedAmr`; **issuer-specific assurance, no acr ordering:** the gate maps the subject token's `(iss, acr/amr)` through `idJagAssuranceMappings` to a server level and compares against `idJagMinAssuranceLevel` — raw `acr` strings are **never** compared with `>=`; an unmapped `iss` is `unknown` and refused; the same `acr="2"` passes under one issuer's mapping and fails under another's; both the raw `acr`/`amr`/`iss` **and** the mapped level are recorded; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry; **sync signal:** the recorded authenticator facts carry WebAuthn `BE`/`BS`, and a policy demanding `BE=0` rejects a `BE=1` synced passkey even when `authenticator_attachment=platform` (attachment is not read as the sync signal) |
+| `TraceExecutionBindingTest` | **execution-continuation binding (§10.8):** a presented `txn` is accepted only when `clientId`, `executionAuthority`, and the raw `principalIss`/`principalSub` all match the registry entry and the execution is open/unexpired; a second human's grant (or a `client_credentials` grant) presenting another human's `txn` is refused `execution_binding_mismatch` — a shared multi-tenant agent cannot continue another human's execution; a `client_credentials` grant cannot continue a human-rooted execution and vice versa; **delegation lifetime:** issuance against an execution stops at `delegationExpiresAt` (`delegation_expired`) even while SVIDs are inside their own lifetime and `traceExecutionMaxAgeSeconds` has not elapsed, and `delegationExpiresAt` is **not** extended by an SVID renewal |
 | `TraceRecordBuilderTest` | envelope; **canonicalization, signature, and `content_digest` are byte-identical to `jans-trace-core`'s normative vectors** (run the shared vectors through this producer's path and assert equality with the Rust/Lock output — the cross-language conformance bar); signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); records carry `eat_profile: tag:jans.io,2026:trace-v1` only; no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
 | `TraceChainStateTest` | **append protocol (§11.3):** two concurrent writers computing the same sequence — exactly one unique-insert survives, the loser re-reads the tail and retries at the next position (no duplicate `(producer_id, chain_id, sequence_number)`, no fork); tail CAS loser that already inserted keeps its valid record; `prev_record_hash` links; zero hash first; **fence:** a stale-`epoch` writer's tail CAS is rejected, not forked onto the chain; tail rebuilt from the outbox's highest sequence after loss and `epoch` bumped; retry cap exhaustion → `evidence_unavailable` / `fail-open` path; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
 | `TraceEmitterTest` | **hold-until-commit (§11.3):** a `staged` entry is **never posted**; only `committed` entries are delivered; the `staged → committed` flip follows a confirmed entity + `IssuanceLog` write on every backend (and, where a deployment wraps steps 2–4 in a native SQL/Couchbase transaction, the flip coincides with commit); **crash recovery:** a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an **absent** `IssuanceLog` is `voided` and never delivered (no false success); inline mode posts after the commit point, never before; outbox retry; `202` and idempotent-replay both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
@@ -2898,13 +2963,27 @@ resolution.
   the global `trace_execution_id` — aligning with AIMS §10.9 and `design.md`'s privacy-preserving
   cross-domain correlation. The raw human identity otherwise lives only in access-controlled TRACE
   evidence, resolved by `sid` (section 10.10).
-- **Human assurance is gated and recorded, not just correlated.** The ID-JAG issues only when the
-  subject authentication meets a configurable bar — phishing-resistant (passkey/WebAuthn) by
-  default per AIMS §10.4.1, with optional `acr`/`amr` floors (`idJagRequirePhishingResistant`,
-  `idJagMinAcr`, `idJagAllowedAmr`). The achieved `acr`/`amr`/`auth_time` and the `sid` are carried
-  into `human_sponsor` and the execution, so the execution ties to a specific browser session; the
-  signed `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` evidence and human credential recovery/revocation
-  are the Auth/FIDO companion producers' deferred work, correlated back by `sid` (section 10.9).
+- **Human assurance is gated and recorded, not just correlated — and not on false signals.** The
+  ID-JAG issues only when the subject authentication meets a configurable bar: phishing-resistant
+  (passkey/WebAuthn) by default per AIMS §10.4.1, plus a **mapped** assurance floor. Because `acr`
+  is an opaque issuer-specific string with no universal ordering, the gate does **not** compare raw
+  `acr` with `>=`; it maps each trusted issuer's `acr`/`amr` to a server assurance level
+  (`idJagAssuranceMappings`) and compares that against `idJagMinAssuranceLevel`
+  (`idJagRequirePhishingResistant`, `idJagAllowedAmr` complete the bar). Synced-vs-device-bound is
+  read from WebAuthn **BE/BS** backup flags, **not** from `authenticator_attachment` (which does not
+  indicate synchronization). The raw `acr`/`amr`/`iss`, the mapped level, `auth_time`, BE/BS, and
+  the `sid` are carried into `human_sponsor` and the execution; the signed
+  `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` evidence and human credential recovery/revocation are the
+  Auth/FIDO companion producers' deferred work, correlated back by `sid` (section 10.9).
+- **Continuing an execution requires a consistent principal/delegation/authority binding, not just
+  the same client.** A shared multi-tenant agent is one `client_id` for many humans, so matching
+  only `client_id` would let it continue another human's execution. `/token` accepts a presented
+  `txn` only when client, `execution_authority`, and the raw principal/delegation all match the
+  opener (`execution_binding_mismatch` otherwise), and `client_credentials` and human-rooted
+  executions can never cross (§10.8). **Delegation validity is bounded independently of token
+  renewal:** `delegationExpiresAt = min(openedAt + idJagDelegationMaxLifetimeSeconds, ID-JAG exp)`,
+  never extended by an SVID renewal, so an agent cannot keep acting for a human indefinitely by
+  minting fresh short-lived SVIDs (`delegation_expired` once it passes).
 - **The client (agent identity) has an explicit lifecycle, and evidence outlives authorization.**
   A client carries `agentLifecycleState` — `active` → `suspended` (reversible) → `decommissioned`
   (terminal for issuance, keys removed) → `tombstoned` (identity permanently reserved) — consulted
@@ -3293,6 +3372,10 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **Credential provisioning / posture assessment** | AIMS §8: credential issuance is the point posture is evaluated — modeled here as `CREDENTIAL_PROVISIONED` (§11.2). |
 | **WPT / HTTP Message Signature** | AIMS §9 application-layer proof-of-possession mechanisms; referenced for `workload_authentication` / `pop_binding` (Phase 3). |
 | **`human_sponsor` / `sid`** | The authenticated human behind an agent, and the OIDC session id that ties the execution to a browser session and a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` (§10.9). |
+| **`acr` / assurance mapping** | `acr` is an opaque, issuer-specific authentication-context reference with **no universal ordering**; the gate maps each trusted issuer's `acr`/`amr` to a server assurance level (`idJagAssuranceMappings`) and compares *that*, never raw `acr` with `>=` (§10.9). |
+| **WebAuthn BE / BS** | Backup Eligibility and Backup State flags (WebAuthn L3 §6.1): `BE=1` = the credential may be synced/backed up (a multi-device passkey), `BS=1` = currently backed up. The correct signal for synced-vs-device-bound — **not** `authenticator_attachment` (§10.9). |
+| **Delegation validity (`delegationExpiresAt`)** | The bound on how long an agent may keep issuing SVIDs against one human delegation, `min(openedAt + idJagDelegationMaxLifetimeSeconds, ID-JAG exp)`, independent of SVID renewal (§10.8). |
+| **Execution-continuation binding** | Continuing an open execution requires matching client, `execution_authority`, and raw principal/delegation — not just the same `client_id` — so a shared agent cannot continue another human's execution (§10.8). |
 
 ### GovOps / policy
 
