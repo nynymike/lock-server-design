@@ -7,22 +7,31 @@ document's numbered sections, which these entries point to. Keep new review roun
 document stays a clean specification rather than a running changelog.
 
 **Status legend.** Each item is **resolved** (the algorithm is specified *and* its guarantee is
-established by a passing test) or **partially resolved** (the algorithm is specified and the failure
+established by a passing test); **partially resolved** (the algorithm is specified and the failure
 behaviour is defined, but the guarantee depends on crash-point / concurrency fault tests that are
-not yet written or passing — see "Crash-point and concurrency fault tests" in the implementation
-appendix). A partially-resolved item is design-complete but not verification-complete; do not treat
-its guarantee as proven until its tests pass on every backend.
+not yet written or passing — design-complete, not verification-complete); or **algorithm
+incomplete** (the design does not yet fully pin the behaviour — e.g. the fencing / crash-recovery
+ordering is still being specified, so a test cannot yet be written against a settled algorithm).
+An **algorithm-incomplete** item is a stronger caveat than *partially resolved*: it is **not**
+design-complete, and its guarantee must not be treated as proven or even as test-ready. See
+"Crash-point and concurrency fault tests" in the implementation appendix. Do not treat any
+non-**resolved** guarantee as proven.
+
+**Items currently algorithm-incomplete** (behaviour not yet fully pinned, not merely untested):
+
+| Item | What is still open |
+|------|--------------------|
+| Q8 — staged-commit evidence durability (fencing + recovery) | the fence-then-resolve ordering, the paused-writer cancellation interaction with **Commit**, and the recovery drain across **Intake → Stage → Commit → Resolve-abort** are specified as a transition table (§11.3) but the cancellation/fence protocol and its recovery edges are still being nailed down; the guarantee is not yet reducible to a settled algorithm a test can pin |
+| Q13 — fenced verifier worker (fencing + recovery) | the epoch-guarded ordering of the assessment / `completed` / state-overwrite writes under lease loss, and the recovery that resolves partial states by `challenge_id`, are not yet a fully settled algorithm; the "a fenced worker never records a verdict" guarantee is design-incomplete, not merely untested |
 
 **Items currently partially resolved** (algorithm specified, tests pending):
 
 | Item | Guarantee awaiting test | Tests |
 |------|-------------------------|-------|
 | Q3 — single-row attestation state | a rejection is authoritative; no issuance resurrects an overwritten approval | delayed-positive-after-rejection; crash-point on the state write |
-| Q8 — staged-commit evidence durability | no persisted credential lacks evidence; no false-success record; absence never classified as abort; a paused writer cannot commit after recovery | crash-point between every durable write (issuance steps 2–5); paused-writer-resume-after-cancel; crash-mid-entity-transaction rolls back atomically → `aborted` |
 | Q10 — enrollment transaction | first-enrollment state initialization; idempotent redo | first-enrollment init; crash between `KeyEnrollment` and state init |
 | Q11 — evidence precedence / plural in-flight | stale positive never restores approval; bounded in-flight exposure | delayed-positive-after-rejection; plural-in-flight |
 | Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
-| Q13 — fenced verifier worker | a fenced worker never records a verdict | stale-worker insertion after fencing |
 | Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
@@ -145,10 +154,13 @@ concurrent claim gets `challenge_in_progress` without a fresh nonce; `completed`
 
 ## Q8. Evidence durability was only partially specified
 
-**Status: partially resolved** — algorithm and failure behaviour specified (§11.3), including the
-embedded per-operation commit receipt (Q16) and writer cancellation/fencing; guarantee pending the
-crash-point-between-every-durable-write, voided/aborted-middle-record, and
-paused-writer-resume-after-cancel tests.
+**Status: algorithm incomplete** — the §11.3 transition table specifies the happy path and the
+embedded per-operation commit receipt (Q16), but the **fencing and crash-recovery** parts are not
+yet a fully settled algorithm: the cancel-then-resolve ordering, the paused-writer cancellation
+interaction with **Commit**, and the recovery drain across **Intake → Stage → Commit → Resolve-abort**
+still need to be pinned before a test can assert the guarantee. Treat the durability guarantee as
+design-incomplete, not merely untested. (The narrower gapless-chain-under-abort claim is tracked
+separately as partially resolved.)
 
 **Raised.** Updating chain state and the outbox together prevents some chain failures but does not
 ensure every successful issuance has an evidence record unless issuance and evidence persistence
@@ -276,8 +288,11 @@ agent," just not which human or the delegation credential.
 ## Q13. A batch of precision fixes across attestation, delegation, privacy, and signing
 
 **Status: mostly resolved** — items (2)–(7) are specified and testable directly; item (1), the
-fenced verifier worker, is **partially resolved** pending the stale-worker-insertion-after-fencing
-crash test.
+**fenced verifier worker**, is **algorithm incomplete**: the epoch-guarded ordering of the
+assessment / `completed` / state-overwrite writes under lease loss, and the recovery that resolves
+partial states by `challenge_id`, are not yet a fully settled algorithm, so "a fenced worker never
+records a verdict" is design-incomplete rather than merely awaiting the
+stale-worker-insertion-after-fencing crash test.
 
 **Raised (seven items).** (1) §9.3c claimed a verdict and `completed` are "written in one operation"
 though challenge, assessment, state, and outbox are separate entities — and a verifier worker whose
