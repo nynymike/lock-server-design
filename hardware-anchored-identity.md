@@ -240,7 +240,7 @@ sequenceDiagram
 
     Note over Human,AS: ③ DELEGATE — when a human starts an execution (crosses a trust boundary)
     Human->>IdP: token exchange at the IdP AS: ID token → requested_token_type=id-jag,<br/>audience = op.example.org (the Resource AS), not the IdP itself
-    Note over IdP: ID-JAG draft: the IdP AS does NOT redeem its own ID-JAG;<br/>iss = idp.example.org, aud = op.example.org cross a trust (e.g. tenant) boundary
+    Note over IdP: ID-JAG draft: the IdP AS does NOT redeem its own ID-JAG —<br/>iss = idp.example.org, aud = op.example.org cross a trust (e.g. tenant) boundary
     IdP-->>Human: ID-JAG { iss: idp.example.org, sub: alice, aud: op.example.org,<br/>client_id: agent } — delegated access, NOT per-execution approval
     Human->>Agent: hand ID-JAG to the agent
 
