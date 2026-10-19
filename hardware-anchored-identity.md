@@ -2454,6 +2454,55 @@ signed by the **`jans-auth`** OP producer key (the two-role split above). The ke
 per record, so a `CREDENTIAL_PROVISIONED` can only be accepted under the `jans-svid-issuer` key and
 the bootstrap only under the `jans-auth` key.
 
+#### Outcome is part of the wire contract (success / aborted / indeterminate)
+
+Every journaled operation resolves to one of three outcomes (§11.3), and **each outcome is a signed
+record delivered at the operation's allocated sequence position** — a never-committed position is
+not dropped. The outcome is **not** a new `event_kind`; it is an `event.provisioning_outcome`
+discriminator on the *same* kind the success record uses, so the producer key authorization is
+unchanged per outcome. This matters for the two producers:
+
+- A failed **issuance, enrollment, or appraisal** emits its aborted/indeterminate record as a
+  `CREDENTIAL_PROVISIONED` under the **`jans-svid-issuer`** key — the same kind and key as its
+  success record.
+- A failed **bootstrap** emits its aborted/indeterminate record as an `EXECUTION_STARTED` under the
+  **`jans-auth`** key — **not** a `CREDENTIAL_PROVISIONED`. Emitting a `CREDENTIAL_PROVISIONED` for a
+  bootstrap would be rejected by Lock because the `jans-auth` key is not authorized for that kind
+  (the per-record scope above). The abort rule is therefore stated per producer, not as a single
+  hard-coded `CREDENTIAL_PROVISIONED` abort.
+
+`event.provisioning_outcome` takes `committed` (the default when absent, preserving the existing
+success shape), `aborted`, or `indeterminate`. The required fields differ by outcome:
+
+| `provisioning_outcome` | `event_kind` / producer | `credential_fingerprint` | `reason` | Other required fields |
+|------------------------|-------------------------|--------------------------|----------|-----------------------|
+| `committed` (success) | as in the table above | **present** (the provisioned credential) | absent | the success facts for that kind |
+| `aborted` | same kind/producer as the operation's success record (`CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, or `EXECUTION_STARTED`/`jans-auth` for a bootstrap) | **absent** (nothing was provisioned) | `not_committed` | `trace_execution_id`, `execution_authority`, `subject`, `sequence_number`, `prev_record_hash`, and the same `parent_record_ids` the success record would have carried |
+| `indeterminate` | same kind/producer as the success record | **absent** (commit could not be decided) | `witness_unavailable` | same as `aborted` |
+
+Two invariants make these validatable rather than free-form:
+
+1. **`credential_fingerprint` presence is tied to outcome.** `committed` MUST carry it; `aborted` and
+   `indeterminate` MUST NOT — a credential that was never (provably) provisioned has no fingerprint
+   to name. A validator rejects a `committed` record missing the fingerprint or an
+   `aborted`/`indeterminate` record that carries one.
+2. **`provisioning_outcome` ∈ `{committed, aborted, indeterminate}`** and the `reason` is constrained
+   per outcome (`aborted` ⇒ `not_committed`, `indeterminate` ⇒ `witness_unavailable`).
+
+**Lock compatibility is a confirmation item, not an assumption.** Lock "enforces event schemas" and
+validates "the complete TRACE schema and the `trace.event_kind` discriminated union" server-side
+(`jans-trace-core`, §4.1/§6.2 of the TRACE-core design); the core library checks only
+cryptographically-relevant structure. Adding `provisioning_outcome` and allowing an **absent
+`credential_fingerprint`** on `CREDENTIAL_PROVISIONED` / `EXECUTION_STARTED` is therefore a change
+Lock's per-kind schema must accept, even though **no new `event_kind` is introduced**. Before the
+demo this plan verifies against Lock's actual `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED`
+schema and validation rules that: (a) `provisioning_outcome` is an accepted member (or is added),
+(b) a record with an absent `credential_fingerprint` is accepted for `aborted`/`indeterminate` and
+not rejected as malformed, and (c) the producer-key scope rejects a bootstrap abort sent as
+`CREDENTIAL_PROVISIONED`. If Lock's current schema requires `credential_fingerprint` unconditionally,
+the compatibility gap is resolved by a Lock-side schema update (the appendix tracks this), never by
+fabricating a fingerprint for an operation that provisioned nothing.
+
 | Event | `event_kind` | Producer | Signed facts | Credential / tokens | `subject` + scope |
 |-------|--------------|----------|--------------|---------------------|-------------------|
 | Attestation appraised | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance`, no credential yet bound; the appraisal is carried as `posture_assessment_ref` + `attestation_ref`) | `jans-svid-issuer` | `posture_assessment_ref { attestation_id, status, platform, measurement, policy_version, verifier, verifier_result_digest, evidence_digest }`, `assessment_policy` | no `tokens[]`; no `credential_fingerprint` yet (bare-key appraisal) | `workload_id` (the enrolling client where known; absent for a bare key appraisal), `attestation_ref`. **Lifecycle record**: `trace_execution_id = "att:" + attestation_id` |
@@ -2745,7 +2794,7 @@ has these states:
 |-------|---------|------------------------------------|
 | `staged` | Outbox row inserted (sequence number taken, append protocol above); the credential entity's commit is **not yet confirmed** — the outcome is **unresolved**, not "failed" | **Not yet.** The emitter never posts a `staged` entry; it resolves it first |
 | `committed` | The entity commit is confirmed (by atomic flip, or by probing the entity in recovery); the position will carry the success `CREDENTIAL_PROVISIONED` | **Yes** — the success record |
-| `aborted` | Resolution found **decidable non-commit** — both witnesses absent on a backend whose retained witness would have proved a commit (SQL/Couchbase), after fencing the writer | **Yes** — a signed **aborted-outcome record** at the same `sequence_number`/`prev_record_hash`, so the chain has no gap |
+| `aborted` | Resolution found **decidable non-commit** — both witnesses absent on a backend whose retained witness would have proved a commit (SQL/Couchbase), after fencing the writer | **Yes** — a signed **aborted-outcome record** (`provisioning_outcome=aborted`, no `credential_fingerprint`, reason `not_committed`) **in the operation's own kind/producer** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, or `EXECUTION_STARTED`/`jans-auth` for a bootstrap (§11.2) — at the same `sequence_number`/`prev_record_hash`, so the chain has no gap |
 | `indeterminate` | Resolution could **not decide** — both witnesses absent on a backend that cannot guarantee a token-outliving witness (LDAP, marker possibly never written, token possibly deleted); the writer is fenced so it cannot commit afterward, but absence does **not** prove non-commit | **Yes** — a signed **indeterminate-outcome record** (`provisioning_outcome=indeterminate`, reason `witness_unavailable`) at the position, so the chain is gapless and honest; neither success nor abort is asserted |
 | `delivered` | Lock accepted whichever record (success / aborted / indeterminate) occupies the position (`202` or idempotent replay) | terminal |
 
@@ -2855,12 +2904,17 @@ substitute for a witness and is not lengthened to try to disambiguate (a longer 
 more likely to have vanished, not less).
 
 **The aborted record, so the chain is honest about what happened.** It is a signed record at the
-allocated position whose event states the operation did not complete — a `CREDENTIAL_PROVISIONED`
-with `provisioning_outcome=aborted` (no `credential_fingerprint`, reason `not_committed`), carrying
-the same `trace_execution_id` and `parent_record_ids` the success record would have. It occupies
-sequence *n* with its `prev_record_hash` over *n-1*'s delivered digest, and *n+1* chains over the
-aborted record's digest — so Lock receives an unbroken chain in which position *n* truthfully says
-"attempted, not provisioned" rather than silently vanishing (which would show as a
+allocated position whose event states the operation did not complete, with
+`provisioning_outcome=aborted` (no `credential_fingerprint`, reason `not_committed`), carrying the
+same `trace_execution_id` and `parent_record_ids` the success record would have. **It uses the same
+`event_kind` and producer key as that operation's success record** (§11.2): an issuance, enrollment,
+or appraisal aborts as a `CREDENTIAL_PROVISIONED` under `jans-svid-issuer`; a **bootstrap aborts as
+an `EXECUTION_STARTED` under `jans-auth`**, never as a `CREDENTIAL_PROVISIONED` (whose kind the
+`jans-auth` key is not authorized to sign — Lock would reject it). The abort rule is per producer,
+not a single hard-coded `CREDENTIAL_PROVISIONED`. The record occupies sequence *n* with its
+`prev_record_hash` over *n-1*'s delivered digest, and *n+1* chains over the aborted record's digest
+— so Lock receives an unbroken chain in which position *n* truthfully says "attempted, not
+provisioned" rather than silently vanishing (which would show as a
 `coverage_gap`/`chain_link_failure`). This is the difference between *this* case — a staged position
 whose outcome is known *before* first delivery — and the orphan-compensation case below, which
 repairs an *already-delivered* success record found inconsistent later.
@@ -3432,7 +3486,7 @@ in the cited section.
 | One profile per record (`tag:jans.io,2026:trace-v1`); canonicalization/signing/digest from the shared `jans-trace-core` (or byte-identical to its vectors), no jans-local fork | §11.1, §11.3 |
 | Evidence before action: a durable local outbox commit is the accountable record (Lock delivery is async at-least-once); `JWT-SVID` issuance fails closed when evidence cannot be durably committed | §11.3 |
 | The staged outbox entry is the operation journal with a **three-valued** outcome (committed / not-committed / **unresolved**); recovery answers **"did *this* `operation_id` commit?"** by matching an **operation commit receipt** (`operation_id` + `record_id`) embedded in the entity (`TokenEntity`/`KeyEnrollment`/`AttestationAssessment`) or an `operation_id`-keyed `IssuanceLog` — **never** by a same-identifier entity's existence or a separate marker's absence, so a crash after the entity committed cannot void its evidence and a stray same-identifier entity cannot fake a commit. Receipt/journal retention ≥ resolution-wait + downtime + reconciliation interval | §11.3 |
-| **Chain the operation, with explicit aborted outcomes** (not "assign the position only after the outcome is known"): every allocated sequence position is delivered — a committed one as the success record, a never-committed one as a signed aborted-outcome record at the same position — so the chain Lock receives has no gap. `prev_record_hash` is bound at resolution over the predecessor's delivered digest; delivery is strictly in sequence order | §11.3 |
+| **Chain the operation, with explicit aborted/indeterminate outcomes** (not "assign the position only after the outcome is known"): every allocated sequence position is delivered — a committed one as the success record, a never-committed one as a signed outcome record at the same position — so the chain Lock receives has no gap. The outcome is an `event.provisioning_outcome` ∈ `{committed, aborted, indeterminate}` discriminator on the operation's **own `event_kind`/producer** (`CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, or `EXECUTION_STARTED`/`jans-auth` for a bootstrap), with `credential_fingerprint` present iff `committed`; `prev_record_hash` is bound at resolution over the predecessor's delivered digest; delivery is strictly in sequence order | §11.2, §11.3 |
 | Append is a **per-chain single-writer journal**, not multi-writer CAS: issuance threads write unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially; the `epoch` fence is enforced **in the authoritative guarded insert** (a stale writer cannot create a row at all); records are matched to operations by stored `operation_id`, never "adopted" from a colliding row | §11.3 |
 | Availability posture is per-capability-risk tier, fail-closed by default (untiered = `critical`); degraded issuance is recorded as degraded | §16.9 |
 | Trust domain is pinned on first start and never re-derived | §8 |
@@ -3542,8 +3596,9 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **Outbox append protocol** | A per-chain **single-writer journal**: issuance threads enqueue unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially; the `epoch` fence is enforced in the authoritative guarded insert, so a stale writer never creates a record (§11.3). |
 | **`operation_id` / journal lease** | The per-issuance identity that ties an intake row to its chain entry (ownership is never inferred from a colliding record), and the per-chain `epoch`-fenced lease that makes exactly one writer append at a time (§11.3). |
 | **Record states `staged` / `committed` / `aborted` / `delivered`** | The outbox lifecycle: `staged` = position allocated, outcome unresolved, not yet posted; `committed` = entity confirmed, success record will be delivered; `aborted` = positive evidence of non-commit, an aborted-outcome record is delivered **at the same sequence position** so the chain has no gap; `delivered` = Lock accepted whichever record occupies the position. Every allocated position is delivered (§11.3). |
-| **Aborted-outcome record** | A signed `CREDENTIAL_PROVISIONED` with `provisioning_outcome=aborted` (reason `not_committed`, no `credential_fingerprint`) delivered at an allocated sequence position whose operation never committed, so the hash chain Lock receives is gapless (§11.3). |
-| **`IssuanceLog`** | A TTL-independent marker (keyed by `record_id`) proving a credential was committed; it outlives the SVID so **token absence is never read as failed issuance** (§11.3). |
+| **Aborted-outcome record** | A signed record with `provisioning_outcome=aborted` (reason `not_committed`, no `credential_fingerprint`) delivered at an allocated sequence position whose operation never committed, so the hash chain Lock receives is gapless. It uses the operation's **own `event_kind` and producer key** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer` for issuance/enrollment/appraisal, `EXECUTION_STARTED`/`jans-auth` for a bootstrap — never a cross-producer kind (§11.2, §11.3). |
+| **Indeterminate-outcome record** | A signed record with `provisioning_outcome=indeterminate` (reason `witness_unavailable`, no `credential_fingerprint`) delivered when recovery could not decide whether the operation committed (the narrow LDAP both-absent case); same kind/producer rule as the aborted record; neither asserts success nor fabricates an abort (§11.2, §11.3). |
+| **`IssuanceLog`** | A TTL-independent witness (**keyed by `operation_id`**) proving a specific operation committed; it outlives the SVID so **token absence is never read as failed issuance**, and recovery matches it by `operation_id` rather than by credential identifiers (§11.3). |
 | **Persisted vs. delivered** | "Credential persisted" (committed by the issuer, what a record attests) vs. "response received by the client" (unobservable by the server, never asserted) (§11.3). |
 | **Operation binding** | `request_digest` / `input_digest` / `tool_call_digest` / `result_digest` + proof-of-possession binding — the Phase-3 same-operation proof (§3; `design.md`). |
 

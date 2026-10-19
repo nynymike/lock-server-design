@@ -26,6 +26,7 @@ its guarantee as proven until its tests pass on every backend.
 | Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
+| Q17 — aborted/indeterminate wire contract | outcome records validate per operation kind and producer; bootstrap aborts under the right key | per-(kind × outcome) schema fixtures; `credential_fingerprint` present iff `committed`; bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -370,6 +371,34 @@ absent `operation_id` proves nothing about this attempt and is not read as commi
 the SQL/Couchbase and LDAP witness rules, and the crash-point / reconciliation tests are all stated
 in terms of the receipt, not identifier existence.
 
+## Q17. Aborted/indeterminate outcomes were not a complete wire contract
+
+**Status: partially resolved** — the outcome wire contract and per-producer rule are specified
+(§11.2/§11.3); guarantee pending the per-(kind × outcome) schema-fixture tests and confirmation
+against Lock's actual schema.
+
+**Raised.** The design introduced a `CREDENTIAL_PROVISIONED` with `provisioning_outcome=aborted` and
+no `credential_fingerprint`, but the implementation appendix still said no event-format changes were
+needed, and the shape was described only in §11.3 prose — no field-level contract, no Lock schema /
+validation confirmation. Two concrete gaps: (1) `provisioning_outcome` and an absent
+`credential_fingerprint` *are* format additions Lock's per-kind schema must accept, even though the
+`event_kind` is unchanged; (2) the generic abort rule hard-coded `CREDENTIAL_PROVISIONED`, so it did
+not cover an unsuccessful **`EXECUTION_STARTED`** bootstrap — which belongs to the `jans-auth`
+producer, whose key is **not** authorized to emit `CREDENTIAL_PROVISIONED`.
+
+**Change (§11.2, §11.3, appendix).** The outcome is now an explicit wire contract: a new
+`event.provisioning_outcome` ∈ `{committed, aborted, indeterminate}` discriminator (default
+`committed`, preserving the success shape), with per-outcome required fields — `credential_fingerprint`
+**present iff `committed`**, `reason` = `not_committed` (aborted) / `witness_unavailable`
+(indeterminate), and the chain/identity fields carried on every outcome. The abort rule is restated
+**per producer**: a failed issuance/enrollment/appraisal aborts as a `CREDENTIAL_PROVISIONED` under
+`jans-svid-issuer`; a failed **bootstrap aborts as an `EXECUTION_STARTED` under `jans-auth`**, never
+a `CREDENTIAL_PROVISIONED` (which Lock rejects for that producer key). The appendix's jans-lock row
+now lists the field-level format changes as a **confirmation item against Lock's actual schema**
+(resolved by a Lock-side schema update if needed, never by fabricating a fingerprint), and a new
+`OutcomeRecordSchemaFixtureTest` adds a canonical fixture for **each (operation kind × outcome)**
+cell, shared with Lock's conformance suite.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -378,6 +407,7 @@ the §9.5 enrollment transaction, the §9.7/§10.4 single-row state model with `
 `appraisalGeneration`, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap and
 three-valued `key_binding_strength`, the §10.5/§8 JWT-SVID algorithm allowlist, the §10.6/§10.8
 delegation-expiry clamp and tenant-scoped principal binding, the §10.9 BE/BS-vs-hardware
-distinction, the §10.10 token-privacy scope, the §11.3 sign-once-at-resolution rule, and the §16.1
-key-revocation delay). This history preserves the original questions that drove them; for current
-behaviour, read the main document.
+distinction, the §10.10 token-privacy scope, the §11.3 sign-once-at-resolution rule, the §11.2/§11.3
+per-producer outcome wire contract (`provisioning_outcome`, bootstrap aborts as `EXECUTION_STARTED`),
+and the §16.1 key-revocation delay). This history preserves the original questions that drove them;
+for current behaviour, read the main document.
