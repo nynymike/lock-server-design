@@ -187,11 +187,29 @@ client attribute and emit the enrollment TRACE record. `supersedesEligible` now 
 table gained a distinct enrollment-initialization row. One assessment enrolls exactly one client
 (`assessment_already_enrolled` otherwise), and adding a replacement key reuses the same transaction.
 
+## Q11. Attestation ordering needs rules beyond CAS
+
+**Raised.** A monotonic `revision` orders *writes* but not which *evidence* should win: an older
+positive appraisal can finish slowly, lose a CAS to a newer rejection, retry, and overwrite that
+rejection — restoring approval from stale evidence. Separately, with per-issuance freshness disabled
+the text understated the race: multiple concurrent requests can all pass `stillCurrent(r)` before a
+rejection and all finish, so the exposure is plural, not one SVID.
+
+**Change (§§9.3, 9.7, 10.4).** Added a per-key **`appraisalGeneration`** stamped at challenge
+issuance (monotonic, independent of wall-clock), carried challenge → assessment → state. The
+write-side guard now admits an overwrite **only if its generation is strictly newer** than the row's
+— so a stale `affirming` that loses and retries is dropped, never restoring approval. `revision`
+orders writes; `appraisalGeneration` orders evidence. The default-mode exposure is restated honestly
+as **plural already-authorized in-flight issuances** that complete after a rejection (bounded by SVID
+TTL; collapsed to one by `attestationRequireFreshPerIssuance`/a `critical` tier), and the
+authorization point is related to entity persistence and evidence commit as three ordered points — a
+rejection governs only issuances not yet past the first.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
 folded into the numbered sections of the main document (notably the §9.5 enrollment transaction, the
-§9.7/§10.4 single-row state model, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap,
-the §10.8–§10.9 execution-binding and human-assurance rules, and the §16.1 key-revocation delay).
-This history preserves the original questions that drove them; for current behaviour, read the main
-document.
+§9.7/§10.4 single-row state model with `revision` + `appraisalGeneration`, the §11.3 append/commit
+protocol, the §9.3a Azure AK-binding gap, the §10.8–§10.9 execution-binding and human-assurance
+rules, and the §16.1 key-revocation delay). This history preserves the original questions that drove
+them; for current behaviour, read the main document.

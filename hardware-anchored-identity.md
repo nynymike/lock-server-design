@@ -692,9 +692,20 @@ Response `200`:
 ```
 
 Nonce ≥ 128 bits random, stored as a persistent `AttestationChallenge` entry (section 9.3c) with
-`{ jkt, client_id, purpose, state: pending, expires_at }` under `challenge_id`
+`{ jkt, client_id, purpose, state: pending, expires_at, appraisalGeneration }` under `challenge_id`
 (TTL `attestationChallengeLifetimeSeconds`). A script may add response members via
 `modifyChallengeResponse`.
+
+**`appraisalGeneration` — a monotonic evidence order per key.** When a challenge is issued, the
+server stamps it with a strictly increasing per-`jkt` generation number (a small CAS-incremented
+per-key counter, `jansKeyGeneration`; challenge issuance is off the hot issuance path, so the extra
+write is cheap). The number travels challenge → evidence → assessment → the authoritative-state
+write, where it is the **precedence key** that decides which evidence may overwrite which (§10.4):
+it orders appraisals by *when the evidence was solicited*, independent of wall-clock, so a slow
+writer cannot win merely by finishing late. This is distinct from the state row's `revision`, which
+orders *writes*; `appraisalGeneration` orders *evidence*. The counter is recovered from the highest
+generation seen on the key's challenges/assessments if lost, and resuming at a higher value is
+always safe (gaps are fine; only strict monotonicity matters).
 
 Errors (`400`): `invalid_request` (malformed key), `invalid_client` (unknown `client_id`),
 `key_not_registered`.
@@ -1296,7 +1307,9 @@ back-filled**: enrollment does not mutate this row, it records the client↔key 
 `KeyEnrollment` binding, §9.5), `status`, `platform`, `measurement`, `policyVersion`, `verifier`,
 `verifierResultJwt` (the `AttestationResultJWT`, stored when `attestationStoreVerifierResult=true`,
 default), `verifierResultDigest`, `evidenceFormat`, `evidenceDigest`, raw evidence only when
-`attestationStoreEvidence=true`, `keyCertified` (core-computed, 9.3b), `challengeId`, `appraisedAt`,
+`attestationStoreEvidence=true`, `keyCertified` (core-computed, 9.3b), `challengeId`,
+`appraisalGeneration` (the monotonic per-key evidence order from the challenge, §9.3 — the
+precedence key for state writes, §10.4), `appraisedAt`,
 `expiresAt` (**a logical authorization-validity timestamp, *not* a deletion trigger** — see
 "Authorization expiry vs. retention deletion" below), `retentionExpiresAt` (the ORM TTL attribute
 that actually deletes the row, set to `appraisedAt + attestationRetentionSeconds`),
@@ -1310,10 +1323,11 @@ introspection).
 **`KeyAttestationState` — the authoritative state (one row per key, mutated under CAS).** New
 entity (`ou=keyAttestationStates`, `jansKeyAttestState`): primary key is the pair
 **`(clientId, jkt)`** (one row per attested key — not one per attempt); `revision` (a monotonic
-counter, the single source of order for this key); `status` (the current authoritative verdict:
-`affirming` / `warning` / `contraindicated` / `none`); `appraisedAt`, `expiresAt` (copied from the
-assessment that set this state); `assessmentId` (the evidence-log row that produced the current
-state); `consumed` / `consumedByJti` (for `attestationRequireFreshPerIssuance`); `reasons`. There
+counter ordering *writes* to this row); `appraisalGeneration` (the evidence order of the appraisal
+that currently occupies the row — the precedence key, below); `status` (the current authoritative
+verdict: `affirming` / `warning` / `contraindicated` / `none`); `appraisedAt`, `expiresAt` (copied
+from the assessment that set this state); `assessmentId` (the evidence-log row that produced the
+current state); `consumed` / `consumedByJti` (for `attestationRequireFreshPerIssuance`); `reasons`. There
 is no `supersededBy`/`supersededAt` and no cross-entry `(appraisedAt, version)` tie-break anymore:
 supersession is simply the next CAS that overwrites this one row, and `revision` is a total order by
 construction. Schema in `jans-linux-setup`, ORM entries for all backends, alongside
@@ -1331,8 +1345,8 @@ single-entry CAS is also all the design *needs*:
 
 | Transition | Who writes it | The CAS |
 |------------|---------------|---------|
-| **Initialize** the first state for a key | the **enrollment transaction** (`/register` or `updateClient` adding a key, §9.5), authorized by the DCR DPoP proof over `K` — **not** by the assessment's `supersedesEligible` | **Insert** `KeyAttestationState(clientId, jkt)` at `revision = 0` with `status`/`appraisedAt`/`expiresAt`/`assessmentId` from the `affirming` assessment, **conditioned on absence**. If the row already exists it is a no-op success (idempotent re-enrollment). This is the only first-write, and the only state write an eligible-to-supersede appraisal is *not* required for |
-| **Overwrite** with a new authoritative verdict (section 10.4 write side) | `/attestation`, only for a `supersedesEligible == true` appraisal, **against an already-initialized row** | Read the row at `revision = r`. Write `status`, `appraisedAt`, `expiresAt`, `assessmentId`, reset `consumed = false`, **conditioned on `revision` still being `r`**, setting `revision = r + 1`. A `contraindicated`/`warning` that lands this way *is* the supersession: it overwrites the single authoritative row, so there is nothing else to mark. It does **not** create a row — a non-eligible or no-row key is never initialized by this path |
+| **Initialize** the first state for a key | the **enrollment transaction** (`/register` or `updateClient` adding a key, §9.5), authorized by the DCR DPoP proof over `K` — **not** by the assessment's `supersedesEligible` | **Insert** `KeyAttestationState(clientId, jkt)` at `revision = 0` with `appraisalGeneration`/`status`/`appraisedAt`/`expiresAt`/`assessmentId` from the `affirming` assessment, **conditioned on absence**. If the row already exists it is a no-op success (idempotent re-enrollment). This is the only first-write, and the only state write an eligible-to-supersede appraisal is *not* required for |
+| **Overwrite** with a new authoritative verdict (section 10.4 write side) | `/attestation`, only for a `supersedesEligible == true` appraisal, **against an already-initialized row** | Read the row at `revision = r`, current generation `g`. Apply **only if the incoming appraisal's `appraisalGeneration` g′ > g** (newer evidence); write `status`/`appraisedAt`/`expiresAt`/`assessmentId`/`appraisalGeneration = g′`, reset `consumed = false`, **conditioned on `revision` still being `r`**, setting `revision = r + 1`. On a lost CAS the writer re-reads and **re-checks the generation**: if the row now holds `g′′ ≥ g′` it **drops** (does not overwrite newer evidence). So the `revision` CAS orders *writes* and the `g′ > g` guard orders *evidence* — a stale appraisal that finishes late can never overwrite a newer verdict, even by retrying |
 | Claim the state for one issuance (section 10.4 read/commit side) | `/token`, when `attestationRequireFreshPerIssuance` | CAS `consumed = false → true, consumedByJti = :svidJti` **conditioned on `revision` still being the `r` the issuance evaluated**. Succeeds for exactly one concurrent `/token`; a loser (another issuance, or a rejection that bumped `revision`) gets `attestation_required`. |
 
 CAS on one entry is uniformly available: a SQL `UPDATE … WHERE revision = :r`, an LDAP modify with
@@ -1662,25 +1676,56 @@ that read the state at `revision = r`:
   (which still names `revision = r`) **fails** and the issuance returns `attestation_required`. The
   rejection wins.
 - If the issuance's CAS commits **first**, it advances the row to `r + 1` itself; the rejection's
-  CAS (also naming `r`) then fails, re-reads, and re-applies against `r + 1`, landing as the
-  authoritative verdict for every subsequent issuance. That one in-flight SVID was issued against
-  the then-current approval; its short TTL bounds the exposure, and the recorded rejection stops the
+  CAS (also naming `r`) then fails, re-reads, and re-applies against `r + 1` (its generation is
+  newer, so the precedence guard admits it), landing as the authoritative verdict for every
+  subsequent issuance. The in-flight SVID(s) already past their commit point were issued against the
+  then-current approval; their short TTL bounds the exposure, and the recorded rejection stops the
   next issuance.
 
-When `attestationRequireFreshPerIssuance` is on there is **no** window in which an issuance reads an
-approval, a rejection commits, and the issuance still succeeds against the stale read — the issuance
-does not succeed on the read, it succeeds on the `revision` CAS, and that CAS and the rejection
-contend for the *same single row*, so a rejection that commits first makes the issuance fail. With
-the flag off, the commit is a `stillCurrent(r)` read-check rather than a mutating CAS, so a
-rejection landing in the sliver between that check and the mint can let **one** already-evaluated
-issuance through; that single SVID is bounded by its short TTL and the rejection stops every
-subsequent issuance. In both modes the key guarantee holds — a rejection is authoritative for all
-issuance that has not already passed its commit point, and no issuance can resurrect an approval the
-row no longer holds. This is the guarantee the previous per-assessment-entry CAS could not give at
-all: updating several assessment entries one at a time left the window open even under
-`attestationRequireFreshPerIssuance` (a reader passed on entry A while a writer marked entry A
-superseded), and separate entries sharing `(appraisedAt, version)` were not even totally ordered.
-One row, one `revision`, one CAS closes both gaps.
+**Evidence precedence: a newer rejection is never undone by an older approval.** `revision` orders
+*writes*, but it does **not** say which *evidence* should win — and without a second rule an older
+`affirming` appraisal could finish slowly, lose its CAS to a newer `contraindicated`, retry against
+the bumped revision, and overwrite the rejection, silently restoring approval from stale evidence.
+The precedence key `appraisalGeneration` (§9.3, monotonic per key at challenge issuance) closes
+this: a state write lands only if its appraisal's generation is **strictly newer** than the one the
+row currently holds (§9.7 write-side). A stale `affirming` that lost the race carries an *older*
+generation, so on retry the guard **rejects** it — it cannot overwrite the newer `contraindicated`.
+Newer evidence wins regardless of which writer's CAS happens to commit first; the slow writer gains
+nothing by finishing late.
+
+**Default-mode exposure, stated honestly.** The two commit modes differ, and the flag-off case is
+**plural**, not singular:
+
+- With `attestationRequireFreshPerIssuance` **on**, the commit is a mutating CAS that also consumes
+  the state (`consumed = false → true`), so it succeeds for **exactly one** concurrent issuance and
+  contends on the *same single row* as any rejection; a rejection that commits first makes every
+  such issuance fail. There is no stale-read window.
+- With the flag **off**, the commit is a `stillCurrent(r)` read-check, not a mutating CAS.
+  **Multiple** concurrent issuances can each read `revision = r`, each pass `stillCurrent(r)`, and
+  each proceed to mint — so a rejection that commits just after they pass the check does **not**
+  retract them. The honest statement is therefore: a rejection is authoritative for every issuance
+  whose authorization point has **not yet passed**, but issuances **already authorized and in
+  flight — potentially several, not one — complete.** Their exposure is bounded only by the short
+  SVID TTL and by the rejection stopping all *subsequent* issuance. An operator who cannot tolerate
+  plural in-flight issuance after a rejection sets `attestationRequireFreshPerIssuance=true` (or a
+  `critical`-tier policy, §16.9), which collapses the window to the single-CAS case.
+
+**Where the authorization point sits relative to persistence and evidence (§11.3).** The issuance's
+authorization point is its commit step — the `compareAndConsume`/`stillCurrent` above. It is
+**independent of** the credential-entity persistence and the evidence commit, which happen after
+(§11.3 steps): an SVID that passes its authorization point is authorized *even if* its
+`TokenEntity` write or its TRACE record is still in flight. Consequently a rejection that lands
+after an issuance's authorization point but before that issuance's entity/evidence commit does
+**not** un-authorize the already-authorized SVID; the evidence chain records it as a committed
+provisioning (or, if the entity never persisted, as an aborted position — §11.3), and the rejection
+stands as the authoritative state for the next issuance. "Authorized," "persisted," and "evidenced"
+are three ordered points, and a rejection only governs issuances that have not passed the first.
+
+This single-row model is what the previous per-assessment-entry CAS could not give: updating several
+assessment entries one at a time left a window open even under `attestationRequireFreshPerIssuance`
+(a reader passed on entry A while a writer marked entry A superseded), and separate entries sharing
+`(appraisedAt, version)` were not even totally ordered. One row, one `revision` for write order, one
+`appraisalGeneration` for evidence order.
 
 **Recorded observation vs. authoritative issuance state.** The denial-of-service defence rests on
 the same single-row model, split from the evidence log:
@@ -2863,6 +2908,8 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Evidence about a different key than the DPoP / registration key | Core extracts the attested key from the verifier result and the certify structure, compares it to the challenge `jkt` and to the registered keys; `key_mismatch`; the script has no input into this comparison |
 | Platform state changes after enrollment (measurement no longer allowed, debug enabled, TCB downgraded) | Re-attestation yields `contraindicated`, which **overwrites** the key's authoritative state row at once (10.4); issuance stops with `attestation_required` immediately, not when the old approval ages out; outstanding SVIDs die within the TTL; introspection shows the stale `attestation`. Only properties the platform actually measures are covered |
 | Agent receives `contraindicated`, retries `/token` hoping an older approval still counts | Refused: the one authoritative `KeyAttestationState` row now reads `contraindicated`; the old approval was overwritten in place, not left alongside. A racing `/token` on another node either reads the new state or has its commit CAS on `revision` fail (10.4), so it can never settle on the overwritten approval. The agent must obtain a new `affirming` appraisal |
+| A slow older `affirming` appraisal finishes after a newer `contraindicated` and tries to overwrite it | **Rejected by evidence precedence (§10.4):** the stale appraisal carries a lower `appraisalGeneration`, so the write-side guard admits it only if its generation is strictly newer than the row's. It is not, so it is dropped — a stale positive can never restore approval over a newer rejection, even by losing and retrying the CAS. `revision` orders writes; `appraisalGeneration` orders evidence |
+| Flag off (`attestationRequireFreshPerIssuance=false`): rejection lands while issuances are in flight | **Plural in-flight issuances already past their authorization point complete** — the flag-off commit is a read-check, so several concurrent `/token` calls can each pass it before the rejection and each mint. This is stated exposure, not a bug: it is bounded by the short SVID TTL, and the rejection stops all *subsequent* issuance. A deployment that needs the window collapsed to one sets `attestationRequireFreshPerIssuance=true` / a `critical` tier (§10.4, §16.9) |
 | Platform verifier unreachable from jans | `/attestation` returns `503 verifier_unavailable`, keeps the challenge for a retry, and records `status=none`; existing assessments stay valid until `expires_at`, so issuance continues inside the window, then stops with `attestation_required`. Lengthening the window is visible as a new `bundle_hash`. The agent never needed network access to the verifier, so nothing changes on the agent side. **How this resolves is the capability-risk tier's choice (§16.9):** `critical` fails closed once no fresh appraisal remains; `low` MAY proceed under a recorded degraded posture if its policy opts in |
 | Agent suspended, decommissioned, or expired | The client's `agentLifecycleState` gates issuance (§9.9): `suspended` refuses `/token` reversibly (`403 client_suspended`), `decommissioned` refuses permanently and removes the keys, and reaching `agentExpiresAt` does one or the other per `agentExpiryAction`. In all cases outstanding SVIDs die within the TTL and introspection reports `active: false`. The `client_id` is never recycled; a decommissioned client becomes a `tombstoned` identity after `clientTombstoneAfterSeconds`, with its evidence retained |
 | Agent's hardware key `K` destroyed, lost, or compromised | No old-key-authorized rotation is possible, so recovery is the administrative path (section 9.9): an operator authorizes re-enrollment of a fresh attested key (destroyed/lost) or revokes `K` and enrolls a replacement (compromise). Issuance under `K` stops at once; a VM rebuild additionally changes `workload_instance_id`, which stays visible in the evidence. Recorded as `IDENTITY_ROTATED` (`key_lost` / `emergency`) |
@@ -3166,7 +3213,8 @@ in the cited section.
 | No jans-signed assessment token; the assessment is a server-side record; the only signed attestation object is the verifier's `AttestationResultJWT` | §9.6 |
 | Challenges are a persistent `pending → processing → completed` state machine, not a cache entry | §9.3c |
 | Proof of possession of `K` gates negative-verdict supersession; an anonymous negative verdict is evidence (`supersedesEligible=false`) but never reaches issuance state, so it cannot deny service | §9.3, §10.4 |
-| Single authoritative `KeyAttestationState` row per `(client_id, jkt)` with a monotonic `revision`; issuance commits under a `revision` CAS so a rejection that commits first wins; expired state is a read-time check, not deletion | §9.7, §10.4 |
+| Single authoritative `KeyAttestationState` row per `(client_id, jkt)` with **two orders**: a monotonic `revision` orders *writes* (CAS), and a per-key `appraisalGeneration` (stamped at challenge issuance) orders *evidence* — a state write lands only if its evidence generation is strictly newer, so a stale `affirming` can never overwrite a newer `contraindicated`. Issuance commits under the `revision` CAS; expired state is a read-time check, not deletion | §9.3, §9.7, §10.4 |
+| Default mode (`attestationRequireFreshPerIssuance=false`) commits on a read-check, so **plural** already-authorized in-flight issuances can complete after a rejection; stated exposure, bounded by SVID TTL. The flag (or a `critical` tier) collapses it to one via a mutating consume-CAS. Authorized / persisted / evidenced are three ordered points; a rejection governs only issuances not yet past the first | §10.4, §11.3 |
 | Enrollment is an explicit idempotent transaction that **initializes** the first `KeyAttestationState` for a key — authorized by the DCR DPoP proof over `K`, not by the assessment's `supersedesEligible` (which only governs *overwriting* an existing client's state). The pre-enrollment assessment is left immutable; the client↔key↔assessment link is a separate `KeyEnrollment` binding, never a mutation of the evidence row. One assessment enrolls exactly one client. Adding a replacement key uses the same transaction | §9.5, §9.7, §10.4 |
 | Authorization lifetime is separate from evidence lifetime: `expiresAt` bounds issuance; `retentionExpiresAt` (the only deletion TTL) keeps evidence for `attestationRetentionSeconds` | §9.7, §9.9 |
 | A client may hold up to `clientMaxAttestedKeys` attested keys; rotation is old-key-authorized; destroyed/compromised keys use an administrative re-enrollment/revocation path (`IDENTITY_ROTATED`) | §9.9 |
@@ -3332,6 +3380,8 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **`KeyAttestationState`** | The **single authoritative row per `(client_id, jkt)`**, carrying the current verdict and a monotonic `revision`. **Initialized** by the enrollment transaction (authorized by the DCR proof over `K`); thereafter **overwritten** only by a supersession-eligible verdict under CAS; issuance reads it, and the `revision` CAS serializes rejection against in-flight issuance (§9.5, §9.7, §10.4). |
 | **`KeyEnrollment`** | The separate binding `(clientId, jkt) → attestationId` created at enrollment, recording which client+key the assessment justified — kept outside the immutable `AttestationAssessment` so evidence is never mutated. One assessment enrolls one client (§9.5). |
 | **`supersedesEligible`** | Whether a verdict may **overwrite** an existing client's authoritative `KeyAttestationState` — true only with proof of possession of `K`. It does **not** govern enrollment **initialization** of a key's first state, which the DCR proof authorizes instead; a non-eligible verdict is evidence only and can never overwrite state or block issuance (§9.3, §9.5, §10.4). |
+| **`appraisalGeneration`** | A strictly monotonic per-key number stamped on each challenge, carried to the assessment and state row. It orders *evidence* (which appraisal is newer), as distinct from `revision` which orders *writes*. A state overwrite lands only with a strictly newer generation, so a slow stale appraisal cannot restore approval over a newer rejection (§9.3, §10.4). |
+| **`revision` vs `appraisalGeneration`** | Two orders on `KeyAttestationState`: `revision` serializes concurrent *writes* (the CAS token); `appraisalGeneration` is the precedence of the *evidence* a write carries. Both are needed — CAS alone orders writes but not which evidence should win (§10.4). |
 | **`agentLifecycleState`** | The client lifecycle — `active` / `suspended` / `decommissioned` / `tombstoned` (§9.9). |
 | **Capability-risk tier** | `critical` / `standard` / `low`; chooses how a verifier/bundle/Lock outage resolves (§16.9). |
 | **Lifecycle vs. execution record** | Appraisal/enrollment (lifecycle, own identifiers) vs. delegation/issuance (carry the execution pair) (§3). |
