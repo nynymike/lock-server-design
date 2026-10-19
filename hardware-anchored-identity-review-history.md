@@ -32,7 +32,7 @@ non-**resolved** guarantee as proven.
 | Q10 — enrollment transaction | first-enrollment state initialization; idempotent redo | first-enrollment init; crash between `KeyEnrollment` and state init |
 | Q11 — evidence precedence / plural in-flight | stale positive never restores approval; bounded in-flight exposure | delayed-positive-after-rejection; plural-in-flight |
 | Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
-| Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
+| Q14 / Q25 — sign the complete record | signature covers sequence/hash/outcome; **one authoritative byte sequence** across rebuilds and concurrent finalizers | sign-once-at-resolution; reject signing incomplete content; freeze-input + install-once-CAS + adopt-winner (`signed_at`/`kid` do not drift; CAS loser adopts stored bytes) |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
 | Q17 / Q21 — outcome wire contract | outcome records validate per **event kind × operation subtype × outcome**; bootstrap aborts under the right key | per-(subtype × outcome) schema fixtures; identifying artifact per the matrix (fingerprint only for SVID issuance/enrollment; appraisal and bootstrap carry none); bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
@@ -340,6 +340,13 @@ are persisted on the outbox entry before delivery and re-sent **byte-identically
 (so a `409` content-mismatch cannot arise from a retry). An optional **signed intent object** is
 defined as a separate, distinctly-typed artifact for deployments that want an attempt-time
 signature — never the record's signature, and not emitted in v1.
+
+> **"Re-finalizing is byte-identical" qualified by Q25.** This round leaned on signature determinism,
+> but a *rebuild* after a crash can change `signed_at`, the selected `kid` (after a key rotation), or
+> other generated fields, so determinism of Ed25519 alone does not reproduce the bytes. Q25 freezes
+> the full signing input (including `signed_at`/`kid`) and installs the bytes once via CAS, with
+> concurrent/retry finalizers adopting the stored winner — the guarantee is **one authoritative byte
+> sequence, not one execution of the signer**.
 
 ## Q15. "One assessment enrolls one client" had no atomic mechanism; key replacement under-specified
 
@@ -670,6 +677,30 @@ An optional client-chosen `Idempotency-Key` header MAY be stored on the claim an
 `(attestation_id, client_id, K)` binding; v1 relies on `(attestation_id, K)` alone. The internal
 `operationId` is retained only as a cross-table recovery-matching id, never the client's key.
 
+## Q25. "Re-finalizing produces byte-identical bytes" was unqualified
+
+**Status: resolved** — §11.3 freezes the signing input and installs the final bytes once; retries
+adopt the stored winner.
+
+**Raised.** The §11.3 **Finalize-and-sign** transition claimed re-finalizing a resolved entry
+produces byte-identical bytes "idempotent and deterministic." But Ed25519 signature determinism does
+not make a *rebuild* reproduce the bytes: rebuilding after a crash can pick a fresh `signed_at`, a
+different signing `kid` (after a key rotation), or other generated fields, so the input — not just
+the signing function — must be pinned. The useful guarantee is **one authoritative byte sequence**,
+not one execution of the signer.
+
+**Change (§11.3, appendix).** **Finalize-and-sign** now **freezes the complete signing input the
+first time it runs** — the canonical record plus every otherwise-generated field (`signed_at`, the
+selected signing `kid`, any nonce) — persists that frozen input on the entry, and **installs the
+signed bytes once via a set-if-unset CAS** (`signed_bytes`). A concurrent finalizer or a post-crash
+retry that loses the CAS **adopts the stored winner's bytes** and does not re-sign; a re-finalize
+that still needs to run re-reads the frozen input, so `signed_at`/`kid` cannot drift. The outbox
+schema stores the frozen input alongside the installed bytes, and `TraceRecordBuilderTest` asserts
+no drift across a rebuild (fresh clock / rotated `kid`) and that concurrent finalizers converge on
+one byte sequence with the loser adopting it. The decision log and the §11.3 `TraceRecordBuilder`
+note were corrected from "signing is deterministic, so bytes are reused" to this freeze-and-install
+rule.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -692,6 +723,8 @@ too-coarse "committed ⇒ fingerprint" rule), the §9.3c/§11.3 unified appraisa
 §9.5 key-replacement RFC 7592 `PUT` wire format (old-key auth in the `DPoP` header, new-key
 `attested_key_pop` body member, `change_digest` signing the mutation; Q23, which corrected the
 two-proofs-one-header / hard-coded-`POST` defects), the §9.5 enrollment-retry idempotency key
-`(attestation_id, K)` (Q24, which replaced the client-invisible `operationId` retry rule), and the
+`(attestation_id, K)` (Q24, which replaced the client-invisible `operationId` retry rule), the
+§11.3 freeze-signing-input + install-once-CAS rule (Q25, which qualified "re-finalizing is
+byte-identical" into one authoritative byte sequence, not one signer execution), and the
 §16.1 key-revocation delay). This history preserves the original questions that drove them; for
 current behaviour, read the main document.
