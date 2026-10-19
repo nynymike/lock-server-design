@@ -51,8 +51,8 @@ trust stops there; the chain makes explicit what each party vouches for.
 | 1 | ROOT | TPM / TEE hardware | Non-exportable keypair; vendor-signed raw evidence over it | Raw evidence (quote / report) |
 | 2 | ATTEST | `/attestation` + script | Single-use challenge; **jans** sends the raw evidence to the platform verifier and receives its `AttestationResultJWT`; measurement policy applied; **assessment stored with a validity window** | `attestation_id` (server-side assessment), `AttestationResultJWT` (verifier's) |
 | 3 | ENROLL | DCR `/register` | Registration accepted only with a fresh `affirming` assessment for the registered key; `client_id` ↔ `jkt` ↔ `attestation_id` persisted; SPIFFE ID assigned | `spiffe://td/agent/<client_id>` |
-| 4 | DELEGATE | Token exchange (ID-JAG) | Human's ID token exchanged for an ID-JAG naming the agent; the `(trace_execution_id, execution_authority)` pair is minted (execution id aliased by `txn`) | ID-JAG with the canonical correlation claims |
-| 5 | ISSUE | `/token` + DPoP | `client_credentials` or JWT bearer with ID-JAG; DPoP key must equal the enrolled key **and** have an assessment younger than the maximum age; else `attestation_required` | JWT-SVID with `cnf.jkt`, the `(trace_execution_id, execution_authority)` claims, `attestation` |
+| 4 | DELEGATE | Token exchange at the **IdP Authorization Server** (ID-JAG) | Human's ID token exchanged at the IdP AS for an ID-JAG naming the agent, `aud` = the Resource AS (jans), crossing a trust boundary (§5); it carries delegated authority, **not** per-execution human approval | ID-JAG (`iss` = IdP, `aud` = jans) |
+| 5 | ISSUE | `/token` + DPoP at the **Resource AS** (jans) | jans **redeems** the ID-JAG (validates `iss` ∈ trusted IdPs, `aud` = jans), opens the execution and **mints** the `(trace_execution_id, execution_authority)` pair; `client_credentials` or JWT bearer; DPoP key must equal the enrolled key **and** have an assessment younger than the maximum age; else `attestation_required` | JWT-SVID with `cnf.jkt`, the `(trace_execution_id, execution_authority)` claims, `attestation` |
 | 6 | PUBLISH | `/spiffe/bundle` | Signing keys served in SPIFFE bundle format at a stable HTTPS URL | JWKS, `use: jwt-svid` |
 | 7 | DECIDE | PDP (AuthZEN / Cedarling) | May agent A (for human H) invoke capability C? | `AUTHORIZATION_DECISION` record |
 | 8 | PRESENT & INVOKE | Agent → PEP → capability | SVID + fresh DPoP proof; PEP verifies via the bundle, enforces the decision | `CAPABILITY_INVOKED`, `RUNTIME_EFFECT` records |
@@ -126,7 +126,7 @@ Execution scope is defined independently of credential lifetime:
 
 | Scope | Identifier | Opened by | Closed by |
 |-------|------------|-----------|-----------|
-| **Execution** | `(trace_execution_id, execution_authority)` — `trace_execution_id` value `exe_…`, aliased by `txn` | The ID-JAG exchange (human-delegated), or the first `/token` call of an autonomous agent that carries no execution id; the server mints the pair and returns it in the token response (the canonical claims, plus the `txn` alias) so the agent reuses it | `traceExecutionMaxAgeSeconds` (default 24 h), or an explicit `txn_close=true` on a token request |
+| **Execution** | `(trace_execution_id, execution_authority)` — `trace_execution_id` value `exe_…`, aliased by `txn` | jans (the Resource AS) when it **redeems** a human's ID-JAG at `/token`, or on the first `/token` call of an autonomous agent that carries no execution id; jans mints the pair and returns it in the token response so the agent reuses it. The ID-JAG itself is issued earlier by the IdP AS and does not open the execution (§5) | `traceExecutionMaxAgeSeconds` (default 24 h), or an explicit `txn_close=true` on a token request |
 | **Token lifetime** | SVID `jti` | Each issuance | `exp` (minutes) |
 | **Key lifecycle** (attestation, enrollment) | `attestation_id`, `client_id` | Before any execution exists | Key rotation / client removal |
 
@@ -165,7 +165,7 @@ attestation reference rather than a signed capability label.
 
 | Identity | Carried in | Bound by | Recorded as |
 |----------|-----------|----------|-------------|
-| Human | ID-JAG (`sub`, `email`, `acr`, `amr`, `auth_time`, `sid`) | OIDC login at the IdP (gated phishing-resistant by default, §10.9); token exchange at jans | `subject.human_sponsor` with achieved `acr`/`amr`; `sid` ties the execution to the browser session a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` resolves; `tokens[]` entry `token_type=id-jag` |
+| Human | ID-JAG (`sub`, `email`, `acr`, `amr`, `auth_time`, `sid`) | OIDC login at the IdP (gated phishing-resistant by default, §10.9); the ID-JAG is issued by the IdP AS (`aud` = jans) and **redeemed** by jans at `/token` (§5) — delegated authority, not per-execution approval | `subject.human_sponsor` with achieved `acr`/`amr`; `sid` ties the execution to the browser session a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` resolves; `tokens[]` entry `token_type=id-jag` |
 | Agent | JWT-SVID `sub` | Derived from `client_id` under the server's trust domain; never client-supplied | `subject.workload_id` (the SPIFFE ID); `tokens[]`/`credential_fingerprint` entry for the `jwt-svid` |
 | Hardware key | JWT-SVID `cnf.jkt`; DPoP proof on every request | Attestation assessment binds `jkt` to platform + measurement | `attestation_ref` (verifier, `result_status`, `appraised_at`) and `posture_assessment_ref` (`jkt`, `attestation_id`, `platform`, `measurement`) |
 | Policy decision | AuthZEN response | PDP evaluates agent + principal against the action/resource | `AUTHORIZATION_DECISION` signing `decision { action, resource_type, outcome }` (never a `capability_id`) by the PDP |
@@ -204,7 +204,8 @@ sequenceDiagram
     participant TEE as TPM / TEE
     participant Agent as AI Agent
     participant Human as Human (OIDC client)
-    participant AS as jans-auth-server<br/>(trust domain op.example.org)
+    participant IdP as IdP Authorization Server<br/>(issuer idp.example.org · issues ID-JAG)
+    participant AS as Resource Authorization Server<br/>jans-auth-server (issuer op.example.org · SVID issuer)
     participant Verifier as Platform verifier<br/>(Azure Attestation / Intel TA)
     participant Lock as jans-lock<br/>TRACE store
     participant PEP as PEP / Relying Party
@@ -234,17 +235,18 @@ sequenceDiagram
     PEP->>AS: GET /spiffe/bundle (periodic, or via SPIRE federates_with)
     AS-->>PEP: { keys[use: jwt-svid], spiffe_sequence, spiffe_refresh_hint }
 
-    Note over Human,AS: ③ DELEGATE — when a human starts an execution
-    Human->>AS: token exchange: ID token → requested_token_type=id-jag, audience=AS
-    AS-->>Lock: EXECUTION_STARTED (token-exchange bootstrap · ID-JAG issued)
-    AS-->>Human: ID-JAG { sub: alice, client_id: agent,<br/>execution_id + execution_authority (txn alias) }
+    Note over Human,AS: ③ DELEGATE — when a human starts an execution (crosses a trust boundary)
+    Human->>IdP: token exchange at the IdP AS: ID token → requested_token_type=id-jag,<br/>audience = op.example.org (the Resource AS), not the IdP itself
+    Note over IdP: ID-JAG draft: the IdP AS does NOT redeem its own ID-JAG;<br/>iss = idp.example.org, aud = op.example.org cross a trust (e.g. tenant) boundary
+    IdP-->>Human: ID-JAG { iss: idp.example.org, sub: alice, aud: op.example.org,<br/>client_id: agent } — delegated access, NOT per-execution approval
     Human->>Agent: hand ID-JAG to the agent
 
-    Note over TEE,AS: ④ ISSUE — every few minutes
+    Note over TEE,AS: ④ ISSUE — every few minutes (Resource AS redeems the ID-JAG)
     Agent->>TEE: sign DPoP proof (+ private_key_jwt)
     TEE-->>Agent: signatures (key never leaves)
     Agent->>AS: POST /token grant=jwt-bearer assertion=ID-JAG (or client_credentials)<br/>DPoP proof · resource=#lt;PEP#gt;
-    Note over AS: jkt = thumbprint of the DPoP proof public key (K.public)<br/>jkt must be a registered key of client_id<br/>authoritative KeyAttestationState read by (client_id, jkt)<br/>status must be affirming and appraised_at within max age;<br/>issuance commits under CAS on the row's revision,<br/>else 400 attestation_required { nonce }
+    Note over AS: ID-JAG redeemed HERE, not at the issuer: validate iss ∈ trusted IdPs,<br/>aud == this Resource AS (op.example.org), sig/exp · then the hardware gate:<br/>jkt = DPoP proof key, a registered key of client_id · KeyAttestationState(client_id, jkt)<br/>affirming and within max age · commit under CAS on revision · else 400 attestation_required
+    AS-->>Lock: EXECUTION_STARTED (token-exchange bootstrap · opens execution, mints the pair)
     AS-->>Lock: CREDENTIAL_PROVISIONED (SVID issued · posture_assessment_ref)
     AS-->>Agent: JWT-SVID { sub: spiffe id, aud, exp +10m, cnf.jkt,<br/>execution_id + execution_authority (txn alias), attestation, delegation }
 
@@ -257,12 +259,32 @@ sequenceDiagram
     PEP-->>Agent: 200
 ```
 
-Steps 1 to 14 establish the hardware binding; if the appraisal is not `affirming` no identity is
-ever assigned. Steps 15 to 16 run on the bundle's refresh cadence, never per token. Steps 17 to 20
-put a human at the root of the execution. Steps 21 to 30 are the steady state: every token is
-short-lived, pinned to the hardware key via `cnf`, stamped with the assessment it was issued
-under, and recorded. Every call into the TPM / TEE returns only a public key, a signature or a
-piece of evidence; the private half of `K` never crosses that boundary.
+Phase ① establishes the hardware binding; if the appraisal is not `affirming` no identity is ever
+assigned. Phase ② runs on the bundle's refresh cadence, never per token. Phase ③ puts a human at
+the root of the execution, and phase ④ is the steady state: every token is short-lived, pinned to
+the hardware key via `cnf`, stamped with the assessment it was issued under, and recorded. Every
+call into the TPM / TEE returns only a public key, a signature or a piece of evidence; the private
+half of `K` never crosses that boundary.
+
+**Two authorization servers, across a trust boundary (phases ③–④).** The diagram draws the
+**IdP Authorization Server** (which authenticates the human and issues the ID-JAG, `iss =
+idp.example.org`) and the **Resource Authorization Server** (this jans-auth-server, the SVID
+issuer, `iss = op.example.org`) as **separate participants with distinct issuer and audience**. The
+ID-JAG is minted with `aud = op.example.org` and is **redeemed by the Resource AS, never by the IdP
+that issued it** — draft-ietf-oauth-identity-assertion-authz-grant builds on cross-domain identity
+chaining (draft-ietf-oauth-identity-chaining), so the grant must cross a trust boundary (for example
+a tenant boundary) rather than loop back to its issuer. One software installation MAY play both
+roles, but only across such a boundary with distinct `iss`/`aud`; a genuinely single-domain
+deployment with no boundary to cross must use a different delegation mechanism (e.g. a direct
+token exchange or a local grant), not an ID-JAG redeemed by its own issuer.
+
+**An ID-JAG is delegated authority, not per-execution human approval.** The ID-JAG establishes that
+*an IdP authorized delegated access on behalf of the human* at login time — it does **not** prove
+that *the human explicitly approved this particular execution*. This plan treats it as the former:
+it roots the execution in a human identity and records the login assurance (§10.9), but it makes no
+claim of per-execution consent. Where a deployment needs explicit human approval of a specific
+operation (a step-up confirmation, a signed approval of the exact request), that is a separate
+mechanism the PDP/PEP enforces at the operation, not something the ID-JAG carries.
 
 Reading the arrows: a **solid** arrow is a request the sender initiates and waits for; a
 **dashed** arrow is either the reply to the solid arrow above it, or a one-way notification the
@@ -1761,15 +1783,23 @@ that did not supply an execution learns the pair it is in and reuses both on ren
 
 ### 10.8 The execution pair in the ID-JAG and the execution registry
 
-`IdJagService` stamps the canonical correlation pair on every ID-JAG it issues — the
-`https://jans.io/trace/execution_id` claim (fresh unless the exchange request carries `txn` /
-`execution_id` naming an open execution this exchange is bound to: same client, same
-`execution_authority`, same principal as the exchange's own subject, and inside the
-delegation-validity window — the §10.8 binding, not merely the same client) and
-`https://jans.io/trace/execution_authority` (this server's configured authority), with `txn` set to
-the same execution-id value as the compatibility alias. The two claims travel together. This puts
-the human's login at the root of the execution: the ID-JAG `jti` appears in `tokens[]` and its
-`sub` in `subject.human_sponsor` of every later record.
+The execution pair is minted by the **Resource Authorization Server** (this jans-auth-server, the
+SVID issuer) when it **redeems** an ID-JAG at `/token` — not by the IdP Authorization Server that
+*issued* the ID-JAG. The ID-JAG arrives with `iss` = a trusted IdP and `aud` = this Resource AS
+(§5, two authorization servers across a trust boundary); the Resource AS validates `iss`/`aud`/sig,
+opens the execution, and stamps the canonical correlation pair:
+`https://jans.io/trace/execution_id` (fresh unless the request carries `txn` / `execution_id`
+naming an open execution this grant is bound to: same client, same `execution_authority`, same
+principal as the redeemed ID-JAG's subject, and inside the delegation-validity window — the §10.8
+binding below, not merely the same client) and `https://jans.io/trace/execution_authority` (the
+Resource AS's configured authority), with `txn` set to the same execution-id value as the
+compatibility alias. The two claims travel together.
+
+This roots the execution in the human's login: the ID-JAG `jti` appears in `tokens[]` and its `sub`
+in `subject.human_sponsor` of every later record. **It records delegated authority, not
+per-execution approval** — an IdP authorized access on the human's behalf; the ID-JAG does not
+assert that the human approved this specific execution (§5). Per-operation human consent, where a
+deployment requires it, is enforced by the PDP/PEP at the operation, not carried by the ID-JAG.
 
 Open executions are tracked in a small persistent registry (`jansTraceExecution`: `txn`,
 `clientId`, `principalIss`, `principalSub`, `delegationCredentialId`, `executionAuthority`, `sid`,
@@ -2923,7 +2953,7 @@ resolution.
 | RFC 9711 EAT, RFC 9334 RATS, draft-ietf-rats-ar4si (EAR) | Evidence envelope, roles, `status` vocabulary | **New** (attestation endpoint) |
 | draft-ietf-oauth-attestation-based-client-auth | Where IETF is heading for presenting attestation to an AS; align the `attestation` parameter and result-token shape as it stabilises; also the WIT-SVID prerequisite | Track |
 | draft-ietf-wimse-s2s-protocol (WIT) | **Not** what this plan issues. A WIT has `typ: wit+jwt`, no `aud`, a mandatory `cnf` and mandatory proof of possession (WPT or mTLS); a JWT-SVID has `aud`, no `typ` requirement and bearer semantics for plain SPIFFE verifiers. The two are different token profiles even though both bind a workload identity to a key | Track; a separate `access_token_type=WIT` is possible later; verify the current draft text before designing it |
-| draft-ietf-oauth-identity-assertion-authz-grant (ID-JAG) | Human → agent delegation | **Implemented**; `txn` added |
+| draft-ietf-oauth-identity-assertion-authz-grant (ID-JAG) | Human → agent delegation. **Issued by the IdP AS, redeemed by a different Resource AS across a trust boundary** (distinct `iss`/`aud`); the IdP does not redeem its own ID-JAG (§5). Carries *delegated authority*, not per-execution human approval | **Implemented**; `txn` minted on redemption; a single-domain deployment with no boundary to cross must use another delegation mechanism |
 | RFC 8417 §2.2 `txn` | Execution correlation claim | New usage |
 | RFC 8693 §4.1 `act` / §4.4 `may_act` | Considered and **not** used for the delegator (semantics are current actor / future actor, not delegating principal); a dedicated `delegation` claim is used instead | Not used |
 | RFC 7662 Introspection | Online verification | **Implemented**; new claims |
@@ -2963,6 +2993,8 @@ in the cited section.
 | A shared execution id is correlation, not same-operation proof (which is the Phase-3 operation-binding commitments) | §3, §11.1 |
 | Continuing an execution requires matching client + `execution_authority` + raw principal/delegation (not just client); delegation validity is bounded by `delegationExpiresAt`, independent of token renewal | §10.8 |
 | Human assurance is gated and recorded, not inferred: issuer-specific assurance mappings (no `acr` ordering) and WebAuthn BE/BS for synced-vs-device-bound (not `authenticator_attachment`) | §10.9 |
+| The ID-JAG is issued by the IdP AS and redeemed by a distinct Resource AS across a trust boundary (distinct `iss`/`aud`); the IdP never redeems its own ID-JAG, and a single-domain deployment with no boundary uses another delegation mechanism | §5 |
+| An ID-JAG is delegated authority, not per-execution human approval; per-operation consent, where required, is enforced by the PDP/PEP at the operation | §5, §10.8 |
 | Delegator is a dedicated `delegation` claim, not RFC 8693 `act`/`may_act` | §10.5 |
 | The hardware guarantee requires the full RFC 9449 PEP check (including a mandatory `ath`), not a thumbprint comparison; a `cnf`-ignoring PEP is bearer-only | §6 |
 | Two TRACE producer roles/keys (`jans-auth` for auth/bootstrap, `jans-svid-issuer` for provisioning); the authentication key is not widened to cover `CREDENTIAL_PROVISIONED` | §11.1 |
@@ -3042,7 +3074,8 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 |------|--------------|
 | **DPoP** (RFC 9449) | Demonstrating Proof-of-Possession: a per-request signed proof that the caller holds the key in the token's `cnf`. The hardware binding at presentation (§6). |
 | **`cnf` / `jkt`** | The confirmation claim (RFC 7800) and the RFC 7638 thumbprint of the bound key; `cnf.jkt` pins the SVID to the hardware key (§6, §10.5). |
-| **ID-JAG** | Identity Assertion JWT Authorization Grant (draft-ietf-oauth-identity-assertion-authz-grant): the token exchange that carries the human's identity into the agent flow (§5, §10.8). |
+| **ID-JAG** | Identity Assertion JWT Authorization Grant (draft-ietf-oauth-identity-assertion-authz-grant): a grant that carries the human's delegated identity into the agent flow. Issued by the **IdP Authorization Server** and redeemed by a **Resource Authorization Server** across a trust boundary (distinct `iss`/`aud`); it establishes *delegated authority*, not per-execution human approval (§5, §10.8). |
+| **IdP AS / Resource AS** | The two ID-JAG roles: the IdP Authorization Server issues the ID-JAG (`iss` = IdP, `aud` = Resource AS); the Resource AS (this jans-auth-server, the SVID issuer) redeems it. One installation may play both, but only across a trust boundary (§5). |
 | **DCR** | Dynamic Client Registration — the `/register` path where a key is enrolled and attestation is gated (§9.5). |
 | **`txn`** | RFC 8417 transaction claim; here an **application alias** for the execution id, not a separate correlation key (§3). |
 | **PPID / pairwise subject** | A per-audience pseudonymous identifier for the human, so unrelated relying parties cannot correlate them (§10.10). |
