@@ -514,7 +514,7 @@ signed it.
 
 | RATS role | Played by | Creates | Signed with |
 |-----------|-----------|---------|-------------|
-| **Attester** | The hardware (TPM / TEE firmware / CPU) on the agent's host, driven by the agent process | **Raw evidence**, always two parts: (1) **platform evidence** (SEV-SNP report, TDX quote, or TPM `TPM2_Quote` over PCRs) and (2) **key certification**: a `TPM2_Certify` attestation over `K` with `qualifyingData = nonce`, signed by the attestation key (AK) that the platform evidence vouches for (section 9.3a). Bare SEV-SNP / TDX deployments without a vTPM put `SHA-256(nonce ‖ thumbprint(K.public))` in `REPORT_DATA` / `REPORTDATA` **and** must certify `K` by another platform mechanism; report data alone names bytes, it does not certify a key | A platform key rooted in the vendor: TPM / vTPM AK (certified by the EK CA or, on Azure CVMs, by the SEV-SNP report through HCL runtime data), AMD VCEK / VLEK, Intel PCK |
+| **Attester** | The hardware (TPM / TEE firmware / CPU) on the agent's host, driven by the agent process | **Raw evidence**, always two parts: (1) **platform evidence** (SEV-SNP report, TDX quote, or TPM `TPM2_Quote` over PCRs) and (2) **key certification**: a `TPM2_Certify` attestation over `K` with `qualifyingData = nonce`, signed by the attestation key (AK) that the platform evidence vouches for (section 9.3a). Bare SEV-SNP / TDX deployments without a vTPM put `SHA-256(nonce ‖ thumbprint(K.public))` in `REPORT_DATA` / `REPORTDATA` **and** must certify `K` by another platform mechanism; report data alone names bytes, it does not certify a key | A platform key rooted in the vendor: TPM / vTPM AK (certified by the EK CA, or — the binding Azure CVMs are *expected* to provide but which this repo has not yet proven, §9.3a AK-binding gap — committed in the SNP-measured HCL runtime data), AMD VCEK / VLEK, Intel PCK |
 | **Verifier** (delegated, `verifier_kind=azure-maa` / `intel-ta`) | Azure Attestation or Intel Trust Authority, **called by jans-auth-server's attestation script** | **`AttestationResultJWT`**: a JWT stating "I verified this raw evidence against the vendor roots; the platform measured X; the report carried nonce N and key K.public" | The verifier's own published JWKS |
 | **Verifier** (in-process, `verifier_kind=local`) | jans-auth-server's attestation script | The same appraisal, done locally over the raw evidence (`eat+jwt` signed by a trusted attester key; later `tpm2-quote+json`) | n/a; the verdict is signed by jans below |
 | **Relying Party** | jans-auth-server core (`AttestationService`, then DCR and `/token`) | **Assessment** (server-side record, section 9.6): "I accept this verdict for key K until `expires_at`"; surfaced to others through the SVID `attestation` claim and the TRACE record | Not a separate token; the SVID and the TRACE record carry jans's signature |
@@ -781,7 +781,7 @@ conformance vectors").**
 
 | Platform (`evidence_format`) | Appraisal | Key certification / `key_binding_strength` | Status |
 |------------------------------|-----------|---------------------------------------------|--------|
-| **Azure confidential VM, SEV-SNP with vTPM** (`azure-cvm-sev-snp+json`), the demo platform | Delegated to Azure Attestation (`verifier_kind=azure-maa`) | `TPM2_Certify` of `K` by the vTPM AK with `qualifyingData = nonce` → `certified`. Azure's HCL is documented to place the vTPM AK in the SNP report runtime data (`REPORT_DATA = SHA-256(hcl_runtime_data)`), AMD signs the report with the VCEK, and MAA is documented to return the AK in `x-ms-runtime.keys`. On Azure CVMs the guest cannot choose `REPORT_DATA`, so freshness comes from the `TPM2_Certify` `extraData`, not the SNP report. **Claim paths per Azure MAA docs; pending captured vectors.** | experimental |
+| **Azure confidential VM, SEV-SNP with vTPM** (`azure-cvm-sev-snp+json`), the demo platform | Delegated to Azure Attestation (`verifier_kind=azure-maa`) | `TPM2_Certify` of `K` by the vTPM AK with `qualifyingData = nonce` → `certified` — **conditional on an AK-binding step this repository has not yet substantiated (see "The Azure AK-binding gap" below).** Azure's HCL is documented to place HCL runtime data in the SNP report (`REPORT_DATA = SHA-256(hcl_runtime_data)`) and AMD signs the report with the VCEK, but **`x-ms-runtime.keys` is a JWK *set* of runtime-reported keys that need not be — and in Microsoft's own example is not only — the signing AK** (it includes an encryption key named `HCLTransferKey`). Selecting "some key from `x-ms-runtime.keys`" does **not** prove the key that *signed the `TPM2_Certify`* is the vTPM AK of the VM MAA appraised. Freshness comes from the `TPM2_Certify` `extraData` (the guest cannot choose SNP `REPORT_DATA`). **AK binding unproven; blocks `validated` until captured vectors demonstrate it.** | experimental |
 | **Physical / generic TPM 2.0** (`tpm2-quote+json`) | In-process (`verifier_kind=local`), vendor-neutral | Same `TPM2_Certify` by an AK → `certified`. AK certified by a privacy CA, or bound to the EK via `TPM2_MakeCredential` / `TPM2_ActivateCredential` with the EK certificate chaining to the manufacturer CA | experimental |
 | **Google Cloud Confidential VM / Confidential Space** (`gcp-confidential-space+jwt`) | Delegated to the Confidential Space attestation service (`verifier_kind=gcp-cs`), which issues an OIDC-style token | Where a vTPM is present, `TPM2_Certify` → `certified`; otherwise the measured-image model → `measured_guest`. Profile declares the token issuer/JWKS and the claim paths to the image/submod measurement and the echoed nonce. **Claim paths per GCP Confidential Space docs; pending captured vectors.** | experimental |
 | **AWS Nitro Enclaves** (`aws-nitro+cbor`) | In-process (`verifier_kind=aws-nitro`): verify the COSE_Sign1 attestation document against the pinned AWS Nitro Attestation PKI root | No vTPM → `measured_guest`: the document's `public_key` / `user_data` carries `K`'s thumbprint and the `nonce` field carries freshness; PCRs are the measurement. **Structure per AWS Nitro docs; pending captured vectors.** | experimental |
@@ -790,16 +790,49 @@ conformance vectors").**
 
 Core's concrete checks for a **`certified`** (TPM) profile are: (1) the verifier result is valid
 under the profile (issuer, signature, `exp`), the platform/attestation-type claim is as the profile
-expects, the launch/image measurement is in policy, and debug is disabled; (2) the attester/AK in
-the result equals the AK that signed the certification; (3) the AK signature over the certify
-structure verifies; (4) the certification's `extraData`/nonce equals the challenge nonce; (5) the
-certified key name equals `Name(key_public)`; (6) `key_public` attributes mark it non-duplicable
-(`fixedTPM`, `fixedParent`, `sensitiveDataOrigin`, `sign`, not `restricted`/`decrypt`-duplicable);
-(7) the key material inside `key_public` equals `attested_key`. For a **`measured_guest`** profile,
+expects, the launch/image measurement is in policy, and debug is disabled; (2) **the AK that signed
+the certification is the one the appraised platform vouches for** — not merely a key that appears in
+a runtime-key set. This is the obligation the Azure profile does **not** yet meet (see "The Azure
+AK-binding gap"): core must have a verifiable path from the signing AK of the `TPM2_Certify` to the
+VM MAA appraised (an AK-certificate/`AKCert` chain, or the AK's public key committed inside the
+SNP-measured HCL runtime data whose digest is `REPORT_DATA`), and it must select the AK by that
+binding, never by position in `x-ms-runtime.keys`; (3) the AK signature over the certify structure
+verifies; (4) the certification's `extraData`/nonce equals the challenge nonce; (5) the certified
+key name equals `Name(key_public)`; (6) `key_public` attributes mark it non-duplicable (`fixedTPM`,
+`fixedParent`, `sensitiveDataOrigin`, `sign`, not `restricted`/`decrypt`-duplicable); (7) the key
+material inside `key_public` equals `attested_key`. For a **`measured_guest`** profile, (2) and
 (5)–(7) are replaced by "the measured guest image is in policy and the report binds
 `SHA-256(nonce ‖ thumbprint(K.public))`", and the assessment records `key_binding_strength=measured_guest`.
 These are the vendor-neutral checks; the Azure/TPM instance is the one with captured vectors
-targeted first (section 13, PR 3).
+targeted first (section 13, PR 3), and check (2) is exactly what those vectors must demonstrate.
+
+#### The Azure AK-binding gap (stated honestly, unproven until vectors)
+
+The Azure `certified` claim rests on one step this repository has **not** substantiated: that the
+AK which signed the `TPM2_Certify` over `K` is the vTPM AK *of the specific VM Azure Attestation
+appraised*. The documented MAA result does not hand this over for free:
+
+- **`x-ms-runtime.keys` is a set, not "the AK".** It is a JWK set of keys the HCL reports at
+  runtime, and Microsoft's own published example includes an **encryption** key named
+  `HCLTransferKey` alongside any attestation key. "A key appears in `x-ms-runtime.keys`" is
+  therefore *not* evidence that a given key is the signing AK, and picking a key by name or position
+  is unsound — a confused or hostile guest could present a certify signed by a key it controls while
+  a different key occupies the expected slot.
+- **What must actually be shown.** The implementation needs a cryptographic chain from the
+  `TPM2_Certify` **signer** to the appraised VM. Concretely, one of: (a) an AK certificate
+  (`AKCert`) that chains to a root the MAA appraisal covers, with the certify verified under *that*
+  AK; or (b) the signing AK's public key (or its digest/`Name`) committed inside the HCL runtime data
+  that the SNP report measures (`REPORT_DATA = SHA-256(hcl_runtime_data)`), so AMD's VCEK signature
+  over the report transitively binds the AK to the measured VM. Either way the AK is selected and
+  trusted **by that binding**, never by its presence in a runtime-keys list.
+- **Until a captured vector demonstrates (a) or (b)**, the Azure profile ships `experimental`, its
+  `certified` strength is **provisional**, and a deployment that requires a genuine hardware binding
+  for a high-risk capability MUST refuse it (the `experimental`-refusal switch, 9.3b). The profile
+  config below carries `akClaimPath` only as a *candidate* location to inspect; it is not treated as
+  proof of AK identity, and core's check (2) is what the Azure vector set must satisfy to earn
+  `validated`. If the captured MAA result turns out to expose no verifiable AK-to-VM binding at all,
+  the honest outcome is to **downgrade the Azure profile to `measured_guest`** rather than assert a
+  `certified` guarantee the evidence does not support.
 
 What a `certified` profile establishes, in words a relying party can rely on: *"The private half of
 `K` was generated inside, and cannot be exported from, hardware whose launch/image measurement the
@@ -822,7 +855,13 @@ carries both:
 - **Captured interoperability vectors, positive and negative.** A recorded *positive* vector (real
   evidence + verifier result that core's checks accept) and a set of *must-fail* vectors — wrong
   nonce, wrong/forged attested key, debug-enabled, measurement-not-allowed, tampered AK signature,
-  expired verifier result — that core MUST reject. These follow the positive/negative/must-fail
+  expired verifier result — that core MUST reject. **For any `certified` cloud profile (Azure
+  first), the positive vector MUST demonstrate the AK-binding of check (2) — a verifiable chain from
+  the `TPM2_Certify` signer to the appraised VM — and the must-fail set MUST include a certify
+  signed by a key that merely *appears in* `x-ms-runtime.keys` (e.g. a stand-in for `HCLTransferKey`
+  or any non-AK runtime key) but is not the bound AK; core MUST reject it. A profile whose captured
+  result cannot exhibit this binding does not earn `certified` and is recorded `measured_guest`
+  (9.3a AK-binding gap).** These follow the positive/negative/must-fail
   discipline of the TRACE accountability-conformance work and live beside the profile as test
   fixtures. Only when a profile has citations **and** passing positive/negative vectors is it
   promoted to `maturity: validated`; a deployment MAY refuse `experimental` profiles for a
@@ -845,7 +884,7 @@ material itself and derives the binding from it; the script only hands the mater
 |---------|-----|-----|
 | Call the platform verifier; choose endpoint, credentials, request shape | Script | `callVerifier()` |
 | `AttestationResultJWT` signature, `iss`, `exp`, `nbf` | **Core** | Against a server-configured **verifier profile** (`attestationVerifierProfiles`, below), never against script-supplied keys |
-| Extract nonce and attested key from the result | **Core** | Claim paths come from the verifier profile (per-vendor, e.g. Azure: `x-ms-runtime.keys`, nonce via the certify structure; Intel TA: `nonce`, `cnf`; GCP/AWS/OCI per their profiles — see 9.3a); the script cannot redirect them |
+| Extract nonce and attested key from the result | **Core** | Claim paths come from the verifier profile (per-vendor, e.g. Intel TA: `nonce`, `cnf`; GCP/AWS/OCI per their profiles — see 9.3a); the script cannot redirect them. **For Azure, `akClaimPath: x-ms-runtime.keys` names a JWK *set* to inspect, not "the AK" — core must bind the certify signer to the appraised VM, not trust a key by its presence there (the AK-binding gap, 9.3a)** |
 | Nonce equals the challenge nonce | **Core** | Compared to the persisted challenge |
 | Attested key equals the challenge `jkt` and a registered key of `client_id` | **Core** | RFC 7638 thumbprint of the key core extracted |
 | Key certification chain (`TPM2_Certify` parse, AK match, signature, `extraData`, name, attributes) | **Core** | `TpmCertifyVerifier` in `io.jans.as.server.attestation` (small, self-contained TPM 2.0 structure parsing; no external library) |
@@ -872,8 +911,11 @@ paths are per-deployment.
     "measurementClaimPath": "x-ms-sevsnpvm-launchmeasurement",
     "debugClaimPath": "x-ms-sevsnpvm-is-debuggable",
     "akClaimPath": "x-ms-runtime.keys",
+    "akBindingProven": false,
+    "akBindingNote": "x-ms-runtime.keys is a JWK SET (includes HCLTransferKey, an encryption key); it is NOT proof of the signing AK. Core must bind the TPM2_Certify signer to the appraised VM via AKCert chain or AK committed in SNP-measured HCL runtime data (9.3a AK-binding gap). Candidate inspection path only.",
     "platform": "azure-cvm-sev-snp",
     "keyBindingStrength": "certified",
+    "keyBindingStrengthProvisional": true,
     "maturity": "experimental"
   },
   {
@@ -2399,7 +2441,7 @@ Each PR updates `jans-auth-server/docs/swagger.yaml` and the docs it touches in 
 |---|----|-------|
 | 1 | `access_token_type` | Section 7: enum, `RegisterRequestParam`, `ClientAttributes.accessTokenType`, resolver, validator (without the attestation row), swagger deprecation of `access_token_as_jwt`, `RegisterRequest` client support |
 | 2 | Bundle endpoint | Section 8: `SPIFFE_SVID_ISSUANCE` flag, `SpiffeOwnBundleService`, endpoint, discovery member, trust-domain pinning, config properties, swagger path + `SpiffeBundle` schema |
-| 3 | Attestation endpoint | Section 9: `ATTESTATION` flag, `/attestation/challenge`, `/attestation`, `AttestationService`, challenge state machine, the **vendor-neutral binding contract** + verifier profiles (`maturity`/`keyBindingStrength`) + `AttestationResultVerifier`, `TpmCertifyVerifier`, entity + schema, verifier HTTP client, script type + `ExternalAttestationService`, reference script, discovery members, swagger. **Ship the Azure + generic-TPM profiles with vendor citations and captured positive/negative conformance vectors (promoting them to `validated`); other cloud profiles (GCP/AWS/OCI) ship `experimental` until their vectors exist (section 9.3a)** |
+| 3 | Attestation endpoint | Section 9: `ATTESTATION` flag, `/attestation/challenge`, `/attestation`, `AttestationService`, challenge state machine, the **vendor-neutral binding contract** + verifier profiles (`maturity`/`keyBindingStrength`) + `AttestationResultVerifier`, `TpmCertifyVerifier`, entity + schema, verifier HTTP client, script type + `ExternalAttestationService`, reference script, discovery members, swagger. **Ship the generic-TPM profile with vendor citations and captured positive/negative vectors (the clean path to `validated`, since a physical TPM AK chains to a manufacturer/privacy CA). The Azure profile ships `experimental` and is promoted to `validated` only if a captured MAA vector demonstrates the AK-to-VM binding of check (2) (AKCert chain, or AK committed in the SNP-measured HCL runtime data) — not merely a key present in `x-ms-runtime.keys`; if the captured result exposes no such binding, Azure is recorded `measured_guest`, not `certified` (section 9.3a AK-binding gap). GCP/AWS/OCI ship `experimental` until their vectors exist** |
 | 4 | DCR gate | Section 9.5: `attestation` parameter, DPoP proof on `/register`, `validateAttestation()`, `stale_evidence` + `challenge_id`, one-step `evidence` routing, `ClientAttributes.attestation` and `allowedResources` (`allowed_resources` metadata), `updateClient` re-gate, attestation row in the `JWT-SVID` validator, swagger client-metadata schemas |
 | 5 | Issuance | Section 10: `validateJwtSvidRequest`, `invalid_target`, key rule, freshness rule + `attestation_required`, inline `attestation` / `evidence` / `challenge_id` parameters, `JwtSvidBuilder`, lifetime, introspection, `txn` in ID-JAG, `TokenRequest` client support (`setResource`, `setAttestation`), swagger token endpoint |
 | 6 | TRACE emission (Phase-1 producer) | Section 11: producer key, chain state, outbox, emitter, record builders, configuration, setup step. Scope is a **TRACE Phase-1 producer** — attributable, correlatable records Lock receives/verifies/chains; it is gated on Lock shipping the TRACE subsystem, and the settlement, completeness, RATS/instance-binding, lineage, and Evidence-Packet assurances the records are forward-compatible with are later TRACE phases (see §11.1 phase mapping), not delivered here |
@@ -2446,8 +2488,8 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `AuthorizationGrantTest` (extend) | protected SVID claims re-applied after `modifyAccessToken()` alters or removes them; `WARN` logged; additive claims kept |
 | `DpopServiceTest` (extend) | `validateDpopKeyIsRegistered`: match, mismatch, no JWKS, `jwks_uri` |
 | `JwtSvidBuilderTest` | `sub` derivation; `aud` = resources only; `cnf.jkt`; the `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` pair is always present together, sourced correctly, and reused across renewals, with `txn` carrying the same execution-id value; `attestation`; `delegation` present / absent; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
-| `TpmCertifyVerifierTest` | `TPMS_ATTEST` parse; AK signature; `extraData` mismatch; name mismatch; attribute policy; key material equals JWK |
-| `AttestationResultVerifierTest` | profile lookup by `verifier_kind`; signature / issuer / `exp`; claim-path extraction; script-supplied JWKS ignored |
+| `TpmCertifyVerifierTest` | `TPMS_ATTEST` parse; AK signature; `extraData` mismatch; name mismatch; attribute policy; key material equals JWK; **AK-binding (§9.3a):** a certify whose signing key is bound to the appraised VM (AKCert chain, or AK committed in the SNP-measured HCL runtime data) is accepted; **a certify signed by a key that merely appears in `x-ms-runtime.keys` (e.g. a stand-in for `HCLTransferKey` or any non-AK runtime key) but carries no VM binding is rejected**, and a certify signed by a key absent from any binding path is rejected |
+| `AttestationResultVerifierTest` | profile lookup by `verifier_kind`; signature / issuer / `exp`; claim-path extraction; script-supplied JWKS ignored; **the AK is selected by its VM binding, never by position/name in the `akClaimPath` JWK set; a profile without a demonstrated AK binding cannot yield `certified` (falls back to `measured_guest`)** |
 | `AttestationChallengeServiceTest` | `pending → processing` CAS and the losing racer; `completed` terminal; retry after `verifier_unavailable` keeps nonce; retry limit; lease expiry repair |
 | `TraceExecutionRegistryTest` | open / validate / close; foreign `client_id` refused; expiry |
 | `AbstractAuthorizationGrantTest` (extend) | SVID lifetime source, cap, key-regeneration interaction |
@@ -2566,7 +2608,7 @@ points at the section that bounds or addresses it.
 | # | What must be trusted / is not proven | Why it is residual | Mitigation / where detailed |
 |---|--------------------------------------|--------------------|-----------------------------|
 | 1 | **The platform verifier** (Azure MAA, Intel TA, GCP CS, …) appraises honestly and its signing keys are uncompromised | jans delegates appraisal of raw hardware evidence to it; a dishonest verifier could affirm a bad platform | Verifier trust anchors are server config (`attestationVerifierProfiles`); core re-checks the result signature/issuer/nonce/key binding (9.3b); raw evidence can be re-appraised independently when stored (§15, "Auditor doubts jans") |
-| 2 | **The named platform claim paths are correct** (e.g. Azure HCL→AK→`x-ms-runtime.keys`) | Not substantiated by captured vectors in-repo | Profiles ship `experimental` until citations + positive/negative vectors promote them to `validated` (9.3a) |
+| 2 | **The named platform claim paths are correct, and — for a `certified` cloud profile — the `TPM2_Certify` signing AK is cryptographically bound to the appraised VM** | Not substantiated by captured vectors in-repo. In particular, Azure's `x-ms-runtime.keys` is a JWK *set* (includes a non-AK encryption key, `HCLTransferKey`) and does **not** by itself identify the signing AK | Profiles ship `experimental` until citations + positive/negative vectors — including a must-fail vector for a non-AK runtime key — promote them to `validated`; absent a demonstrated AK-to-VM binding, the Azure profile is `measured_guest`, not `certified` (9.3a AK-binding gap) |
 | 3 | **The right process inside the attested runtime uses `K`** | Attestation proves the platform and key custody, not which process signs (and not that agent memory/prompts are intact) | Needs agent-runtime measurement (IMA, confidential containers) in `allowed_measurements`, or behavioural TRACE evidence (§15 guarantee) |
 | 4 | **A `measured_guest` key is actually protected by its guest image** | On bare SEV-SNP/TDX/Nitro without a vTPM, `K` is reported-by-a-measured-image, not TPM-certified | `key_binding_strength` records `measured_guest` vs `certified` so a verifier can tell them apart (9.3a) |
 | 5 | **The relying-party PEP performs the full RFC 9449 check** | A `cnf`-ignoring (bearer-only) or thumbprint-only PEP gets no hardware guarantee | Normative PEP presentation requirements; high-value RPs MUST be `cnf`-checking and require DPoP (§6) |
@@ -2883,8 +2925,18 @@ resolution.
   (Azure `x-ms-*`/HCL/AK, and the GCP/AWS/OCI equivalents) are documented best-effort and are
   **not** substantiated by captured vectors in this repository. A profile ships `maturity:
   experimental` until it carries vendor citations **and** passing positive/negative conformance
-  vectors, at which point it is `validated`; PR 3 does this for Azure + generic TPM first, and a
-  deployment MAY refuse `experimental` for a high-risk capability (section 9.3a).
+  vectors, at which point it is `validated`; PR 3 takes the generic-TPM profile there first (its AK
+  chains to a manufacturer/privacy CA), and a deployment MAY refuse `experimental` for a high-risk
+  capability (section 9.3a).
+- **The Azure `certified` claim has an explicit, unproven AK-binding gap.** `x-ms-runtime.keys` is
+  a JWK *set* (Microsoft's own example includes a non-AK encryption key, `HCLTransferKey`), so "a
+  key appears there" is **not** proof that the `TPM2_Certify` signing AK is the vTPM AK of the VM
+  MAA appraised. The Azure profile earns `certified`/`validated` only when a captured vector shows a
+  verifiable AK-to-VM binding (an AKCert chain, or the AK committed inside the SNP-measured HCL
+  runtime data whose digest is `REPORT_DATA`); core selects the AK by that binding, never by its
+  presence in the runtime-keys set, and a must-fail vector for a non-AK runtime key is required. If
+  no such binding exists in the captured result, Azure is recorded `measured_guest`, not `certified`
+  (section 9.3a, "The Azure AK-binding gap").
 - **`key_binding_strength` is recorded per platform.** `certified` (a vTPM/TPM `TPM2_Certify`s a
   non-exportable `K`) vs. `measured_guest` (a measured image reports it holds `K`) is stored on the
   assessment and surfaced across clouds, so a relying party can tell them apart (section 9.3a).
@@ -3190,8 +3242,9 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **Attester / Verifier / Relying Party** | The hardware producing evidence / the platform service appraising it (Azure MAA, Intel TA, …) / jans accepting the verdict (§9.2). |
 | **Evidence vs. Attestation Result** | Raw hardware-signed evidence vs. the verifier's signed appraisal (`AttestationResultJWT`) of it (§9.2). |
 | **EAR / EAT** | EAT Attestation Result (draft-ietf-rats-ar4si) status vocabulary — `affirming` / `warning` / `contraindicated` (§9.6); EAT (RFC 9711) is the preferred cloud-neutral evidence envelope (§9.3a). |
-| **`TPM2_Certify` / AK / vTPM** | The TPM operation that certifies a key as non-exportable, the attestation key that signs it, and the virtual TPM on a confidential VM (§9.3a). |
-| **`key_binding_strength`** | `certified` (TPM-certified, non-exportable) vs. `measured_guest` (a measured image reports it holds the key) (§9.3a). |
+| **`TPM2_Certify` / AK / vTPM** | The TPM operation that certifies a key as non-exportable, the attestation key (AK) that signs it, and the virtual TPM on a confidential VM. `certified` requires the AK to be bound to the appraised VM, not merely present in a runtime-key set (§9.3a). |
+| **AK-binding gap (Azure)** | The unproven step in the Azure profile: `x-ms-runtime.keys` is a JWK set (includes the non-AK `HCLTransferKey`), so it does not identify the `TPM2_Certify` signing AK; `certified` is provisional until a captured vector shows an AKCert chain or an AK committed in the SNP-measured HCL runtime data (§9.3a). |
+| **`key_binding_strength`** | `certified` (AK-certified, non-exportable, AK bound to the appraised VM) vs. `measured_guest` (a measured image reports it holds the key). Azure `certified` is provisional pending the AK-binding gap (§9.3a). |
 | **`attestation_ref` / `posture_assessment_ref`** | The producer-signed RATS binding, and the credential-provisioning posture reference carrying the attestation verdict (§11.2; `design.md`). |
 
 ### TRACE / Lock evidence
