@@ -387,7 +387,9 @@ any call to jans — **and they are present only when this audience's disclosure
 them** (section 10.10). The minimized default SVID omits `attestation` and `delegation` entirely,
 and discloses `delegation.principal_sub` as a pairwise identifier unless the audience is authorized
 for the raw subject; an audience that needs the hardware state or the human identity is the one
-configured to receive it, and no other RP does.
+whose token is *minted with* those claims — a different audience's token simply does not carry them
+(minimization). This is about which claims a token contains, not confidentiality of a token once
+issued: a signed SVID's claims are readable by anyone who holds it (§10.2, §10.10).
 
 ## 7. Access token type selection: `access_token_type` replaces `access_token_as_jwt`
 
@@ -1608,8 +1610,11 @@ The reason is the per-audience disclosure profile (§10.10): `attestation`, `del
 execution-id granularity are chosen *per audience*, so a single token carrying two audiences would
 have no well-defined profile — it would either over-disclose to the stricter audience or
 under-disclose to the looser one. Rather than silently pick one, v1 mints a **separate, minimally
-scoped SVID per audience**, each with that audience's profile applied, which is also the stronger
-privacy posture (a token is readable only by the one RP it was scoped to). The `List<String>`
+scoped SVID per audience**, each with that audience's profile applied. Each token is **intended for
+one resource server**, but it is a signed JWT, not an encrypted one: audience restriction controls
+*acceptance*, not *readability* — **anyone who obtains the signed JWT can read its claims.** The
+privacy benefit is therefore minimization (a per-audience token carries only that audience's
+claims), not confidentiality of what it does carry. The `List<String>`
 carrier and the RFC 8707 multi-value parse are kept so a later version MAY lift this to per-audience
 claim sets within one token (e.g. a nested/`aud`-keyed disclosure map) without reworking the request
 path; until then the one-audience rule is enforced at validation.
@@ -1844,9 +1849,13 @@ profile opts into the full claim set** (the minimized default is in section 10.1
 The **minimized default SVID** (what an ordinary audience receives) carries only
 `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, and `cnf` — the claims a plain SPIFFE/PEP
 verifier needs. The `attestation`, `delegation`, and correlation claims above are **opt-in per
-audience** (section 10.10), and `delegation.principal_sub` is a **pairwise** identifier
-(`ppid:…`) unless the audience is authorized for the raw subject — so no two unrelated relying
-parties receive a value they can use to correlate the human across services.
+audience** (section 10.10), and both `delegation.principal_sub` (`ppid:…`) and the delegation
+`credential_ref` are **pairwise per audience** unless the audience is authorized for the raw
+values — so two unrelated relying parties cannot join on *the human's identity or the delegation
+credential*. They can still tell it is the **same agent** (`sub` and `cnf.jkt` are stable across
+audiences by design); the SVID is a signed JWT whose claims are readable by anyone holding it, so
+the guarantee is minimization and reduced human-correlation, not agent anonymity or confidentiality
+(section 10.10).
 
 | Part | Value | Rule |
 |------|-------|------|
@@ -1860,7 +1869,7 @@ parties receive a value they can use to correlate the human across services.
 | `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` is the ID-JAG's execution id for a JWT-bearer grant; otherwise the `txn` request parameter when it names an open execution this grant is **bound to** — same client, same execution authority, same principal/delegation, and inside the delegation-validity window (§10.8); otherwise freshly minted. `execution_authority` is this server's configured authority (its issuer by default). Both are returned in the token response so renewals reuse them. | *Role:* the authoritative correlation binding PDP/PEP read. *Rule:* the two MUST travel together — one pair per execution, not per token. A presented `txn` that fails the §10.8 binding is `invalid_grant` (`execution_binding_mismatch`), never silently re-minted as a fresh execution. *Disclosure (§10.10):* raw only to a same-domain audience; a cross-domain audience gets a pairwise/opaque reference, never the global id. |
 | `txn` | Same value as `execution_id`, kept for the existing transaction-token machinery. | An application alias for `execution_id`, not a separate correlation key. Shares the execution id's per-audience disclosure rule (§10.10). |
 | `attestation` | The assessment that satisfied 10.4 — the hardware state the token was issued under. | *Disclosure (§10.10):* **omitted by default** — it is emitted only to an audience whose profile opts in. When an audience opts in, the granularity defaults to `status_only` (`{status, appraised_at}`); `platform` / `measurement` / `policy_version` / `id` go only to an audience whose profile is `full`, since raw measurements are fingerprinting material. The minimized default SVID (`svidDefaultClaims`) carries no `attestation` at all. |
-| `delegation` | *Contains:* `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` (the ID-JAG token-type URI), and `credential_id` (the ID-JAG `jti`). Omitted for pure `client_credentials`. | *Role:* ties the human to the agent inside the token. *Why not `act`:* RFC 8693 `act` names the *current actor* acting for `sub` (that would read as "Alice acts for the agent"), and `may_act` names a party allowed to *become* an actor — neither means "the principal who delegated." So the SPIFFE agent stays `sub`, and the delegator is a separate, explicit reference to the credential that carried the delegation. *Disclosure (§10.10):* omitted unless the audience opts in; `principal_sub` is **pairwise** per `(audience, human)` unless the audience is authorized for the raw subject, so unrelated RPs cannot correlate the human. The raw identity otherwise lives only in access-controlled TRACE evidence, resolved by `sid`. |
+| `delegation` | *Contains:* `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` (the ID-JAG token-type URI), and an **audience-specific** `credential_ref`. Omitted for pure `client_credentials`. | *Role:* ties the human to the agent inside the token. *Why not `act`:* RFC 8693 `act` names the *current actor* acting for `sub` (that would read as "Alice acts for the agent"), and `may_act` names a party allowed to *become* an actor — neither means "the principal who delegated." So the SPIFFE agent stays `sub`, and the delegator is a separate, explicit reference to the credential that carried the delegation. *Disclosure (§10.10):* omitted unless the audience opts in; `principal_sub` is **pairwise** per `(audience, human)`. **The delegation credential reference is also per-audience:** the raw ID-JAG `jti` is **not** placed in the token (a single `jti` repeated across audiences would re-link the human that the pairwise `principal_sub` was meant to unlink); instead `credential_ref` is a per-`(audience, ID-JAG)` opaque value that an audited resolver maps back to the ID-JAG, so two audiences cannot join on it. The raw `jti` and raw identity live only in the access-controlled TRACE evidence, resolved by `sid`. |
 | `client_id`, `scope`, `token_type` | as today | harmless additive claims |
 
 Everything else in `createAccessToken()` (`externalUpdateTokenService.modifyAccessToken()`,
@@ -2076,22 +2085,38 @@ profile:
 | Claim | Default (no profile) | `none` | middle | widest |
 |-------|----------------------|--------|--------|--------|
 | `attestation` | **omitted** (not in `svidDefaultClaims`) | omitted | `status_only` → `{status, appraised_at}` (the granularity default **when an audience opts in** without naming one) | `full` adds `platform`/`measurement`/`policy_version`/`id` (fingerprinting material — only for an audience that must apply its own measurement policy) |
-| `delegation` | `none` (omitted) | omitted | `pairwise` → `principal_sub` is a PPID per `(audience, human)`, `principal_iss` omitted or generalized | `raw` → the real `principal_iss`/`principal_sub` (only for an audience explicitly authorized for the human's identity) |
+| `delegation` | `none` (omitted) | omitted | `pairwise` → `principal_sub` is a PPID per `(audience, human)`, `principal_iss` omitted or generalized, and `credential_ref` is a per-`(audience, ID-JAG)` opaque value (**never** the raw ID-JAG `jti`, which would re-link across audiences) | `raw` → the real `principal_iss`/`principal_sub` and the raw ID-JAG `jti` (only for an audience explicitly authorized for the human's identity) |
 | execution id / `txn` | `same_domain` | omitted | `same_domain` → raw id only when the audience is in the execution's own trust domain | `always` (discouraged; see cross-domain rule) |
 
 An operator sets these per audience; an update-token or client-registration script may **narrow**
 a profile (never widen it), the same monotonic rule `allowed_resources` already follows.
 
-#### Pairwise human subject: unrelated services cannot correlate the human
+#### Pairwise human subject: reduces one correlation path, does not promise unlinkability
 
 When `delegation` is disclosed at `pairwise`, `principal_sub` is a **pairwise pseudonymous
-identifier** derived per `(audience, human)` (reusing jans's existing OIDC PPID machinery), so two
-unrelated RPs that both receive a delegation claim still cannot tell they concern the same human.
-The **raw** human identity (`iss`/`sub`/`email`) is disclosed in an SVID only to an audience set to
-`raw`, and otherwise lives only in the **access-controlled TRACE evidence**, where it is resolved
-from the execution via `sid` (section 10.9) rather than copied into every token and every
-downstream record. This is the AIMS rule — "user identity information delegated to agents is not
-exposed to unrelated services" — made concrete.
+identifier** derived per `(audience, human)` (reusing jans's existing OIDC PPID machinery), and the
+delegation `credential_ref` is likewise per-audience (§10.5). This **reduces a particular
+correlation path** — two unrelated RPs cannot join the agent's activity *on the human's subject or
+on the ID-JAG credential id*. It does **not** deliver general unlinkability, and this plan does not
+claim it does. Two correlation handles remain, by construction, in any SVID an agent presents to
+multiple RPs:
+
+- **The agent `sub` is stable.** The SPIFFE ID `spiffe://<td>/agent/<client_id>` is the same to
+  every audience (it is the agent's identity, and plain SPIFFE verifiers key on it). Any two RPs the
+  agent calls can tell it is the *same agent*.
+- **The `cnf.jkt` is stable.** The hardware key thumbprint is the same across audiences for the life
+  of the key, so it too links an agent's tokens across RPs.
+
+So the honest scope is: pairwise `principal_sub` and per-audience `credential_ref` keep *the human's
+identity and the specific delegation* from being joined across audiences, while the *agent* remains
+linkable across the services it calls (which is generally intended — the agent is one identity). An
+RP set that colludes can still observe "the same agent acted at all of us"; it cannot, from the
+tokens alone, resolve *which human* or join on the delegation credential. The **raw** human identity
+(`iss`/`sub`/`email`) is disclosed in an SVID only to an audience explicitly set to `raw`, and
+otherwise lives only in the **access-controlled TRACE evidence**, resolved from the execution via
+`sid` (§10.9) rather than copied into every token. This is the AIMS rule — "user identity
+information delegated to agents is not exposed to unrelated services" — applied to the human
+identity specifically, not a claim of agent-level anonymity (which the stable `sub`/`cnf` preclude).
 
 #### The correlation id does not become a global cross-service tracker
 
@@ -2750,7 +2775,7 @@ publishes an agentrust record for a run reads one Lock execution and fills: `sub
 `attestation_ref`; `policy.bundle_hash` ← the PDP decision's `trace.policy`;
 `tool_transcript.hash` ← digest over the ordered `CAPABILITY_INVOKED` records;
 `references[rel=authorized-intent]` ← the PDP decision record; `references[rel=approval-outcome]`
-← the ID-JAG (`jti`, IdP as resolver); `delegation.credential_id` ← the ID-JAG `jti`;
+← the ID-JAG (`jti`, IdP as resolver); `delegation.credential_id` ← the ID-JAG `jti` (read from the access-controlled TRACE evidence, which holds the raw `jti` — **not** from an SVID, whose `credential_ref` is a per-audience opaque value, §10.5);
 `transparency` ← Lock receipt URI. Export concern, not auth-server code; listed so the demo can
 show both views from one set of facts.
 
@@ -3221,7 +3246,8 @@ in the cited section.
 | Client lifecycle `active → suspended → decommissioned → tombstoned`, consulted on every `/token`; `client_id` never recycled; owner transfer is an attributed admin action | §9.9, §10.2 |
 | Signing-key revocation is not instantaneous at verifiers; the delay is bounded by the verifier's max bundle cache age (≤ `spiffeBundleRefreshHintSeconds`, or the tier's `bundleMaxCachedAgeSeconds`) | §16.1 |
 | One audience per token in v1 (`multiple_audiences_unsupported`), so each token has one disclosure profile | §10.2, §10.10 |
-| SVID is minimized by default; `attestation`/`delegation`/correlation id are opt-in per audience; cross-domain audiences get a pairwise execution reference | §10.10 |
+| SVID is minimized by default; `attestation`/`delegation`/correlation id are opt-in per audience; cross-domain audiences get a pairwise execution reference. An SVID is a **signed, not encrypted** JWT — audience restriction controls acceptance, not readability; the guarantee is minimization, not confidentiality | §10.2, §10.10 |
+| Pairwise `principal_sub` **and** a per-audience delegation `credential_ref` (never the raw ID-JAG `jti`) reduce the *human-identity* correlation path across audiences; they do **not** promise general unlinkability — the stable agent `sub` and `cnf.jkt` remain cross-audience handles by design (the agent is one identity) | §10.5, §10.10 |
 | A shared execution id is correlation, not same-operation proof (which is the Phase-3 operation-binding commitments) | §3, §11.1 |
 | Continuing an execution requires matching client + `execution_authority` + raw principal/delegation (not just client); delegation validity is bounded by `delegationExpiresAt`, independent of token renewal | §10.8 |
 | Human assurance is gated and recorded, not inferred: issuer-specific assurance mappings (no `acr` ordering) and WebAuthn BE/BS for synced-vs-device-bound (not `authenticator_attachment`) | §10.9 |
@@ -3312,7 +3338,8 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **IdP AS / Resource AS** | The two ID-JAG roles: the IdP Authorization Server issues the ID-JAG (`iss` = IdP, `aud` = Resource AS); the Resource AS (this jans-auth-server, the SVID issuer) redeems it. One installation may play both, but only across a trust boundary (§5). |
 | **DCR** | Dynamic Client Registration — the `/register` path where a key is enrolled and attestation is gated (§9.5). |
 | **`txn`** | RFC 8417 transaction claim; here an **application alias** for the execution id, not a separate correlation key (§3). |
-| **PPID / pairwise subject** | A per-audience pseudonymous identifier for the human, so unrelated relying parties cannot correlate them (§10.10). |
+| **PPID / pairwise subject** | A per-audience pseudonymous identifier for the human (and a per-audience delegation `credential_ref`), which **reduces** the human-identity correlation path across audiences — it does not deliver general unlinkability, since the agent `sub` and `cnf.jkt` stay stable across audiences (§10.5, §10.10). |
+| **Signed, not encrypted** | An SVID is a signed JWT: audience restriction governs *acceptance*, not *readability*. Anyone who obtains the token can read its claims; the privacy lever is claim minimization, not confidentiality (§10.2, §10.10). |
 
 ### RATS / attestation
 

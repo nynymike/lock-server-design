@@ -205,11 +205,28 @@ TTL; collapsed to one by `attestationRequireFreshPerIssuance`/a `critical` tier)
 authorization point is related to entity persistence and evidence commit as three ordered points — a
 rejection governs only issuances not yet past the first.
 
+## Q12. Privacy claims stronger than the token format supports
+
+**Raised.** Pairwise human subjects do not prevent correlation if tokens disclose the same ID-JAG
+`credential_id` across audiences, and the stable agent `sub` and hardware `cnf.jkt` remain
+correlation handles. More directly, "a token is readable only by the one RP it was scoped to" is
+wrong: audience restriction controls acceptance, not readability — a signed JWT is not encrypted.
+
+**Change (§§10.2, 10.5, 10.10).** Replaced the "readable only by" sentence with: *each token is
+intended for one resource server; anyone who obtains the signed JWT can read its claims* — the
+privacy lever is minimization, not confidentiality. Made the delegation credential reference
+**audience-specific** (`credential_ref`, a per-`(audience, ID-JAG)` opaque value; the raw `jti` is
+never put in the token), so it no longer re-links the human across audiences. Restated pairwise
+identifiers as **reducing the human-identity correlation path**, explicitly **not** promising
+general unlinkability, and named the residual handles: the agent `sub` and `cnf.jkt` are stable
+across audiences by design (the agent is one identity), so colluding RPs can still see "the same
+agent," just not which human or the delegation credential.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
 folded into the numbered sections of the main document (notably the §9.5 enrollment transaction, the
 §9.7/§10.4 single-row state model with `revision` + `appraisalGeneration`, the §11.3 append/commit
 protocol, the §9.3a Azure AK-binding gap, the §10.8–§10.9 execution-binding and human-assurance
-rules, and the §16.1 key-revocation delay). This history preserves the original questions that drove
-them; for current behaviour, read the main document.
+rules, the §10.10 token-privacy scope, and the §16.1 key-revocation delay). This history preserves
+the original questions that drove them; for current behaviour, read the main document.
