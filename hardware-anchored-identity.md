@@ -23,28 +23,23 @@ tags:
 > [Hardware-Anchored Agent Identity Demo Plan](https://github.com/JanssenProject/jans/wiki/Hardware%E2%80%90Anchored-Agent-Identity-Demo-Plan)
 > and aligns with the OWASP GovOps architecture (capability as the unit of governance; access
 > decisions visible, measurable, accountable). The scope is **jans-auth-server**; changes other
-> components need are listed in one short section (section 12) as dependencies.
+> components need are listed in the [implementation appendix](./hardware-anchored-identity-implementation.md)
+> as dependencies.
 
 ## 1. The goal in one paragraph
 
-An operator enrolls an AI agent with jans-auth-server. The agent's keypair lives in a hardware
-secure element (TPM, TEE, confidential VM) and never leaves it. jans-auth-server **attests** that
-key through a dedicated attestation endpoint, binds it to the agent's registration, assigns the
-agent a SPIFFE ID, and from then on mints short-lived **JWT-SVIDs** pinned to that key via `cnf`.
-Before every issuance the server checks that the hardware passed policy *recently enough*, not only
-at enrollment. jans-auth-server publishes its signing keys as a **SPIFFE trust bundle**, so any
-relying party, SPIRE or plain JWT verifier, checks the token offline. When a human stands behind the
-agent, the human's identity enters through an ID-JAG and is carried into the SVID. Every step the
-server takes (appraisal, enrollment, delegation, issuance) is emitted as a signed, hash-chained
-**TRACE record**. Appraisal and enrollment are **lifecycle** records that precede, and serve many,
-executions, so they keep their own identifiers; delegation and issuance carry the execution's
-`(trace_execution_id, execution_authority)` pair, and the lifecycle records are linked in by
-`parent_record_ids` (see §3). Correlated that way, a third party can later tie together the human,
-the agent, the hardware key, the authorization decision and the invocation of a governed
-capability. The SVID itself is checkable offline against the published bundle; correlating a full
-execution view is an online query against jans-lock in the initial (Phase-1) integration, and
-becomes fully offline-verifiable only with the later Phase-4 Evidence Packet (see §11.1 for the
-phase mapping).
+Jans Auth Server enrolls an agent key and verifies evidence binding it to an approved platform. It
+issues short-lived JWT-SVIDs bound to that key, and relying parties enforce possession through DPoP.
+Signed TRACE records connect enrollment, appraisal, delegation, and issuance to later authorization
+and runtime evidence. This establishes credential provenance and execution correlation; it does not
+prove that the agent is uncompromised or that correlated records describe the same operation.
+
+The detail behind each clause follows: the attestation endpoint and the hardware-key binding (§9),
+SVID issuance and DPoP presentation (§6, §10), the TRACE producer model and record set (§11), and
+the correlation model with its explicit limits (§3). The SVID is checkable offline against the
+published SPIFFE bundle (§8); a full execution view is an online query against jans-lock in the
+Phase-1 integration and becomes offline-verifiable only with the later Phase-4 Evidence Packet
+(§11.1).
 
 ## 2. The trust chain at a glance
 
@@ -283,14 +278,15 @@ recovery rules are section 9.9.
 
 ## 6. Verification: how and where
 
-Three offline-capable paths. In all three the answer to "does the verifier call the auth server?"
-is: only periodically for the bundle, never per token.
+Three verification paths: two offline (bundle-based) and one online. The two offline paths call the
+auth server only periodically for the bundle, never per token; introspection is an online,
+per-token call to the auth server.
 
-| Path | Who it's for | How it works |
-|------|--------------|--------------|
-| **SPIRE federation** | Relying parties in a SPIFFE/SPIRE ecosystem | SPIRE server adds `federates_with` pointing at the jans bundle endpoint (`https_web` profile), fetches on the refresh-hint cadence, distributes to its agents; workloads validate via `ValidateJWTSVID` |
-| **Direct bundle fetch** | Ordinary services, gateways | The bundle is a JWKS. Any JWT library verifies the signature and checks `sub`, `aud`, `exp` |
-| **Introspection** | High-assurance checks and debugging | RFC 7662 at jans-auth-server for a live answer; the closest thing to revocation the short-TTL model offers |
+| Path | Online/offline | Who it's for | How it works |
+|------|----------------|--------------|--------------|
+| **SPIRE federation** | Offline per token (bundle fetched periodically) | Relying parties in a SPIFFE/SPIRE ecosystem | SPIRE server adds `federates_with` pointing at the jans bundle endpoint (`https_web` profile), fetches on the refresh-hint cadence, distributes to its agents; workloads validate via `ValidateJWTSVID` |
+| **Direct bundle fetch** | Offline per token (bundle fetched periodically) | Ordinary services, gateways | The bundle is a JWKS. Any JWT library verifies the signature and checks `sub`, `exp`, and that its own identifier is **a member of** `aud` (not equal to it): `aud` is a JWT array (RFC 7519), and a relying party accepts the token iff its identifier appears in the array. SPIFFE allows multiple audiences but recommends one in normal cases, and v1 issues exactly one (§10.2) — but verifiers MUST still use membership, not equality, so a future multi-audience token verifies correctly |
+| **Introspection** | **Online** (per-token call to jans) | High-assurance checks and debugging | RFC 7662 at jans-auth-server for a live answer; the closest thing to revocation the short-TTL model offers |
 
 SPIRE configuration on the relying party side (the entire integration):
 
@@ -825,8 +821,9 @@ key name equals `Name(key_public)`; (6) `key_public` attributes mark it non-dupl
 material inside `key_public` equals `attested_key`. For a **`measured_guest`** profile, (2) and
 (5)–(7) are replaced by "the measured guest image is in policy and the report binds
 `SHA-256(nonce ‖ thumbprint(K.public))`", and the assessment records `key_binding_strength=measured_guest`.
-These are the vendor-neutral checks; the Azure/TPM instance is the one with captured vectors
-targeted first (section 13, PR 3), and check (2) is exactly what those vectors must demonstrate.
+These are the vendor-neutral checks; the generic-TPM instance is the one with captured vectors
+targeted first (implementation appendix, PR 3), and check (2) is exactly what those vectors must
+demonstrate.
 
 #### The Azure AK-binding gap (stated honestly, unproven until vectors)
 
@@ -996,9 +993,13 @@ declarative.
 
 The script's `verifier_kind` must name a profile; a script result whose `AttestationResultJWT`
 does not verify under that profile is `contraindicated` with `untrusted_verifier` regardless of
-what the script reported. With this split the statement "a script cannot mint `affirming` for a
-key the evidence does not name" holds by construction: every binding input is a signature core
-checked against configuration the script cannot touch.
+what the script reported. This split is what makes "a script cannot mint `affirming` for a key the
+evidence does not name" true, under one assumption: every binding input (verifier-result signature
+and issuer, nonce, derived attested key, `TPM2_Certify` chain) is checked by core against the
+server-configured verifier profile, and the script result API exposes no setter for any of those
+facts (§9.3b). The claim holds as long as that API boundary holds — a script that could write a
+binding fact directly would break it, which is why the result object is read-only for binding
+fields.
 
 ### 9.3c Challenge lifecycle: an atomic state machine
 
@@ -1720,7 +1721,7 @@ parties receive a value they can use to correlate the human across services.
 |------|-------|------|
 | header `alg`, `kid`, `typ: JWT` | client `access_token_signing_alg` if asymmetric else `defaultSignatureAlgorithm`; key from `WebKeysConfiguration` (the set the bundle publishes); HMAC rejected at registration and defensively here | existing `JwtSigner` |
 | `iss` | `appConfiguration.getIssuer()` | |
-| `sub` | `SpiffeIdUtil.buildAgentSpiffeId(trustDomain, clientId)` → `spiffe://<td>/agent/<client_id>`. The trust-domain grammar is validated first, so a `/` in the configured domain cannot silently become path segments. | **Derived** by the server, never taken from the `spiffe_id` client attribute (which means the opposite thing — an external identity the client authenticates *in* with). Spoofing and collisions are therefore structurally impossible. |
+| `sub` | `SpiffeIdUtil.buildAgentSpiffeId(trustDomain, clientId)` → `spiffe://<td>/agent/<client_id>`. The trust-domain grammar is validated first, so a `/` in the configured domain cannot silently become path segments. | **Derived** by the server from the authenticated `client_id` and the pinned trust domain, never taken from the `spiffe_id` client attribute (which means the opposite thing — an external identity the client authenticates *in* with). Because the client never supplies `sub` and `client_id` is unique per client, a client cannot spoof another's SPIFFE ID or collide with it: the only way to change `sub` is to be a different authenticated client. |
 | `aud` | the single validated `resource` value (v1 is one audience per token, §10.2); `removeClaim` first so neither `client_id` nor `additionalAudience` leak in | **required**; the reverse of the inbound validator where `aud` must equal our issuer. A single-element `aud` keeps the §10.10 disclosure profile unambiguous |
 | `iat`, `nbf`, `exp` | from `accessToken`; lifetime per 10.6 | |
 | `jti` | `context.getTokenReferenceId()` | |
@@ -2008,8 +2009,9 @@ jans-auth-server becomes a TRACE **producer** towards jans-lock.
 > The Lock source today exposes only the ordinary audit endpoints (`/audit/health`, `/audit/log`,
 > `/audit/telemetry` and their `/bulk` variants); there is no `/api/v1/audit/trace` ingestion or
 > retrieval, no TRACE record store or verifier, no producer-key API, and no receipt ledger. Those
-> are **implementation dependencies this plan assumes Lock will add** (tracked in section 12's
-> dependency table), not completed components to call. The producer work below (sign, chain,
+> are **implementation dependencies this plan assumes Lock will add** (tracked in the dependency
+> inventory in the [implementation appendix](./hardware-anchored-identity-implementation.md)), not
+> completed components to call. The producer work below (sign, chain,
 > outbox, emit) can be built and unit-tested against the record schema independently, but the
 > end-to-end flow is gated on Lock delivering that subsystem.
 
@@ -2564,99 +2566,23 @@ Deliberately absent: a CA or X.509-SVID issuance; the SPIFFE Workload API (agent
 OAuth clients over HTTPS); in-process parsing of SEV-SNP / TDX quotes; any dependency on agentrust
 SDKs.
 
-### Dependencies outside jans-auth-server
+### Dependencies, PR sequencing, hardware platform, and test design
 
-| Component | Change | Needed by |
-|-----------|--------|-----------|
-| jans-core | `CustomScriptType.ATTESTATION`, `AttestationType`, `DummyAttestationType`; a binding to the shared **`jans-trace-core`** canonicalization/signing/digest library (its Java/JNI binding, or a Java implementation that passes its normative vectors), **not** a jans-local canonicalizer — so producer and Lock outputs are byte-identical | PR 1, PR 6 |
-| jans-lock | Accept the existing `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED` (bootstrap) event kinds this plan emits — no new event kind is introduced (the earlier `ATTESTATION_APPRAISED` proposal is dropped in favor of `CREDENTIAL_PROVISIONED` carrying the attestation verdict as `posture_assessment_ref`/`attestation_ref`); confirm the `POST /api/v1/audit/trace` submit (`202`, idempotent replay) and `GET /api/v1/audit/trace/executions/{id}` read endpoints (these are a Lock dependency, not reused — only the admin REST class exists on this branch) | PR 6, demo |
-| jans-linux-setup | Schema for `jansAttest`, `jansKeyAttestState` (§9.7), `jansTraceChain`, `jansTraceOutbox` (unique index on `(producer_id, chain_id, sequence_number)`, §11.3), `jansTraceChainTail`, `jansIssuanceLog` (§11.3); register **both** producer keys + chains in Lock when enabled — `jans-auth` scoped `["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]` and `jans-svid-issuer` scoped `["CREDENTIAL_PROVISIONED"]`, each with its own Producer-Key Authorization Statement; ship the reference script | PR 1, PR 6 |
-| jans-config-api, jans-cli-tui, Admin UI | `access_token_type`, attestation and trace properties | after PR 2 |
-| PDP / PEP (Cedarling, demo gateway) | Copy the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s into their records, and sign `(action, resource_type)` facts — **never** a `capability_id` (Lock resolves it, section 11.5); PEP validates the SVID via the bundle **and** performs the full RFC 9449 DPoP presentation check (`htm`/`htu`/`iat`-age/`jti`-replay/`nonce`-when-used/`ath`, plus proof-key = `cnf.jkt`; §6) — the thumbprint comparison alone is not sender-constrained | demo |
-| Auth Server / FIDO Server human-authentication evidence | The signed `AUTHENTICATION_EVENT` (`auth-server-trace-design.md`) and `FIDO_CEREMONY` (`fido-trace-design.md` / `fido-trace-design-MVP.md`) that resolve the human login behind an execution, correlated by `sid` (§10.9). **Deferred past the Lock MVP** (authentication/FIDO events are not in the three-kind MVP catalog); this plan only carries the `acr`/`amr`/`sid` inputs and gates delegation on them | later phase |
+The rest of §12 — the dependency inventory outside jans-auth-server — together with §13
+(implementation phases and pull requests, the demo hardware platform) and §14 (test design) now
+live in the [implementation appendix](./hardware-anchored-identity-implementation.md), so this
+document stays a specification rather than a work plan. Section numbers below are unchanged; §13 and
+§14 are intentionally brief pointers.
 
 ## 13. Implementation phases and pull requests
 
-Each PR updates `jans-auth-server/docs/swagger.yaml` and the docs it touches in the same change.
-
-| # | PR | Scope |
-|---|----|-------|
-| 1 | `access_token_type` | Section 7: enum, `RegisterRequestParam`, `ClientAttributes.accessTokenType`, resolver, validator (without the attestation row), swagger deprecation of `access_token_as_jwt`, `RegisterRequest` client support |
-| 2 | Bundle endpoint | Section 8: `SPIFFE_SVID_ISSUANCE` flag, `SpiffeOwnBundleService`, endpoint, discovery member, trust-domain pinning, config properties, swagger path + `SpiffeBundle` schema |
-| 3 | Attestation endpoint | Section 9: `ATTESTATION` flag, `/attestation/challenge`, `/attestation`, `AttestationService`, challenge state machine, the **vendor-neutral binding contract** + verifier profiles (`maturity`/`keyBindingStrength`) + `AttestationResultVerifier`, `TpmCertifyVerifier`, entity + schema, verifier HTTP client, script type + `ExternalAttestationService`, reference script, discovery members, swagger. **Ship the generic-TPM profile with vendor citations and captured positive/negative vectors (the clean path to `validated`, since a physical TPM AK chains to a manufacturer/privacy CA). The Azure profile ships `experimental` and is promoted to `validated` only if a captured MAA vector demonstrates the AK-to-VM binding of check (2) (AKCert chain, or AK committed in the SNP-measured HCL runtime data) — not merely a key present in `x-ms-runtime.keys`; if the captured result exposes no such binding, Azure is recorded `measured_guest`, not `certified` (section 9.3a AK-binding gap). GCP/AWS/OCI ship `experimental` until their vectors exist** |
-| 4 | DCR gate | Section 9.5: `attestation` parameter, DPoP proof on `/register`, `validateAttestation()`, `stale_evidence` + `challenge_id`, one-step `evidence` routing, `ClientAttributes.attestation` and `allowedResources` (`allowed_resources` metadata), `updateClient` re-gate, attestation row in the `JWT-SVID` validator, swagger client-metadata schemas |
-| 5 | Issuance | Section 10: `validateJwtSvidRequest`, `invalid_target`, key rule, freshness rule + `attestation_required`, inline `attestation` / `evidence` / `challenge_id` parameters, `JwtSvidBuilder`, lifetime, introspection, `txn` in ID-JAG, `TokenRequest` client support (`setResource`, `setAttestation`), swagger token endpoint |
-| 6 | TRACE emission (Phase-1 producer) | Section 11: producer key, chain state, outbox, emitter, record builders, configuration, setup step. Scope is a **TRACE Phase-1 producer** — attributable, correlatable records Lock receives/verifies/chains; it is gated on Lock shipping the TRACE subsystem, and the settlement, completeness, RATS/instance-binding, lineage, and Evidence-Packet assurances the records are forward-compatible with are later TRACE phases (see §11.1 phase mapping), not delivered here |
-| 7 | Interop and demo | SPIRE federation test (docker-compose recipe, manual before releases); end-to-end demo on one hardware platform; the wiki's failure demonstrations; agentrust export (11.4) |
-
-### Hardware platform for the demo
-
-Pick one and document its exact guarantee. Recommendation: **Azure confidential VM (AMD SEV-SNP
-with vTPM)** with **Azure Attestation** as verifier, called by the attestation script
-(`verifier_kind=azure-maa`). The verifier returns an `AttestationResultJWT` (one script
-branch, no quote parsing); the result covers the SEV-SNP launch measurement and the vTPM-held key
-(`x-ms-runtime.keys`), so `platform=azure-cvm-sev-snp`; the agent key is generated in the vTPM
-with `fixedTPM | fixedParent | sensitiveDataOrigin` and certified to the AK with `TPM2_Certify`
-(section 9.3a). What it proves: the private half of `K` is inside the vTPM of a VM whose launch
-measurement Azure's verifier appraised, and the appraisal is no older than the configured maximum
-at each issuance. What it does not prove: which process inside the VM asked the vTPM to sign (the
-demo plan's stated limitation; see the guarantee statement in section 15). Fallback: a plain
-**TPM 2.0** host (`platform=tpm2`), which needs the in-process quote script and an AK certificate
-chain to a manufacturer CA.
+Moved to the [implementation appendix](./hardware-anchored-identity-implementation.md): PR
+sequencing (PR 1–7), the dependency inventory, and the demo hardware-platform recommendation.
 
 ## 14. Test design
 
-Project rules apply: TestNG + Mockito, `@Listeners(MockitoTestNGListener.class)`, `lenient()` for
-shared stubs, a test class is named after the class under test plus `Test`, all `@Test` methods
-above helpers, no section-divider comments. Third parties never appear in unit tests
-(`WebKeysConfiguration`, `AppConfiguration`, `ConfigurationFactory`, `AbstractCryptoProvider`,
-`CommonUtils` are mocks or `mockStatic`).
-
-| Test class | Covers |
-|------------|--------|
-| `AccessTokenTypeTest` (model) | `fromString` variants; unknown → `null`; wire values |
-| `ClientTest` (common, extend) | precedence matrix of `getResolvedAccessTokenType()` |
-| `RegisterParamsValidatorTest` (extend) | every `JWT-SVID` constraint; type wins over `access_token_as_jwt`; `dpopBoundAccessToken` forced |
-| `SpiffeOwnBundleServiceTest` | enc / HMAC excluded; `use` relabelled; no jans-specific members; `kty`/`alg` as strings; `spiffe_sequence` = revision; empty → `keys: []` |
-| `SpiffeBundleRestWebServiceImplTest` | flag disabled; headers |
-| `SpiffeTrustDomainServiceTest` | pin on first start; adopt another node's value; invalid domain → `ERROR`, no exception |
-| `SpiffeIdUtilTest` (extend) | `buildAgentSpiffeId`; trust domain with `/` rejected |
-| `AttestationServiceTest` | challenge TTL and single use; `key_mismatch`; `nonce_mismatch`; `key_not_certified` when the script omits `key_certified`; `client_id` ↔ key ownership; `warning` only with the flag; **single-row state model:** there is exactly one `KeyAttestationState` per `(client_id, jkt)` and a supersession-eligible `contraindicated` **overwrites** it in place under CAS on `revision` (no `supersededBy`, no cross-entry tie-break); `revision` is strictly monotonic per key; the state past its own `expiresAt` is rejected even inside `maxAge`, and one past `maxAge` is rejected even before `expiresAt`; **rejection-vs-in-flight-issuance race (the core fix):** given an issuance that read the row at `revision = r`, a `contraindicated` committing `r → r+1` before the issuance's commit makes the issuance's `compareAndConsume(... revision = r ...)` / `stillCurrent(r)` **fail** → `attestation_required`; if the issuance's CAS commits first, the rejection's CAS loses, re-reads `r+1`, and re-applies — no interleaving lets an issuance succeed on a stale-approval read after a rejection commits; a `contraindicated` **without** proof of possession is written to the evidence log with `supersedesEligible=false` and **never reaches `KeyAttestationState`**, so it overwrites nothing, never becomes authoritative, and does not block issuance even as the newest observation (the DoS guard); `attestationRequireFreshPerIssuance` consume is a CAS on `(revision, consumed)` of the one row that succeeds for exactly one of two concurrent `/token` calls, the loser gets `attestation_required`; a `none` outage is logged but not written through to the row; `key_mismatch` logged against the other key, state row for this `jkt` unchanged |
-| `AttestationRestWebServiceImplTest` | flag disabled; `invalid_challenge` carries a fresh challenge; no `500` for a verdict; `503 verifier_unavailable` keeps the challenge; a submission with a `client_id` and no/invalid DPoP proof is accepted-and-recorded but `supersedesEligible=false`; a `client_id` submission with a valid proof over `K` is `supersedesEligible=true`; pre-enrollment (no `client_id`) needs no proof |
-| `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
-| `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
-| `RegisterValidatorTest` (extend) | `validateAttestation` by id; expired; wrong purpose; key not in `jwks`; missing DPoP proof on `/register`; proof key ≠ attested key; `allowed_resources` empty for `JWT-SVID`; `stale_evidence` has `challenge_id`; **multi-key / rollover (9.9):** a `jwks` with two attested keys is accepted and each key needs its own `affirming` assessment; adding a key without a fresh assessment → `attestation_required_for_new_key`; adding/removing a key requires an old-key-authorized proof outside the admin path; exceeding `clientMaxAttestedKeys` is rejected; the admin re-enrollment / revocation path binds a new key or revokes `K1` without old-key authorization |
-| `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, not-in-`allowed_resources` (exact and prefix), **and more than one `resource` value (`multiple_audiences_unsupported`, v1 one-audience rule §10.2)**; freshness rule none / stale / fresh; inline paths; `attestation_required` body; **lifecycle gate (§9.9):** issuance refused for `suspended` (`403 client_suspended`) and `decommissioned`/`tombstoned` (`403 client_decommissioned`), allowed again after `resume`, and refused once past `agentExpiresAt` per `agentExpiryAction` |
-| `AuthorizationGrantTest` (extend) | protected SVID claims re-applied after `modifyAccessToken()` alters or removes them; `WARN` logged; additive claims kept |
-| `DpopServiceTest` (extend) | `validateDpopKeyIsRegistered`: match, mismatch, no JWKS, `jwks_uri` |
-| `JwtSvidBuilderTest` | `sub` derivation; `aud` is a **single** audience (v1, §10.2); `cnf.jkt`; **integrity vs. disclosure (§3/§10.10):** when the execution id is disclosed at all it is **always** the full pair (`execution_id` + `execution_authority`) — never `txn` alone — but for an audience with no profile the pair is **omitted entirely** (minimized default), and a cross-domain audience gets a pairwise/opaque reference, not the raw id; the pair is reused across renewals with `txn` carrying the same execution-id value; **minimized default:** `attestation` and `delegation` are **omitted** unless the audience's profile opts in (default SVID = `svidDefaultClaims` only); when opted in, `attestation` defaults to `status_only` and `delegation.principal_sub` is pairwise unless `raw`; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
-| `TpmCertifyVerifierTest` | `TPMS_ATTEST` parse; AK signature; `extraData` mismatch; name mismatch; attribute policy; key material equals JWK; **AK-binding (§9.3a):** a certify whose signing key is bound to the appraised VM (AKCert chain, or AK committed in the SNP-measured HCL runtime data) is accepted; **a certify signed by a key that merely appears in `x-ms-runtime.keys` (e.g. a stand-in for `HCLTransferKey` or any non-AK runtime key) but carries no VM binding is rejected**, and a certify signed by a key absent from any binding path is rejected |
-| `AttestationResultVerifierTest` | profile lookup by `verifier_kind`; signature / issuer / `exp`; claim-path extraction; script-supplied JWKS ignored; **the AK is selected by its VM binding, never by position/name in the `akClaimPath` JWK set; a profile without a demonstrated AK binding cannot yield `certified` (falls back to `measured_guest`)** |
-| `AttestationChallengeServiceTest` | `pending → processing` CAS and the losing racer; `completed` terminal; retry after `verifier_unavailable` keeps nonce; retry limit; lease expiry repair |
-| `TraceExecutionRegistryTest` | open / validate / close; foreign `client_id` refused; expiry |
-| `AbstractAuthorizationGrantTest` (extend) | SVID lifetime source, cap, key-regeneration interaction |
-| `IntrospectionWebServiceTest` (extend) | SPIFFE `sub`, `cnf`, `txn`, `attestation`, `delegation` |
-| `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or `amr` is outside `idJagAllowedAmr`; **issuer-specific assurance, no acr ordering:** the gate maps the subject token's `(iss, acr/amr)` through `idJagAssuranceMappings` to a server level and compares against `idJagMinAssuranceLevel` — raw `acr` strings are **never** compared with `>=`; an unmapped `iss` is `unknown` and refused; the same `acr="2"` passes under one issuer's mapping and fails under another's; both the raw `acr`/`amr`/`iss` **and** the mapped level are recorded; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry; **sync signal:** the recorded authenticator facts carry WebAuthn `BE`/`BS`, and a policy demanding `BE=0` rejects a `BE=1` synced passkey even when `authenticator_attachment=platform` (attachment is not read as the sync signal) |
-| `TraceExecutionBindingTest` | **execution-continuation binding (§10.8):** a presented `txn` is accepted only when `clientId`, `executionAuthority`, and the raw `principalIss`/`principalSub` all match the registry entry and the execution is open/unexpired; a second human's grant (or a `client_credentials` grant) presenting another human's `txn` is refused `execution_binding_mismatch` — a shared multi-tenant agent cannot continue another human's execution; a `client_credentials` grant cannot continue a human-rooted execution and vice versa; **delegation lifetime:** issuance against an execution stops at `delegationExpiresAt` (`delegation_expired`) even while SVIDs are inside their own lifetime and `traceExecutionMaxAgeSeconds` has not elapsed, and `delegationExpiresAt` is **not** extended by an SVID renewal |
-| `TraceRecordBuilderTest` | envelope; **canonicalization, signature, and `content_digest` are byte-identical to `jans-trace-core`'s normative vectors** (run the shared vectors through this producer's path and assert equality with the Rust/Lock output — the cross-language conformance bar); signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); records carry `eat_profile: tag:jans.io,2026:trace-v1` only; no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
-| `TraceChainStateTest` | **append protocol (§11.3):** two concurrent writers computing the same sequence — exactly one unique-insert survives, the loser re-reads the tail and retries at the next position (no duplicate `(producer_id, chain_id, sequence_number)`, no fork); tail CAS loser that already inserted keeps its valid record; `prev_record_hash` links; zero hash first; **fence:** a stale-`epoch` writer's tail CAS is rejected, not forked onto the chain; tail rebuilt from the outbox's highest sequence after loss and `epoch` bumped; retry cap exhaustion → `evidence_unavailable` / `fail-open` path; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
-| `TraceEmitterTest` | **hold-until-commit (§11.3):** a `staged` entry is **never posted**; only `committed` entries are delivered; the `staged → committed` flip follows a confirmed entity + `IssuanceLog` write on every backend (and, where a deployment wraps steps 2–4 in a native SQL/Couchbase transaction, the flip coincides with commit); **crash recovery:** a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an **absent** `IssuanceLog` is `voided` and never delivered (no false success); inline mode posts after the commit point, never before; outbox retry; `202` and idempotent-replay both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
-| `IssuanceReconciliationTest` | token **absence is not treated as failed issuance** — an SVID whose `IssuanceLog` is present but whose `TokenEntity` has expired/been deleted is **not** flagged (it was issued and aged out); only a `committed`/`delivered` record with a **missing** `IssuanceLog` is an orphan and draws a compensating `CREDENTIAL_PROVISIONED` (`not_persisted`, `supersedes_credential_fingerprint`, `parent_record_ids`); the `IssuanceLog` outlives the SVID TTL by `issuanceLogRetentionSeconds` |
-
-Integration tests (`jans-auth-server/client`, disabled by default in `testng.xml` like the SPIFFE
-client-auth suite, enabled in the CI profile that provisions the prerequisites): the hardware is
-the static test keystore already used by the DPoP tests (public keys hosted at `clientJwksUri`);
-the platform verifier is replaced by the same reference script in `verifier_kind=local` with
-`formats=eat+jwt` and `trusted_verifier_jwks_uri = clientJwksUri`, the test signing the EAT JWT
-itself (it plays the attester; no outbound call is made); SPIRE is replaced by a
-**self-federation round trip** (`spiffeTrustDomains` lists the server's own trust domain and
-bundle URL, so an SVID issued to agent A is accepted by the shipped inbound validator as a
-`jwt-spiffe` `client_assertion` for client B); the SPIFFE-native relying party is the test itself
-verifying against the fetched bundle. Classes: `SpiffeBundleEndpointHttpTest`,
-`AccessTokenTypeRegistrationHttpTest`, `AttestationHttpTest`, `AttestedRegistrationHttpTest`,
-`JwtSvidIssuanceHttpTest` (including `attestation_required`, attest-and-issue, introspection),
-`JwtSvidRoundTripHttpTest`, `TraceEmissionHttpTest` (against a Lock instance in the CI profile).
-Nothing in the suite calls a host the project does not control.
+Moved to the [implementation appendix](./hardware-anchored-identity-implementation.md): the unit-test
+class-by-class coverage table and the integration-test suite.
 
 ## 15. Failure modes
 
@@ -2731,7 +2657,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Agent VM cloned or snapshotted | A clone cannot export the non-exportable `K`, so it holds no usable key and must enroll its own through the gate; detecting two live runtimes sharing one `jkt` (vTPM-in-snapshot case) is a Phase-4 instance-binding concern, out of scope here and stated so (section 9.9) |
 | Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out. **SLO:** bundle reachable at least once per `spiffeBundleRefreshHintSeconds`; a `critical`-tier RP MAY cap the accepted cached-bundle age tighter (§16.9) |
 | Signing key rotated | Bundle serves old + new for an overlap window and bumps `spiffe_sequence`. An **emergency** rotation drops the old key at once at jans, but this is **not** instant revocation at verifiers: a verifier keeps accepting tokens signed by the dropped key until its cached bundle expires. The revocation delay is bounded by the verifier's max bundle cache age — ≤ `spiffeBundleRefreshHintSeconds`, or the tighter `bundleMaxCachedAgeSeconds` for a `critical`-tier RP (§16.1); the short SVID TTL and DPoP binding cover the interval |
-| Client registers its own SPIFFE ID or a foreign trust domain | Impossible by construction: `sub` is derived from `client_id` under jans's own trust domain; the inbound `spiffe_id` attribute plays no role in issuance |
+| Client registers its own SPIFFE ID or a foreign trust domain | Prevented by the issuance path: `sub` is derived server-side from the authenticated `client_id` under jans's pinned trust domain, and the inbound `spiffe_id` client attribute is never read during issuance, so a client has no input that reaches `sub` |
 | jans-lock unreachable | Records queue in the outbox; auth continues. In `inline` mode the request fails, which is correct for a demo of accountability |
 | TRACE producer key compromised (`jans-auth` or `jans-svid-issuer`) | Revoke the affected role's key via Lock's planned producer-key admin API (a Lock dependency, section 11.1/12); later records under that key rejected; rotate that alias. The two roles' keys are independent, so revoking one does not disturb the other |
 | Attestation script accepts everything | Core verifies the `AttestationResultJWT` against the server-configured verifier profile, extracts nonce and key itself, verifies the `TPM2_Certify` chain, and caps the status at its own binding verdict (9.3b); a permissive script can only make policy looser, never name a different key or skip the nonce |
@@ -3008,156 +2934,44 @@ resolution.
 
 ## 18. Resolved decisions and open questions
 
-### Resolved
+### Resolved — decision log
 
-- **No new `grant_type`.** Token format is orthogonal to authorization basis.
-- **Format is a client property**, `access_token_type=JWT-SVID`; `access_token_as_jwt` deprecated.
-- **Bundle keys = OIDC signing keys** for v1, relabelled in the bundle output; dedicated key set is
-  a follow-up.
-- **`accessTokenType` and `attestation` live in `ClientAttributes`** (`jansAttrs`), no client
-  schema change.
-- **Proof of possession of `K` gates negative-verdict supersession.** `/attestation` needs no OAuth
-  auth for a pre-enrollment caller, but a submission naming an existing `client_id` only
-  invalidates that client's standing approvals (section 10.4) when it carries a valid DPoP proof of
-  possession of the attested key (section 9.3). An anonymous negative verdict is recorded in the
-  `AttestationAssessment` evidence log but marked `supersedesEligible=false`, which keeps it out of
-  issuance state entirely: it is **never written through to the authoritative `KeyAttestationState`
-  row**, so it neither overwrites a standing approval nor becomes the current verdict. Knowing a
-  victim's public `client_id`/`K.public` cannot deny it service.
-- **A shared execution id is correlation, not same-operation proof.** Records sharing
-  `(trace_execution_id, execution_authority)` are claimed to belong to one execution; this does
-  **not** prove two of them describe the same operation. Same-operation proof is the Phase-3
-  operation-binding commitments (`request_digest`/`input_digest`/`tool_call_digest`/`result_digest`
-  + proof-of-possession) in `design.md`, not delivered here; this plan emits the signed
-  `(action, resource_type)` facts and `parent_record_ids` edges those checks consume, and Lock
-  never infers causation from a shared id or close timestamps (§3).
-- **Profile and canonical implementation are fixed.** Records are emitted under the Lock/Jans
-  profile `tag:jans.io,2026:trace-v1` only — an extension of agentrust v0.2, and a deliberate
-  sibling of (not the same tag as) the vendor-neutral GovOps profile `tag:govops.owasp.org,2026:trace-v1`;
-  the profiles are never mixed in a record (§11.1). Canonicalization, signing, and `content_digest`
-  come from the shared `jans-trace-core` library (or a Java implementation proven byte-identical
-  against its normative vectors), so producer and Lock outputs cannot drift (§11.3) — there is no
-  jans-local canonicalizer fork.
-- **The hardware guarantee requires the full RFC 9449 PEP check, not a thumbprint comparison.** A
-  PEP that relies on the `cnf` binding MUST verify every DPoP presentation completely —
-  `htm`, `htu`, `iat`/proof-age, a unique `jti` against a replay cache, `nonce` when the PEP issues
-  one, a **required** `ath` matching the presented SVID (RFC 9449 §7.1, mandatory at the resource),
-  and the proof-key thumbprint equal to `cnf.jkt` (§6). A plain JWT-SVID
-  validator that ignores `cnf` is bearer-only and gains no hardware guarantee, so a high-value RP
-  MUST be `cnf`-checking and require DPoP.
-- **Privacy: the SVID is minimized and disclosed per audience.** The default SVID carries only the
-  claims a plain SPIFFE/PEP verifier needs (`iss`/`sub`/`aud`/`iat`/`nbf`/`exp`/`jti`/`cnf`);
-  `attestation`, `delegation`, and the correlation id are opt-in per audience via a disclosure
-  profile on `allowedResources`. `attestation` and `delegation` are **omitted** unless the audience
-  opts in (once opted in, `attestation` granularity defaults to `status_only`, raw measurement is
-  `full`-only; `delegation.principal_sub` is pairwise per audience unless the audience is authorized
-  for the raw subject), and a cross-domain audience gets a pairwise execution reference, not the
-  global `trace_execution_id` — aligning with AIMS §10.9 and `design.md`'s privacy-preserving
-  cross-domain correlation. **v1 mints one SVID per audience** (`multiple_audiences_unsupported`
-  on a multi-`resource` request, §10.2) so each token has exactly one applicable disclosure
-  profile; the raw pair always travels together as a unit (integrity), while *what* is disclosed is
-  per audience (§3/§10.10). The raw human identity otherwise lives only in access-controlled TRACE
-  evidence, resolved by `sid` (section 10.10).
-- **Human assurance is gated and recorded, not just correlated — and not on false signals.** The
-  ID-JAG issues only when the subject authentication meets a configurable bar: phishing-resistant
-  (passkey/WebAuthn) by default per AIMS §10.4.1, plus a **mapped** assurance floor. Because `acr`
-  is an opaque issuer-specific string with no universal ordering, the gate does **not** compare raw
-  `acr` with `>=`; it maps each trusted issuer's `acr`/`amr` to a server assurance level
-  (`idJagAssuranceMappings`) and compares that against `idJagMinAssuranceLevel`
-  (`idJagRequirePhishingResistant`, `idJagAllowedAmr` complete the bar). Synced-vs-device-bound is
-  read from WebAuthn **BE/BS** backup flags, **not** from `authenticator_attachment` (which does not
-  indicate synchronization). The raw `acr`/`amr`/`iss`, the mapped level, `auth_time`, BE/BS, and
-  the `sid` are carried into `human_sponsor` and the execution; the signed
-  `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` evidence and human credential recovery/revocation are the
-  Auth/FIDO companion producers' deferred work, correlated back by `sid` (section 10.9).
-- **Continuing an execution requires a consistent principal/delegation/authority binding, not just
-  the same client.** A shared multi-tenant agent is one `client_id` for many humans, so matching
-  only `client_id` would let it continue another human's execution. `/token` accepts a presented
-  `txn` only when client, `execution_authority`, and the raw principal/delegation all match the
-  opener (`execution_binding_mismatch` otherwise), and `client_credentials` and human-rooted
-  executions can never cross (§10.8). **Delegation validity is bounded independently of token
-  renewal:** `delegationExpiresAt = min(openedAt + idJagDelegationMaxLifetimeSeconds, ID-JAG exp)`,
-  never extended by an SVID renewal, so an agent cannot keep acting for a human indefinitely by
-  minting fresh short-lived SVIDs (`delegation_expired` once it passes).
-- **The client (agent identity) has an explicit lifecycle, and evidence outlives authorization.**
-  A client carries `agentLifecycleState` — `active` → `suspended` (reversible) → `decommissioned`
-  (terminal for issuance, keys removed) → `tombstoned` (identity permanently reserved) — consulted
-  on every `/token` (§9.9, §10.2). `client_id` is never recycled; owner transfer is an attributed
-  admin action, not a silent re-bind. Separately, **authorization lifetime ≠ evidence lifetime**: an
-  assessment's `expiresAt` bounds issuance, while the assessment, its verifier result, and retired
-  keys are kept for the longer `attestationRetentionSeconds` so past records stay verifiable (§9.9).
-- **A client may hold more than one attested key, and key lifecycle is specified.** "Exactly one
-  key" is the common runtime state, not an enforced invariant; `jwks` MAY hold up to
-  `clientMaxAttestedKeys` (default 2) for a rollover overlap, each key independently attested and
-  assessed. Planned rotation is **old-key-authorized** (a proof over a trusted key adds/removes a
-  key); destroyed-key, VM-rebuild, and compromise cases use an **administrative** re-enrollment /
-  revocation path, recorded as `IDENTITY_ROTATED`. Clone/snapshot detection beyond "a clone has no
-  usable key" is a Phase-4 instance-binding concern, out of scope. See section 9.9.
-- **Two TRACE producer roles, two keys.** jans-auth-server registers a `jans-auth` producer
-  (`["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]`, matching `auth-server-trace-design.md` exactly)
-  and a separate `jans-svid-issuer` credential-provisioning producer (`["CREDENTIAL_PROVISIONED"]`,
-  the `design.md` provisioning-authority role). The authentication key's authorized set is **not**
-  widened to cover `CREDENTIAL_PROVISIONED`; credential provisioning is a distinct role with its
-  own key and chain, so the two companion documents stay consistent and the design's key-separation
-  rule holds.
-- **Attestation is an endpoint + script**, not a DCR script alone; DCR and `/token` call the same
-  service.
-- **Delegate, don't parse**: v1 forwards raw evidence to a platform verifier and validates its
-  `AttestationResultJWT`; TPM quotes in-process later.
-- **Attestation is vendor-neutral: one binding contract, per-cloud profiles.** Every platform
-  satisfies the same three obligations — platform authenticity + measurement, freshness, and key
-  certification — and a verifier profile (9.3b) declares that vendor's claim paths; core checks the
-  obligations abstractly. Azure, generic TPM 2.0, GCP Confidential Space, AWS Nitro, OCI, and the
-  preferred standards-based EAT envelope are profile instances. A platform that reuses a
-  verification mechanism core already has may require only configuration and fixtures; a platform
-  that introduces a new mechanism (an unfamiliar evidence format, a different certificate chain or
-  key-certification scheme, COSE/CBOR as AWS Nitro needs) requires a verifier adapter in core. Claim
-  paths project over already-verified material; they cannot implement the verification (section
-  9.3a/9.3b).
-- **Platform claim paths are unverified until cited and vectored.** The exact vendor claim paths
-  (Azure `x-ms-*`/HCL/AK, and the GCP/AWS/OCI equivalents) are documented best-effort and are
-  **not** substantiated by captured vectors in this repository. A profile ships `maturity:
-  experimental` until it carries vendor citations **and** passing positive/negative conformance
-  vectors, at which point it is `validated`; PR 3 takes the generic-TPM profile there first (its AK
-  chains to a manufacturer/privacy CA), and a deployment MAY refuse `experimental` for a high-risk
-  capability (section 9.3a).
-- **The Azure `certified` claim has an explicit, unproven AK-binding gap.** `x-ms-runtime.keys` is
-  a JWK *set* (Microsoft's own example includes a non-AK encryption key, `HCLTransferKey`), so "a
-  key appears there" is **not** proof that the `TPM2_Certify` signing AK is the vTPM AK of the VM
-  MAA appraised. The Azure profile earns `certified`/`validated` only when a captured vector shows a
-  verifiable AK-to-VM binding (an AKCert chain, or the AK committed inside the SNP-measured HCL
-  runtime data whose digest is `REPORT_DATA`); core selects the AK by that binding, never by its
-  presence in the runtime-keys set, and a must-fail vector for a non-AK runtime key is required. If
-  no such binding exists in the captured result, Azure is recorded `measured_guest`, not `certified`
-  (section 9.3a, "The Azure AK-binding gap").
-- **`key_binding_strength` is recorded per platform.** `certified` (a vTPM/TPM `TPM2_Certify`s a
-  non-exportable `K`) vs. `measured_guest` (a measured image reports it holds `K`) is stored on the
-  assessment and surfaced across clouds, so a relying party can tell them apart (section 9.3a).
-- **Only jans talks to the platform verifier**, from the attestation script during
-  `POST /attestation`. The agent sends raw hardware evidence to jans and nothing anywhere else.
-- **No jans-signed assessment token.** The assessment is a server-side record referenced by
-  `attestation_id`; jans's acceptance is communicated by the SVID `attestation` claim and the
-  TRACE record. The only signed attestation object is the verifier's `AttestationResultJWT`.
-- **Core verifies binding, the script decides policy.** Verifier trust anchors are server
-  configuration (`attestationVerifierProfiles`); the script cannot assert nonce or key facts.
-- **Execution scope is independent of token lifetime.** One `txn` per execution, reused across
-  renewals, held in an execution registry; attestation and enrollment records are lifecycle
-  records referenced by `parent_record_ids`, not execution records.
-- **Delegator is a dedicated `delegation` claim**, not RFC 8693 `act` / `may_act`.
-- **Challenges are a persistent state machine** (`pending → processing → completed`), not a
-  cache entry.
-- **Evidence before action**: the outbox entry is the durable commitment and allocates the chain
-  position; the action's own entity is written after it; `JWT-SVID` issuance fails closed when
-  evidence cannot be committed.
-- **Availability posture is per-capability-risk tier, fail-closed by default.** A verifier, bundle,
-  or Lock outage resolves per the capability's risk tier (`critical` / `standard` / `low`): the
-  default is fail-closed, fail-open is an explicit per-capability opt-in, an untiered capability is
-  treated as `critical`, and any degraded issuance is recorded as degraded rather than silently
-  upgraded. The freshness windows (assessment max age, bundle refresh hint, outbox bound) are the
-  availability budget each tier spends (§16.9).
-- **Trust domain is pinned** on first start and never derived again.
-- **Update-token script may add but not remove** the SVID's identity, binding and correlation
-  claims.
+Each decision is defined authoritatively in the linked section; this log is an index, not a second
+copy of the rules. Where a decision carries a non-obvious limit, the limit lives with the mechanism
+in the cited section.
+
+| Decision | Where defined |
+|----------|---------------|
+| No new `grant_type`; SVID format is a client property (`access_token_type=JWT-SVID`, `access_token_as_jwt` deprecated); `accessTokenType`/`attestation` live in `ClientAttributes` (no schema change) | §7 |
+| v1 reuses OIDC signing keys in the bundle (relabelled); production provisions a dedicated SVID key set | §8, §16.1 |
+| Attestation is an endpoint **plus** a script; DCR and `/token` call the same service; only jans talks to the platform verifier | §9.1, §9.4, §9.5 |
+| Core verifies the signed binding (verifier-result signature/issuer/nonce, derived attested key, `TPM2_Certify` chain); the script decides measurement policy only; final status = `min(core, script)` | §9.3b |
+| Vendor-neutral attestation: one binding contract, per-cloud profiles. Reusing an existing verification mechanism is config + fixtures; a new mechanism (unfamiliar format, COSE/CBOR, new cert chain) needs a verifier adapter in core | §9.3a, §9.3b |
+| Profiles ship `experimental` until cited + vectored, then `validated`; a deployment MAY refuse `experimental` for a high-risk capability | §9.3a |
+| Azure `certified` has an unproven AK-binding gap (`x-ms-runtime.keys` is a set, not the AK); `measured_guest` unless a vector proves AK-to-VM binding | §9.3a |
+| `key_binding_strength` (`certified` vs `measured_guest`) is recorded per platform | §9.3a |
+| No jans-signed assessment token; the assessment is a server-side record; the only signed attestation object is the verifier's `AttestationResultJWT` | §9.6 |
+| Challenges are a persistent `pending → processing → completed` state machine, not a cache entry | §9.3c |
+| Proof of possession of `K` gates negative-verdict supersession; an anonymous negative verdict is evidence (`supersedesEligible=false`) but never reaches issuance state, so it cannot deny service | §9.3, §10.4 |
+| Single authoritative `KeyAttestationState` row per `(client_id, jkt)` with a monotonic `revision`; issuance commits under a `revision` CAS so a rejection that commits first wins; expired state is a read-time check, not deletion | §9.7, §10.4 |
+| Authorization lifetime is separate from evidence lifetime: `expiresAt` bounds issuance; `retentionExpiresAt` (the only deletion TTL) keeps evidence for `attestationRetentionSeconds` | §9.7, §9.9 |
+| A client may hold up to `clientMaxAttestedKeys` attested keys; rotation is old-key-authorized; destroyed/compromised keys use an administrative re-enrollment/revocation path (`IDENTITY_ROTATED`) | §9.9 |
+| Client lifecycle `active → suspended → decommissioned → tombstoned`, consulted on every `/token`; `client_id` never recycled; owner transfer is an attributed admin action | §9.9, §10.2 |
+| Signing-key revocation is not instantaneous at verifiers; the delay is bounded by the verifier's max bundle cache age (≤ `spiffeBundleRefreshHintSeconds`, or the tier's `bundleMaxCachedAgeSeconds`) | §16.1 |
+| One audience per token in v1 (`multiple_audiences_unsupported`), so each token has one disclosure profile | §10.2, §10.10 |
+| SVID is minimized by default; `attestation`/`delegation`/correlation id are opt-in per audience; cross-domain audiences get a pairwise execution reference | §10.10 |
+| A shared execution id is correlation, not same-operation proof (which is the Phase-3 operation-binding commitments) | §3, §11.1 |
+| Continuing an execution requires matching client + `execution_authority` + raw principal/delegation (not just client); delegation validity is bounded by `delegationExpiresAt`, independent of token renewal | §10.8 |
+| Human assurance is gated and recorded, not inferred: issuer-specific assurance mappings (no `acr` ordering) and WebAuthn BE/BS for synced-vs-device-bound (not `authenticator_attachment`) | §10.9 |
+| Delegator is a dedicated `delegation` claim, not RFC 8693 `act`/`may_act` | §10.5 |
+| The hardware guarantee requires the full RFC 9449 PEP check (including a mandatory `ath`), not a thumbprint comparison; a `cnf`-ignoring PEP is bearer-only | §6 |
+| Two TRACE producer roles/keys (`jans-auth` for auth/bootstrap, `jans-svid-issuer` for provisioning); the authentication key is not widened to cover `CREDENTIAL_PROVISIONED` | §11.1 |
+| One profile per record (`tag:jans.io,2026:trace-v1`); canonicalization/signing/digest from the shared `jans-trace-core` (or byte-identical to its vectors), no jans-local fork | §11.1, §11.3 |
+| Evidence before action: a durable local outbox commit is the accountable record (Lock delivery is async at-least-once); `JWT-SVID` issuance fails closed when evidence cannot be durably committed | §11.3 |
+| Outbox append protocol: per-node serial chain, unique `(producer_id, chain_id, sequence_number)` index, tail-pointer CAS with an `epoch` fence, bounded retry | §11.3 |
+| Availability posture is per-capability-risk tier, fail-closed by default (untiered = `critical`); degraded issuance is recorded as degraded | §16.9 |
+| Trust domain is pinned on first start and never re-derived | §8 |
+| Update-token script may add but not remove the SVID's identity, binding, and correlation claims | §10.5 |
 
 ### Open
 
@@ -3198,206 +3012,12 @@ resolution.
 - **SCITT transparency logging.** Lock's receipt chain is the anchor for now; a receipt URI can be
   added to records later without changing producers.
 
-## 20. FAQ: review questions and how the plan answers them
+## 20. Review history
 
-Questions raised in review, each with the change made in this document.
-
-**Q1. A key named in attestation evidence is not automatically a hardware-protected key. Putting
-`SHA-256(nonce ‖ key-thumbprint)` into report data binds those bytes to the report, but the design
-must separately establish that the private key was generated and remains protected by the
-TPM / vTPM. What is the exact certification mechanism for the chosen platform?**
-
-Accepted. The plan now separates *freshness* (the nonce) from *key certification* (where the
-private key lives) and requires both before a verdict can be `affirming`:
-
-- Section 9.3a defines the certification mechanism per platform. For the demo platform (Azure
-  confidential VM, SEV-SNP with vTPM) it is `TPM2_Certify` of `K` by the vTPM attestation key with
-  `qualifyingData = nonce`; the AK is chained to the SEV-SNP report through Azure's HCL runtime
-  data and surfaced by Azure Attestation in `x-ms-runtime.keys`. The script checks AK identity,
-  the certify signature, `extraData == nonce`, `attested.name == Name(K)`, the
-  `fixedTPM | fixedParent | sensitiveDataOrigin` attributes, and that the certified key material
-  equals the `attested_key` JWK. Physical TPM 2.0 (EK / privacy CA) and bare SEV-SNP / TDX
-  (weaker, not v1) are listed with their own rows.
-- The evidence format for the demo platform is `azure-cvm-sev-snp+json` and carries both parts:
-  platform evidence (`snp_report`, `hcl_runtime_data`, `vcek_chain`) and `key_certification`
-  (`certify_info`, `signature`, `key_public`, `ak_public`). Section 9.3 example and field table
-  updated.
-- Key certification is verified by **core** (`TpmCertifyVerifier`, section 9.3b), and the
-  assessment stores the outcome as `keyCertified`; `affirming` is impossible without it
-  (sections 9.4 and 9.6 status table). The RATS roles table (9.2) and the lifecycle diagram note
-  describe raw evidence as "two parts".
-- Corrected an error in the earlier text: on Azure CVMs the guest cannot choose the SNP
-  `REPORT_DATA` (HCL owns it), so freshness comes from the `TPM2_Certify` `extraData`, not from
-  the report. Report-data binding is no longer presented as certification of an application key.
-
-**Q2. Fresh attestation does not necessarily detect a compromised agent. A compromised process may
-retain access to signing operations while the VM's launch measurement remains acceptable. State
-the narrower guarantee.**
-
-Accepted. Section 15 now opens with the guarantee stated narrowly: (1) recent appraisal of
-specified platform properties (launch measurement, TCB / firmware, debug flag, measured runtime
-PCRs where present) under a named `policy_version`, and (2) possession of the enrolled key at each
-DPoP proof. It states explicitly that this does not prove which process invoked the signing
-operation, that agent memory or prompts are intact, or that no other process on the platform can
-use `K`. The "agent host compromised" failure-mode row no longer claims that re-attestation
-detects this; it points to agent runtime measurement in `allowed_measurements` or behavioural
-TRACE evidence as the detection paths. The hardware recommendation (section 13) repeats the
-limitation.
-
-**Q3. `latestAffirming()` can ignore a newer rejection. An agent could receive `contraindicated`
-and keep obtaining tokens with an earlier, still-fresh positive assessment. Use the latest
-relevant assessment and define which failures invalidate prior approval; a verifier outage should
-have different semantics from an authenticated measurement failure.**
-
-Accepted, and strengthened to a **single authoritative state row per `(client_id, jkt)`**
-(`KeyAttestationState`) with a monotonic `revision`, separate from the append-only
-`AttestationAssessment` evidence log (section 9.7). The current verdict for a key is that one row,
-not "the newest among many assessment entries" — the earlier `latestRelevant` ordering by
-`(appraisedAt, version)` was **not** a total order (two entries could share both fields) and the
-earlier per-assessment-entry CAS could **not** serialize rejection against issuance (a `/token`
-could pass its read of an approval while a writer marked that approval superseded, and still
-issue). Now a `contraindicated`/`warning` **overwrites** the single row under CAS on `revision`
-(that overwrite *is* the supersession — there are no sibling entries to mark), and issuance commits
-with a CAS conditioned on the `revision` it evaluated, so a rejection that commits first makes the
-issuance's CAS fail. The linearization point and the precise rejection-vs-in-flight-issuance
-semantics are stated in section 10.4. The freshness check also rejects a state whose own
-`expiresAt` has passed, independently of the per-issuance `maxAge` bound, and
-`attestationRequireFreshPerIssuance` claims the row for exactly one issuance with the same
-`revision` CAS (now also toggling `consumed`). Section 10.4 contains the rule and a table of
-outcomes:
-
-- authenticated platform rejections (`measurement_not_allowed`, `debug_enabled`,
-  `untrusted_verifier`, `key_not_certified`) and replay signals (`nonce_mismatch`,
-  `evidence_expired`) invalidate prior approval;
-- `key_mismatch` is stored against the key the evidence named, so attesting an unrelated key
-  cannot knock out an agent;
-- `none` from `verifier_unavailable` neither invalidates nor extends prior approval, so an outage
-  is distinguishable from a measurement failure and remains visible as a `none` record;
-- malformed requests store nothing.
-
-The DCR gate uses the same rule; the lifecycle diagram note at the token step, the tests
-(`AttestationServiceTest`) and two failure-mode rows ("platform state changes" and "agent retries
-after `contraindicated`") were updated to match.
-
-**Q4. Core does not independently enforce the evidence binding: it compares a script-provided
-`attested_jkt` and trusts the script's `nonceVerified` boolean. A permissive script can supply
-both, so "a script cannot mint `affirming` for a key the evidence does not name" is unsupported.
-Either treat the adapter as trusted security code or have core validate the signed verifier result
-and binding.**
-
-Accepted; core now validates. New section 9.3b splits the work: the script calls the verifier and
-applies measurement policy; **core** verifies the `AttestationResultJWT` signature, issuer and
-expiry against a server-configured verifier profile (`attestationVerifierProfiles`, with the claim
-paths for nonce and key), compares the nonce to the persisted challenge, derives the attested key
-itself, verifies the `TPM2_Certify` chain (`TpmCertifyVerifier` in core), and sets the final
-status to the minimum of its own binding verdict and the script's policy verdict. The script
-result API lost its `attestedJwk`, `nonceVerified` and `keyCertified` setters; it exposes the
-core-verified claims read-only. Section 9.3a's check column is now labelled "core checks", the
-9.2 diagram note and the "script accepts everything" failure-mode row were rewritten, and two
-unit-test classes (`TpmCertifyVerifierTest`, `AttestationResultVerifierTest`) were added.
-
-**Q5. Attestation and enrollment cannot share every execution id: they occur before execution
-starts and may support many later executions. Keep their own record identifiers and have
-execution records reference them. A fresh `txn` per autonomous token issuance also fragments one
-execution across renewals. Define execution scope independently of credential lifetime.**
-
-Accepted. Section 3 now defines three scopes (execution, token lifetime, key lifecycle) with their
-own identifiers, and the execution is identified by the canonical pair
-`(trace_execution_id, execution_authority)` (with `txn` as an application alias for the execution
-id), carried in tokens as `https://jans.io/trace/execution_id` /
-`https://jans.io/trace/execution_authority`. An execution is opened by the ID-JAG exchange or by
-the first `/token` call of an autonomous agent that carries no execution id; the server mints the
-pair, returns it in the token response, and accepts it on later renewals while the execution is
-open and belongs to the same client (`jansTraceExecution` registry, `traceExecutionMaxAgeSeconds`,
-section 10.8). Attestation
-and enrollment records are lifecycle records with their own `trace_execution_id` scope
-(`att:<attestation_id>`, `enroll:<client_id>`); every issuance record references them, and the
-ID-JAG record, through `parent_record_ids` (`attested_by`, `enrolled_as`, `delegated_by`),
-section 11.2. The open questions on `txn` minting and continuation are resolved and removed.
-
-**Q6. The human in `act` reverses the delegation meaning: with the agent as `sub`, Alice in `act`
-says Alice is the current actor acting for the agent. `may_act` is not a generic delegator field
-either. Preserve the SPIFFE agent subject and define a separate, explicit delegation reference.**
-
-Accepted. `act` is removed. The SVID keeps the SPIFFE ID as `sub` and carries a dedicated
-`delegation` claim: `principal_iss`, `principal_sub`, `credential_type` (the ID-JAG token type
-URI) and `credential_id` (the ID-JAG `jti`), so the delegator is an explicit reference to the
-credential that carried the delegation, not an actor assertion. Sections 6, 10.5, 10.7, the
-update-token restriction, the tests, the failure modes and the specs table were updated; the
-specs table records that RFC 8693 `act` / `may_act` were considered and not used, with the reason.
-
-**Q7. The challenge lifecycle contradicts itself: core consumes the challenge before calling the
-verifier, but a verifier outage supposedly leaves it unconsumed. Specify an atomic state machine
-with controlled retry after infrastructure failure.**
-
-Accepted. Section 9.3c replaces the cache entry with a persistent `AttestationChallenge` and a
-state machine `pending → processing → completed`, with `processing → pending` only for
-infrastructure failures that produced no verdict, bounded by `attestationChallengeMaxRetries`,
-keeping the original nonce so the same evidence can be resubmitted; a node lease
-(`attestationProcessingLeaseSeconds`) and a repair timer recover from crashes mid-verification;
-the losing side of a concurrent claim gets `challenge_in_progress` without a fresh nonce;
-`completed` is terminal. The request-processing text in 9.3 and the `503 verifier_unavailable`
-semantics now refer to these transitions.
-
-**Q8. Evidence durability is only partially specified. Updating chain state and the outbox
-together prevents some chain failures but does not ensure every successful issuance has an
-evidence record unless issuance and evidence persistence have a defined commit relationship.
-Explain crash recovery, duplicate delivery and outbox exhaustion.**
-
-Accepted, and specified in full in section 11.3 along three axes the first draft left implicit:
-
-- **Append protocol.** "Insert allocates the sequence number" is now an explicit protocol, not a
-  side effect. Each `(producer_id, chain_id)` is one serial chain per node (`chain_id` = node id, so
-  nodes never share a chain); a **unique index** on `(producer_id, chain_id, sequence_number)` makes
-  a position un-double-writable; a per-chain **tail pointer** carrying `{ next_sequence,
-  tail_record_hash, epoch }` is advanced by **CAS** with the outbox unique-insert as the authority;
-  `epoch` is a **fence** so a zombie/stale thread cannot fork the chain after an operator repair; and
-  lost-CAS / lost-insert both **retry** at the re-read tail up to `traceOutboxAppendMaxRetries`,
-  after which the write fails like any outbox-write failure.
-- **Hold delivery until commit.** The signed record is **staged**, not published, until the
-  credential's entity write is confirmed committed (a `staged → committed` CAS flip after the entity
-  write on every backend, since the `PersistenceEntryManager` abstraction exposes only single-entry
-  CAS portably even though SQL and Couchbase have native multi-item transactions). The emitter
-  **never** posts a `staged` entry,
-  so a record is never delivered for a credential that was not persisted — closing the
-  **false-success-evidence** hole where a signed "provisioned" record could reach Lock after the
-  entity write failed. "Persisted credential" and "response received by the client" are explicitly
-  distinguished; the record attests only the former, because the server cannot observe the latter.
-- **Reconciliation on a positive marker, not token absence.** Token **absence is not proof of
-  failed issuance** — a short-lived SVID can be issued and then expire or be deleted long before a
-  nightly job. A TTL-independent **`IssuanceLog`** row (keyed by `record_id`, retained
-  `issuanceLogRetentionSeconds`) written in the same entity transaction is the positive evidence of
-  commit: a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an
-  absent `IssuanceLog` is `voided` and never delivered, and only a delivered record whose
-  `IssuanceLog` is genuinely missing is an orphan repaired by a compensating, superseding
-  `CREDENTIAL_PROVISIONED` (`not_persisted`) linked to the orphan.
-
-Delivery to Lock remains at-least-once: the emitter marks an entry delivered on a `202` or an
-idempotent-replay acceptance of the same `record_id` (Lock's store is keyed by `record_id`); a
-`409` — same `record_id`, *different* content — is never expected and is surfaced as an error, never
-silently treated as delivered. Crash recovery resolves `staged` entries (promote or void) before
-delivering, then delivers `committed` entries in sequence order. The outbox is bounded
-(`traceOutboxMaxEntries`, `traceOutboxMaxAgeSeconds`) and a full outbox fails `JWT-SVID` issuance
-closed (`503 evidence_unavailable`) or, under `fail-open`, marks the next record with a
-`coverage_gap` so the chain is visibly incomplete. Two failure-mode rows and the
-`TraceChainStateTest` / `TraceEmitterTest` / `IssuanceReconciliationTest` scopes were updated.
-
-**Q9. The extra assessment JWT is the clearest thing to remove. jans already stores the
-assessment, DCR can reference its id, and `/token` looks it up by client and key. The issued SVID
-and the signed TRACE record already communicate jans's acceptance. A portable assessment JWT
-becomes useful only when another system actually needs to consume it independently.**
-
-Accepted; removed. The design no longer mints a jans-signed assessment token. Section 9.6 now
-lists how each consumer learns the verdict without one: the agent from the `/attestation`
-response, DCR from the `attestation_id` it is given, `/token` from the `(client_id, jkt)` lookup,
-relying parties from the SVID's `attestation` claim, auditors from the `CREDENTIAL_PROVISIONED`
-record (whose `posture_assessment_ref` carries the verdict). The `attestation_assessment` response member, the `attestation-assessment+jwt` type, the
-inline "assessment JWT" variants at DCR and `/token`, the corresponding test class and the
-"two result objects" decision were removed; the only signed attestation object left is the
-platform verifier's `AttestationResultJWT`. Section 9.6 notes the one case that would justify a
-portable token later (another authorization server consuming this server's appraisal) and the
-shape it would take (an EAT with `eat_nonce`, `cnf`, `measurements`, EAR `status`), addable as a
-new response member without changing the rest.
+The review questions raised against this plan and the change each one produced are kept in a
+separate document, [`hardware-anchored-identity-review-history.md`](./hardware-anchored-identity-review-history.md),
+so this specification stays current rather than carrying its own changelog. The authoritative
+behaviour is in the numbered sections above; the review history points back to them.
 
 
 ## 21. Glossary
