@@ -2126,39 +2126,126 @@ New package `io.jans.as.server.trace`:
   versa — the role→key mapping is fixed.
 - `TraceChainState`: per-node chain position `{ producer_id, chain_id, sequence_number, prev_record_hash }`,
   **one chain per producer role** (`jans-svid-issuer` and `jans-auth` keep independent chains on a
-  node). It is **derived from the outbox**, not kept separately: the outbox entry that holds record
-  *n* also holds its producer, sequence number, and the hash of record *n-1* on that producer's
-  chain, and inserting the entry is what allocates the sequence number within that chain. There is
-  therefore no second write to keep consistent.
+  node). The **authoritative** chain lives in the outbox: the entry that holds record *n* also holds
+  its producer, sequence number, and the hash of record *n-1*, and the unique index on
+  `(producer_id, chain_id, sequence_number)` is the single source of truth for which positions are
+  taken. A per-chain **tail pointer** is a derived cursor over that truth, kept only to make the
+  next position O(1); it is never trusted on its own — it can be rebuilt from the outbox at any time,
+  and a stale tail cannot corrupt the chain because the unique index rejects a duplicate position.
+  How the sequence number and predecessor hash are chosen under concurrency is the append protocol
+  below, not an implicit side effect of "insert".
+
+#### The outbox append protocol (how concurrent writers do not collide)
+
+Each `(producer_id, chain_id)` is **one serial chain per node**; `chain_id` is the node id, so two
+nodes never share a chain and a record's position is only ever contended by threads of the *same*
+node. The protocol makes that contention safe:
+
+- **Uniqueness constraint.** `jansTraceOutbox` has a unique index on
+  `(producer_id, chain_id, sequence_number)`. The backend rejects a second insert at the same
+  position: a SQL unique constraint, an LDAP `add` whose RDN includes the sequence number (add
+  fails if the entry exists), or a Couchbase `insert` keyed by `producer::chain::seq` (fails if the
+  key exists). Two threads that both compute sequence *n* cannot both commit — at most one insert
+  survives.
+- **Serialized allocation with a fencing token.** A per-`(producer_id, chain_id)` **tail pointer**
+  (`jansTraceChainTail`, one entry per chain) carries `{ next_sequence, tail_record_hash, epoch }`.
+  A writer advances it with a **CAS**: read `{ next_sequence = n, tail_record_hash = h, epoch = e }`,
+  build the record with `sequence_number = n` and `prev_record_hash = h`, then CAS the tail to
+  `{ n+1, hash(record_n), e }` **conditioned on the tail still reading `(n, h, e)`**. The CAS and
+  the outbox insert are ordered: **insert the outbox entry first** (its unique index is the source
+  of truth for "position *n* is taken"), **then** CAS the tail. A writer that loses the tail CAS
+  but already inserted has still produced a valid, unique record; a writer that loses the unique
+  insert discards its record and retries at the re-read tail. `epoch` is the **fence**: an operator
+  repair (tail rebuild after corruption, forced truncation) bumps `epoch`, so a zombie thread
+  holding a stale `(n, h, e-1)` can never CAS the tail forward — its write is rejected as
+  fenced-off, not silently forked onto the chain.
+- **Retry behavior.** On a lost CAS or a lost unique insert, the writer re-reads the tail and
+  retries with the new `(n, h, e)`, bounded by a small attempt cap (default 5) and jittered backoff.
+  Exhausting the cap is treated exactly like an outbox-write failure: `503 evidence_unavailable`
+  for a `fail-closed` client (the action is refused, nothing is half-written), or the `fail-open`
+  drop-with-`coverage_gap` path otherwise. Because the unique index is authoritative, a retry can
+  never duplicate a position even if a previous attempt's insert actually committed before the
+  process saw the result — the retry's insert fails on the constraint and the writer adopts the
+  already-inserted record rather than writing a second one.
+- **Recovery without a separate write.** If `jansTraceChainTail` is lost or stale, it is rebuilt by
+  scanning the outbox for the highest `sequence_number` on the chain and reading that entry's hash;
+  the outbox (with its unique index) remains the single source of truth, and the tail is only a
+  fast cursor. Rebuild bumps `epoch`.
 - `TraceEmitter`: durable outbox (`jansTraceOutbox`) + timer posting to Lock's planned
   `POST /api/v1/audit/trace` ingestion endpoint (a Lock dependency, not a current endpoint — see
   section 11.1) with a `trace.write` client-credentials token from this server; retry with backoff;
-  never drops silently. `traceEmissionMode=inline` posts before the HTTP response (demo mode).
+  never drops silently. `traceEmissionMode=inline` posts before the HTTP response (demo mode) — but
+  only after the commit point, never before (the staging rule in the durability subsection applies
+  to both modes).
 
 #### Durability: the commit relationship between an action and its record
 
-The invariant the plan guarantees: **no successful issuance, enrollment or appraisal exists
-without a durable record of it.** The reverse (a record for an action that then failed) is
-allowed and detectable.
+Two facts must not be conflated, and the protocol keeps them separate:
+
+- **Credential persisted** — the action's own entity (`TokenEntity`, enrolled `Client` key,
+  `AttestationAssessment` + its `KeyAttestationState` write-through) is durably committed. This is
+  what a `CREDENTIAL_PROVISIONED` record attests: *"the issuer committed this credential."*
+- **Response received by the client** — the agent actually got the token in the HTTP response. The
+  server **cannot** observe this (the response can be lost in flight), so no record ever claims it.
+  A persisted-but-never-delivered credential is a real, benign outcome: the credential is valid, the
+  agent simply retries and may receive the same or a fresh one. The record's truth is "persisted,"
+  not "delivered."
+
+The invariant the plan guarantees is therefore stated over *persistence*, not delivery: **no
+persisted issuance, enrollment or appraisal exists without a durable, eventually-delivered record of
+it; and no `CREDENTIAL_PROVISIONED` is delivered to Lock unless the credential it names was
+persisted.** Both directions matter — the first is completeness (no silent issuance), the second is
+**no false success evidence** (no signed "provisioned" record for a credential that was never
+committed).
+
+To get the second direction, the signed record is **built and staged but held undelivered until the
+credential's own commit is established.** An outbox entry has three states:
+
+| State | Meaning | Deliverable to Lock? |
+|-------|---------|----------------------|
+| `staged` | Record signed, outbox row inserted (chain position taken, append protocol above), but the credential entity is not yet confirmed committed | **No.** The emitter never posts a `staged` entry |
+| `committed` | The credential entity's commit is confirmed, so the record is now true | **Yes.** Eligible for the emitter |
+| `delivered` | Lock accepted it (`202` or idempotent replay) | terminal |
 
 | Step | Order | Why |
 |------|-------|-----|
-| 1 | Build the record for the action *as if it succeeded* (the provisioned `credential_fingerprint` — the SVID `jti` — is known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later |
-| 2 | Insert the outbox entry (record, sequence number, previous hash, `state=pending`) | This is the durable commitment; it allocates the chain position. If it fails, the action fails with `503 evidence_unavailable` and nothing else is written |
-| 3 | Persist the action's own entity (`TokenEntity`, `Client`, `AttestationAssessment`) | On backends with multi-entry transactions (SQL) steps 2 and 3 are one transaction. On LDAP / Couchbase they are two writes in this order, so a crash between them yields a record for a token that was never issued |
-| 4 | Return the HTTP response | |
-| 5 | Emitter posts the entry to Lock, marks `state=delivered` on `202` **or** on an idempotent-replay acceptance (Lock already has `record_id`: duplicate delivery after a crash between post and mark) | Delivery is at-least-once; Lock's store is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is never expected here and is surfaced as an error, not treated as delivered |
+| 1 | Build the record *as if the action succeeds* (`credential_fingerprint` is the SVID `jti`, known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later; signing early does **not** publish it |
+| 2 | Insert the outbox entry `state=staged` via the append protocol (unique position, tail CAS, fence) | Allocates the durable chain position. If it fails after the retry cap, the action is refused `503 evidence_unavailable` and nothing else is written |
+| 3 | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`) **and the `IssuanceLog` marker keyed by `record_id`** together | On SQL, steps 2–3 are **one transaction**, so the entry is born `committed` and the `IssuanceLog` is atomic with it. On LDAP / Couchbase (no multi-entry transaction) the entity and `IssuanceLog` are written before the step-4 flip, so recovery can read the marker |
+| 4 | **Promote the entry `staged → committed`** once step 3 is confirmed durable. On SQL this is implicit in the shared transaction; on LDAP / Couchbase it is a CAS flip on the outbox row *after* the entity write returns success | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves a `staged` entry that is never delivered |
+| 5 | Return the HTTP response | The client may or may not receive it; the record already says only "persisted," so a lost response changes nothing |
+| 6 | Emitter posts `committed` entries to Lock, marks `delivered` on `202` **or** on an idempotent-replay acceptance (Lock already has `record_id`) | At-least-once; Lock is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is never expected and is surfaced as an error, not treated as delivered |
 
-Crash recovery: on startup the emitter resends every `pending` entry of its node in sequence
-order; because sequence allocation *is* the outbox insert, there are no gaps and no forks, and
-`prev_record_hash` continuity is re-read from the tail entry. A `CREDENTIAL_PROVISIONED` record
-whose action did not complete (step 3 failed) names a credential `jti` that introspection does not
-know; a nightly reconciliation job emits a compensating, separately-signed `CREDENTIAL_PROVISIONED`
-(`provisioning_kind=rotation`, `supersedes_credential_fingerprint` pointing at the orphan,
-`credential_attributes` marking it never-activated, reason `not_persisted`) with a
-`parent_record_ids` link to the orphan — the issuance record is never rewritten, and the
-compensation is a new provisioning fact rather than a misused `AUTHORIZATION_DECISION` DENY (which
-would overload a decision record with a credential-lifecycle correction).
+So a `staged` entry whose entity write never committed is **never published** — the false-success
+window is closed. The cost is one extra state flip on the two-write backends; the SQL path pays
+nothing because the flip is the transaction commit itself.
+
+Crash recovery: on startup the emitter **resolves every `staged` entry before delivering anything**.
+For each `staged` entry it checks whether the named credential actually committed — not by token
+presence (see below) but by a **durable issuance-fact marker** written in the same step-3
+transaction/write: an `IssuanceLog` row keyed by the record's `record_id` (and carrying the SVID
+`jti`, `client_id`, `jkt`, and `issued_at`). The `IssuanceLog` is **not** the token and does **not**
+share the token's TTL; it is retained for `issuanceLogRetentionSeconds` (default ≥ the longest
+reconciliation interval, independent of SVID lifetime). Resolution:
+
+- `IssuanceLog` present → the entity committed; promote `staged → committed` and deliver. (This
+  recovers the LDAP/Couchbase crash between step 3 and step 4.)
+- `IssuanceLog` absent → the entity write did not commit; the `staged` entry is a record for an
+  action that never happened. It is **discarded** (moved to `voided`, retained for audit), never
+  delivered. No compensating "provisioned" record is emitted, because nothing was provisioned.
+
+This replaces the earlier, incorrect test. Token **absence at reconciliation is not proof of failed
+issuance**: a short-lived SVID can be issued, persisted, delivered, and then **expire or be deleted
+by TTL/revocation** long before a nightly job runs, so "introspection does not know this `jti`"
+cannot distinguish *never issued* from *issued and since gone*. The `IssuanceLog` marker is the
+positive, TTL-independent record of "this credential was committed," and it is what reconciliation
+reads. A genuine orphan (a `committed`/`delivered` record whose `IssuanceLog` is somehow missing —
+e.g. a partial write on a non-transactional backend that slipped past step 4) is corrected with a
+compensating, separately-signed `CREDENTIAL_PROVISIONED` (`provisioning_kind=rotation`,
+`supersedes_credential_fingerprint` pointing at the orphan, `credential_attributes` marking it
+never-activated, reason `not_persisted`) with a `parent_record_ids` link to the orphan — the
+original record is never rewritten, and the compensation is a new provisioning fact rather than a
+misused `AUTHORIZATION_DECISION` DENY.
 
 Outbox exhaustion: the outbox is bounded (`traceOutboxMaxEntries`, default 100 000, and
 `traceOutboxMaxAgeSeconds`). When full, behaviour follows `traceOutboxFullPolicy`:
@@ -2170,8 +2257,11 @@ Outbox exhaustion: the outbox is bounded (`traceOutboxMaxEntries`, default 100 0
   the next successfully emitted record carries a `GapDisclosure`-style `coverage_gap=true` marker
   so Lock flags the chain rather than silently showing it as complete.
 
-`traceEmissionMode=inline` changes only step 5's timing (post before step 4); steps 1 to 3 are
-identical.
+`traceEmissionMode=inline` moves the Lock post (step 6) to **before** the HTTP response (step 5),
+but **not** before the commit point: inline mode still waits for step 4 (`staged → committed`), so
+it posts only a committed, true record. It changes delivery timing, not the staging-before-commit
+rule. If the inline post fails, the entry stays `committed` in the outbox and the timer delivers it
+later — inline is a latency optimization, never a weakening of the hold-until-commit guarantee.
 - Hooks: `AttestationService.verify()`, `RegisterCreateAction` / `RegisterUpdateAction` (attested
   clients), `IdJagService`, `TokenRestWebServiceImpl.requestAccessToken()` for `JWT-SVID` clients
   (both outcomes). Other OAuth traffic produces no records unless `traceRecordAllIssuance=true`.
@@ -2186,9 +2276,11 @@ identical.
 | `traceSvidIssuerProducerKeyAlias` | `trace-svid-issuer` | Keystore alias for the `jans-svid-issuer` producer key, distinct from the `jans-auth` key |
 | `traceEvidenceDomainId` | — | Lock evidence domain |
 | `traceClientId` | — | Client used to obtain `trace.write` tokens |
-| `traceEmissionMode` | `outbox` | `outbox` or `inline` |
+| `traceEmissionMode` | `outbox` | `outbox` or `inline`; `inline` posts after the commit point, never before (11.3) |
 | `traceRecordAllIssuance` | `false` | Also record non-SVID issuance |
 | `traceEmitIssuanceDecision` | `false` | Also emit a separate `AUTHORIZATION_DECISION` (real `(action, resource_type)`) alongside the `CREDENTIAL_PROVISIONED`, for deployments that want an explicit issuance-policy decision record |
+| `traceOutboxAppendMaxRetries` | 5 | Append-protocol attempts (lost tail CAS or unique-insert collision) before the write is treated as failed (11.3) |
+| `issuanceLogRetentionSeconds` | 2592000 (30 d) | How long the TTL-independent `IssuanceLog` marker is kept; MUST be ≥ the longest reconciliation interval and is independent of SVID lifetime (11.3) |
 
 ### 11.4 Mapping to the agentrust TRACE v0.2 record
 
@@ -2278,7 +2370,7 @@ SDKs.
 |-----------|--------|-----------|
 | jans-core | `CustomScriptType.ATTESTATION`, `AttestationType`, `DummyAttestationType`; a binding to the shared **`jans-trace-core`** canonicalization/signing/digest library (its Java/JNI binding, or a Java implementation that passes its normative vectors), **not** a jans-local canonicalizer — so producer and Lock outputs are byte-identical | PR 1, PR 6 |
 | jans-lock | Accept the existing `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED` (bootstrap) event kinds this plan emits — no new event kind is introduced (the earlier `ATTESTATION_APPRAISED` proposal is dropped in favor of `CREDENTIAL_PROVISIONED` carrying the attestation verdict as `posture_assessment_ref`/`attestation_ref`); confirm the `POST /api/v1/audit/trace` submit (`202`, idempotent replay) and `GET /api/v1/audit/trace/executions/{id}` read endpoints (these are a Lock dependency, not reused — only the admin REST class exists on this branch) | PR 6, demo |
-| jans-linux-setup | Schema for `jansAttest`, `jansTraceChain`, `jansTraceOutbox`; register **both** producer keys + chains in Lock when enabled — `jans-auth` scoped `["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]` and `jans-svid-issuer` scoped `["CREDENTIAL_PROVISIONED"]`, each with its own Producer-Key Authorization Statement; ship the reference script | PR 1, PR 6 |
+| jans-linux-setup | Schema for `jansAttest`, `jansKeyAttestState` (§9.7), `jansTraceChain`, `jansTraceOutbox` (unique index on `(producer_id, chain_id, sequence_number)`, §11.3), `jansTraceChainTail`, `jansIssuanceLog` (§11.3); register **both** producer keys + chains in Lock when enabled — `jans-auth` scoped `["AUTHENTICATION_EVENT", "EXECUTION_STARTED"]` and `jans-svid-issuer` scoped `["CREDENTIAL_PROVISIONED"]`, each with its own Producer-Key Authorization Statement; ship the reference script | PR 1, PR 6 |
 | jans-config-api, jans-cli-tui, Admin UI | `access_token_type`, attestation and trace properties | after PR 2 |
 | PDP / PEP (Cedarling, demo gateway) | Copy the correlation pair (`trace_execution_id` + `execution_authority`) and token `jti`s into their records, and sign `(action, resource_type)` facts — **never** a `capability_id` (Lock resolves it, section 11.5); PEP validates the SVID via the bundle **and** performs the full RFC 9449 DPoP presentation check (`htm`/`htu`/`iat`-age/`jti`-replay/`nonce`-when-used/`ath`, plus proof-key = `cnf.jkt`; §6) — the thumbprint comparison alone is not sender-constrained | demo |
 | Auth Server / FIDO Server human-authentication evidence | The signed `AUTHENTICATION_EVENT` (`auth-server-trace-design.md`) and `FIDO_CEREMONY` (`fido-trace-design.md` / `fido-trace-design-MVP.md`) that resolve the human login behind an execution, correlated by `sid` (§10.9). **Deferred past the Lock MVP** (authentication/FIDO events are not in the three-kind MVP catalog); this plan only carries the `acr`/`amr`/`sid` inputs and gates delegation on them | later phase |
@@ -2346,8 +2438,9 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `IntrospectionWebServiceTest` (extend) | SPIFFE `sub`, `cnf`, `txn`, `attestation`, `delegation` |
 | `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or when `acr` is below `idJagMinAcr`, or `amr` is outside `idJagAllowedAmr`; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry |
 | `TraceRecordBuilderTest` | envelope; **canonicalization, signature, and `content_digest` are byte-identical to `jans-trace-core`'s normative vectors** (run the shared vectors through this producer's path and assert equality with the Rust/Lock output — the cross-language conformance bar); signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); records carry `eat_profile: tag:jans.io,2026:trace-v1` only; no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
-| `TraceChainStateTest` | sequence allocated by outbox insert; `prev_record_hash` links; zero hash first; tail re-read after restart; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
-| `TraceEmitterTest` | outbox retry; `202` and idempotent-replay acceptance both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; inline ordering; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
+| `TraceChainStateTest` | **append protocol (§11.3):** two concurrent writers computing the same sequence — exactly one unique-insert survives, the loser re-reads the tail and retries at the next position (no duplicate `(producer_id, chain_id, sequence_number)`, no fork); tail CAS loser that already inserted keeps its valid record; `prev_record_hash` links; zero hash first; **fence:** a stale-`epoch` writer's tail CAS is rejected, not forked onto the chain; tail rebuilt from the outbox's highest sequence after loss and `epoch` bumped; retry cap exhaustion → `evidence_unavailable` / `fail-open` path; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
+| `TraceEmitterTest` | **hold-until-commit (§11.3):** a `staged` entry is **never posted**; only `committed` entries are delivered; on SQL the entry is born `committed` in the shared transaction, on LDAP/Couchbase the `staged → committed` flip follows a confirmed entity write; **crash recovery:** a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an **absent** `IssuanceLog` is `voided` and never delivered (no false success); inline mode posts after the commit point, never before; outbox retry; `202` and idempotent-replay both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
+| `IssuanceReconciliationTest` | token **absence is not treated as failed issuance** — an SVID whose `IssuanceLog` is present but whose `TokenEntity` has expired/been deleted is **not** flagged (it was issued and aged out); only a `committed`/`delivered` record with a **missing** `IssuanceLog` is an orphan and draws a compensating `CREDENTIAL_PROVISIONED` (`not_persisted`, `supersedes_credential_fingerprint`, `parent_record_ids`); the `IssuanceLog` outlives the SVID TTL by `issuanceLogRetentionSeconds` |
 
 Integration tests (`jans-auth-server/client`, disabled by default in `testng.xml` like the SPIFFE
 client-auth suite, enabled in the CI profile that provisions the prerequisites): the hardware is
@@ -2443,7 +2536,8 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Attestation script accepts everything | Core verifies the `AttestationResultJWT` against the server-configured verifier profile, extracts nonce and key itself, verifies the `TPM2_Certify` chain, and caps the status at its own binding verdict (9.3b); a permissive script can only make policy looser, never name a different key or skip the nonce |
 | ID-JAG stolen | Audience- and client-bound, short-lived (existing); the SVID carries `delegation.credential_id` and the records show which agent used it |
 | Outbox full or evidence store unavailable | `JWT-SVID` issuance refused with `503 evidence_unavailable` (`fail-closed`); other traffic per `traceOutboxFullPolicy`, with a `coverage_gap` marker on the next record so the chain is visibly incomplete rather than silently short |
-| Crash between record commit and token persistence | A `CREDENTIAL_PROVISIONED` record exists for a credential `jti` introspection does not know; the reconciliation job emits a compensating, superseding `CREDENTIAL_PROVISIONED` linked to it (11.3) |
+| Crash between record staging and credential persistence | The outbox entry is `staged`, not `committed`, and the credential's `IssuanceLog` marker was never written. On recovery the emitter finds the absent `IssuanceLog`, **voids** the `staged` entry, and **never delivers** it — so no false "provisioned" evidence reaches Lock (11.3). Only a genuinely orphaned *delivered* record (missing `IssuanceLog` despite delivery) draws a compensating, superseding `CREDENTIAL_PROVISIONED` |
+| SVID issued, persisted, then expired or revoked before reconciliation | **Not** flagged as a failed issuance. Token absence is not failure evidence; the TTL-independent `IssuanceLog` marker (retained `issuanceLogRetentionSeconds`) records the commit, so reconciliation sees a real past issuance that simply aged out, not an orphan (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
 
 ### 15.1 Residual trust assumptions
@@ -2987,23 +3081,41 @@ together prevents some chain failures but does not ensure every successful issua
 evidence record unless issuance and evidence persistence have a defined commit relationship.
 Explain crash recovery, duplicate delivery and outbox exhaustion.**
 
-Accepted. Section 11.3 gained a "Durability" subsection with the invariant *no successful
-issuance, enrollment or appraisal without a durable record*, enforced by ordering: build and sign
-the record, insert the outbox entry (which is also what allocates the chain sequence number, so
-there is no separate chain state to keep consistent), then persist the action's entity, then
-respond. SQL backends do the two writes in one transaction; LDAP / Couchbase write in that order,
-and the only possible inconsistency (a record for an action that failed afterwards) is detectable
-by `jti` and repaired by a reconciliation job that emits a compensating, superseding
-`CREDENTIAL_PROVISIONED` record linked to the orphan. Delivery to Lock is at-least-once: the
-emitter marks an entry delivered on a `202` acceptance or on an idempotent-replay acceptance of the
-same `record_id` (Lock's store is keyed by `record_id`, so a re-POST after a crash is idempotent);
-a `409` — same `record_id`, *different* content — is never expected on the emission path and is
-surfaced as an error for investigation, never silently treated as delivered. Crash recovery resends
-`pending` entries in sequence order from the outbox tail.
-The outbox is bounded (`traceOutboxMaxEntries`, `traceOutboxMaxAgeSeconds`) and a full outbox
-fails `JWT-SVID` issuance closed (`503 evidence_unavailable`) or, under `fail-open`, marks the
-next record with a `coverage_gap` so the chain is visibly incomplete. Two failure-mode rows and
-the `TraceChainStateTest` / `TraceEmitterTest` scopes were updated.
+Accepted, and specified in full in section 11.3 along three axes the first draft left implicit:
+
+- **Append protocol.** "Insert allocates the sequence number" is now an explicit protocol, not a
+  side effect. Each `(producer_id, chain_id)` is one serial chain per node (`chain_id` = node id, so
+  nodes never share a chain); a **unique index** on `(producer_id, chain_id, sequence_number)` makes
+  a position un-double-writable; a per-chain **tail pointer** carrying `{ next_sequence,
+  tail_record_hash, epoch }` is advanced by **CAS** with the outbox unique-insert as the authority;
+  `epoch` is a **fence** so a zombie/stale thread cannot fork the chain after an operator repair; and
+  lost-CAS / lost-insert both **retry** at the re-read tail up to `traceOutboxAppendMaxRetries`,
+  after which the write fails like any outbox-write failure.
+- **Hold delivery until commit.** The signed record is **staged**, not published, until the
+  credential's entity write is confirmed committed (one transaction on SQL; a `staged → committed`
+  CAS flip after the entity write on LDAP/Couchbase). The emitter **never** posts a `staged` entry,
+  so a record is never delivered for a credential that was not persisted — closing the
+  **false-success-evidence** hole where a signed "provisioned" record could reach Lock after the
+  entity write failed. "Persisted credential" and "response received by the client" are explicitly
+  distinguished; the record attests only the former, because the server cannot observe the latter.
+- **Reconciliation on a positive marker, not token absence.** Token **absence is not proof of
+  failed issuance** — a short-lived SVID can be issued and then expire or be deleted long before a
+  nightly job. A TTL-independent **`IssuanceLog`** row (keyed by `record_id`, retained
+  `issuanceLogRetentionSeconds`) written in the same entity transaction is the positive evidence of
+  commit: a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an
+  absent `IssuanceLog` is `voided` and never delivered, and only a delivered record whose
+  `IssuanceLog` is genuinely missing is an orphan repaired by a compensating, superseding
+  `CREDENTIAL_PROVISIONED` (`not_persisted`) linked to the orphan.
+
+Delivery to Lock remains at-least-once: the emitter marks an entry delivered on a `202` or an
+idempotent-replay acceptance of the same `record_id` (Lock's store is keyed by `record_id`); a
+`409` — same `record_id`, *different* content — is never expected and is surfaced as an error, never
+silently treated as delivered. Crash recovery resolves `staged` entries (promote or void) before
+delivering, then delivers `committed` entries in sequence order. The outbox is bounded
+(`traceOutboxMaxEntries`, `traceOutboxMaxAgeSeconds`) and a full outbox fails `JWT-SVID` issuance
+closed (`503 evidence_unavailable`) or, under `fail-open`, marks the next record with a
+`coverage_gap` so the chain is visibly incomplete. Two failure-mode rows and the
+`TraceChainStateTest` / `TraceEmitterTest` / `IssuanceReconciliationTest` scopes were updated.
 
 **Q9. The extra assessment JWT is the clearest thing to remove. jans already stores the
 assessment, DCR can reference its id, and `/token` looks it up by client and key. The issued SVID
@@ -3074,6 +3186,10 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **`capability_id`** | The governance label Lock *derives* from signed `(action, resource_type)` facts — never signed by a producer (§11.5). |
 | **Settlement / Evidence Packet / lineage checkpoint** | Lock-side assurance layers (Phase 2/4), referenced for phase scoping (§11.1). |
 | **`jans-trace-core`** | The shared Rust library for canonicalization / Ed25519 signing / digest, with normative cross-language vectors (§11.3). |
+| **Outbox append protocol** | How a record's chain position is chosen under concurrency: a unique index on `(producer_id, chain_id, sequence_number)`, a per-chain tail pointer advanced by CAS, an `epoch` fence against stale writers, and bounded retry (§11.3). |
+| **Record states `staged` / `committed` / `delivered` / `voided`** | The outbox lifecycle: signed but held, commit-confirmed and deliverable, accepted by Lock, or discarded because its credential never committed. A `staged` entry is never delivered (§11.3). |
+| **`IssuanceLog`** | A TTL-independent marker (keyed by `record_id`) proving a credential was committed; it outlives the SVID so **token absence is never read as failed issuance** (§11.3). |
+| **Persisted vs. delivered** | "Credential persisted" (committed by the issuer, what a record attests) vs. "response received by the client" (unobservable by the server, never asserted) (§11.3). |
 | **Operation binding** | `request_digest` / `input_digest` / `tool_call_digest` / `result_digest` + proof-of-possession binding — the Phase-3 same-operation proof (§3; `design.md`). |
 
 ### AIMS / WIMSE
