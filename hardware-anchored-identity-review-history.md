@@ -403,7 +403,7 @@ validation confirmation. Two concrete gaps: (1) `provisioning_outcome` and an ab
 not cover an unsuccessful **`EXECUTION_STARTED`** bootstrap — which belongs to the `jans-auth`
 producer, whose key is **not** authorized to emit `CREDENTIAL_PROVISIONED`.
 
-**Change (§11.2, §11.3, appendix).** The outcome is now an explicit wire contract: a new
+**Change (§11.2, §11.3, appendix).** The outcome became an explicit wire contract: an
 `event.provisioning_outcome` discriminator (default `committed`, preserving the success shape), with
 per-outcome required fields — `credential_fingerprint` **present iff `committed`**, `reason` =
 `not_committed` for an abort, and the chain/identity fields carried on every outcome. (This round
@@ -415,8 +415,13 @@ decision, Q18, removed `indeterminate`, leaving `{committed, aborted}`.) The abo
 a `CREDENTIAL_PROVISIONED` (which Lock rejects for that producer key). The appendix's jans-lock row
 now lists the field-level format changes as a **confirmation item against Lock's actual schema**
 (resolved by a Lock-side schema update if needed, never by fabricating a fingerprint), and a new
-`OutcomeRecordSchemaFixtureTest` adds a canonical fixture for **each (operation kind × outcome)**
-cell, shared with Lock's conformance suite.
+`OutcomeRecordSchemaFixtureTest` adds a canonical fixture for each (operation × outcome) cell, shared
+with Lock's conformance suite.
+
+> **Superseded by Q21.** This round's "`credential_fingerprint` present iff `committed`" rule was
+> too coarse — it contradicted two already-defined success shapes (a committed bare-key appraisal has
+> no credential, and a committed `EXECUTION_STARTED` bootstrap provisions none). Q21 replaced it with
+> an **event kind × operation subtype × outcome** matrix and renamed the field `operation_outcome`.
 
 ## Q18. SQL is the only persistence backend (Ledger drops LDAP and Couchbase)
 
@@ -519,6 +524,37 @@ it does **not** globally restrict Jans and introduces **no separate persistence 
 tables are ordinary SQL entities in the same schema, not a second datastore). §9.5's enrollment
 transaction and the appendix schema/fault-test rows now reference this boundary.
 
+## Q21. The outcome schema contradicted the success event definitions
+
+**Status: resolved** — the required identifying artifact is now defined by event kind × operation
+subtype × outcome (§11.2 matrix); the field is renamed `operation_outcome`.
+
+**Raised.** Q17's invariant required `credential_fingerprint` on *every* `committed` record, but two
+success shapes already defined in §11.2 have no credential fingerprint: a **bare-key appraisal**
+(`CREDENTIAL_PROVISIONED` with no credential bound, identified by `attestation_id` + assessed-key
+`jkt`) and a successful **`EXECUTION_STARTED`** (which carries its source grant in `tokens[]` and
+provisions no credential). Valid success records therefore failed the proposed invariant. Separately,
+`provisioning_outcome` was a misnomer on `EXECUTION_STARTED`, which starts an execution rather than
+provisioning anything.
+
+**Change (§11.2, §11.3, appendix).** Replaced the single "committed ⇒ fingerprint" rule with a
+matrix keyed by **event kind × operation subtype × outcome**, each committed success carrying the
+identifying artifact proper to its operation:
+
+| Successful operation | Required identifying artifact |
+|----------------------|-------------------------------|
+| SVID issuance | `credential_fingerprint` (SVID `jti`/`cnf_key_thumbprint`) |
+| Key enrollment | enrolled-key thumbprint (`jkt`) |
+| Bare-key appraisal | `attestation_id` + assessed-key thumbprint (`jkt`) — **no** `credential_fingerprint` |
+| Execution bootstrap | execution pair (`trace_execution_id` + `execution_authority`) + source-grant reference — **no** `credential_fingerprint` |
+
+`credential_fingerprint` is now required **only** for committed SVID issuance and key enrollment, and
+MUST be absent for a bare-key appraisal, an `EXECUTION_STARTED` bootstrap, and every `aborted` record.
+The field is renamed **`operation_outcome`** (it applies to `EXECUTION_STARTED` too). The same matrix
+drives `OutcomeRecordSchemaFixtureTest` (a fixture per subtype × outcome, asserting the artifact rule
+both ways) and the Lock-compatibility confirmation (a schema that requires `credential_fingerprint`
+uniformly on `CREDENTIAL_PROVISIONED` is itself the contradiction, resolved Lock-side).
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -533,5 +569,7 @@ the SQL-only backend reduction (§§9.5/11.3, which removed the `indeterminate` 
 LDAP/Couchbase portability caveats), the §5 two-authorization-server model (IdP AS issues the
 ID-JAG, Resource AS redeems it and mints the execution pair; Q19), the §11.3 issuer-side
 transaction-boundary requirement (entity + evidence tables in one `jans-orm` SQL transaction domain,
-MySQL/PostgreSQL, Lock ingestion outside it; Q20), and the §16.1 key-revocation delay). This history
+MySQL/PostgreSQL, Lock ingestion outside it; Q20), the §11.2 outcome schema keyed by event kind ×
+operation subtype × outcome with the field renamed `operation_outcome` (Q21, which corrected Q17's
+too-coarse "committed ⇒ fingerprint" rule), and the §16.1 key-revocation delay). This history
 preserves the original questions that drove them; for current behaviour, read the main document.
