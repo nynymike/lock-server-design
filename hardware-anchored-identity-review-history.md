@@ -450,6 +450,11 @@ and the multi-backend caveats collapse into SQL behaviour:
   `INSERT … WHERE … epoch = :myEpoch`), and the fault tests run on SQL only (including a clustered
   configuration), now also asserting mid-transaction rollback.
 
+The title "Ledger drops LDAP and Couchbase" describes the **Lock** side. It is **not** what
+establishes the issuer-side `Commit` atomicity: the entity + `IssuanceLog` + outbox writes happen in
+**jans-auth-server**, before delivery to Lock, so they need their own transaction-domain requirement
+— stated as Q20.
+
 ## Q19. The ID-JAG two-server correction had not propagated through all documents
 
 **Status: resolved** — every passage now reflects the two-AS model and the artifacts each server
@@ -488,6 +493,32 @@ aligned every passage to it:
   issuer side (jans-as-IdP login gate, skipped for external IdPs) from the redemption side
   (validation, acceptance check, pair minting, external-IdP `sid` non-resolution).
 
+## Q20. The one-transaction `Commit` needs an explicit issuer-side transaction boundary
+
+**Status: resolved** — §11.3 states the requirement, names the database and transaction API, and
+answers the deployment question; §9.5 and the appendix are aligned.
+
+**Raised.** The protocol depends on the issuer's entity (`TokenEntity` / `Client`+`KeyEnrollment` /
+`AttestationAssessment`+`KeyAttestationState`), the `IssuanceLog`, and the outbox state committing in
+**one** database transaction. Q18 justified this under "SQL-only," but that framing is about *Lock*,
+whose ingestion is asynchronous and downstream. Making Lock SQL-only does not establish the
+**issuer-side** transaction boundary — the relevant writes are in jans-auth-server. The design had
+not stated that boundary as a requirement, named the database/API, or said whether the feature
+restricts Jans deployments.
+
+**Change (§11.3, §9.5, appendix).** Added an explicit **issuer-side transaction-boundary
+requirement**: hardware-anchored issuance requires the participating jans-auth-server entities and
+the local evidence tables (`jansTraceOutbox`, `jansIssuanceLog`, `jansTraceIntake`,
+`jansTraceChainLease`) to reside in **one supported SQL transaction domain** — the same `jans-orm`
+SQL database, one datasource — so a single **native local (non-XA) transaction** spans all of them;
+Lock ingestion stays asynchronous and outside it. Named the support: the **`jans-orm` SQL
+persistence layer** (`PersistenceEntryManager`, SQL backend) on **MySQL 8+** or **PostgreSQL**, local
+`BEGIN … COMMIT` on one connection, clustered DB allowed. Answered the deployment question: **this
+feature** requires the SQL backend for the issuing node and **fails closed at startup** otherwise;
+it does **not** globally restrict Jans and introduces **no separate persistence path** (the evidence
+tables are ordinary SQL entities in the same schema, not a second datastore). §9.5's enrollment
+transaction and the appendix schema/fault-test rows now reference this boundary.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -500,6 +531,7 @@ distinction, the §10.10 token-privacy scope, the §11.3 sign-once-at-resolution
 per-producer outcome wire contract (`provisioning_outcome`, bootstrap aborts as `EXECUTION_STARTED`),
 the SQL-only backend reduction (§§9.5/11.3, which removed the `indeterminate` outcome and the
 LDAP/Couchbase portability caveats), the §5 two-authorization-server model (IdP AS issues the
-ID-JAG, Resource AS redeems it and mints the execution pair; Q19), and the §16.1 key-revocation
-delay). This history preserves the original questions that drove them; for current behaviour, read
-the main document.
+ID-JAG, Resource AS redeems it and mints the execution pair; Q19), the §11.3 issuer-side
+transaction-boundary requirement (entity + evidence tables in one `jans-orm` SQL transaction domain,
+MySQL/PostgreSQL, Lock ingestion outside it; Q20), and the §16.1 key-revocation delay). This history
+preserves the original questions that drove them; for current behaviour, read the main document.

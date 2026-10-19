@@ -1273,9 +1273,11 @@ The claim replaces the lookup with a write that one and only one enroller can wi
 
 **Recovery across the writes (steps 1–6).** On SQL the whole enrollment — the `KeyEnrollmentClaim`
 insert (step 1), the `KeyEnrollment` binding, the `KeyAttestationState` initialization, and the
-claim-commit — is **one native transaction**, so it is atomic: either all of it commits or none of
-it does, and a crash mid-transaction rolls back cleanly with no half-enrolled state. There is no
-`pending` intermediate state to reconcile. The two concerns the transaction keeps separate are:
+claim-commit — is **one native SQL transaction in the issuer-side transaction domain** (§11.3: all
+of these are `jans-orm` SQL entities in the one database jans-auth-server owns, reached through one
+datasource), so it is atomic: either all of it commits or none of it does, and a crash
+mid-transaction rolls back cleanly with no half-enrolled state. There is no `pending` intermediate
+state to reconcile. The two concerns the transaction keeps separate are:
 
 - **Concurrency / uniqueness** is enforced by the `KeyEnrollmentClaim` insert-conditioned-on-absence
   (a unique constraint on `attestation_id`, step 1). Two concurrent enrollments naming the same
@@ -2788,6 +2790,40 @@ exist, and a record is matched to an operation only by its recorded `operation_i
 
 #### Durability: the commit relationship between an action and its record
 
+**Issuer-side transaction boundary (a deployment requirement).** The **Commit** transition below
+depends on the issuer's own entities and its local evidence tables committing **atomically together**.
+That atomicity is an **issuer-side (jans-auth-server) property** — it happens before anything is
+delivered to Lock — so it is **not** established by Lock being SQL-only. The requirement is explicit:
+
+> **Hardware-anchored issuance requires the participating jans-auth-server entities
+> (`TokenEntity` / `Client`+`KeyEnrollment` / `AttestationAssessment`+`KeyAttestationState`) and the
+> local evidence tables (`jansTraceOutbox`, `jansIssuanceLog`, `jansTraceIntake`,
+> `jansTraceChainLease`) to reside in one supported SQL transaction domain — the same database,
+> reached through one datasource, so a single local transaction spans all of them. Lock ingestion
+> remains asynchronous and is explicitly outside that transaction.**
+
+Concretely:
+
+- **Supported database / API.** The transaction domain is the jans **`jans-orm` SQL persistence
+  layer** (`PersistenceEntryManager` over the SQL backend) on a supported RDBMS — **MySQL 8+** or
+  **PostgreSQL** — using that engine's **native local (single-connection) transaction**
+  (`BEGIN … COMMIT`/`ROLLBACK` on one JDBC connection). It is deliberately **not** a distributed /
+  two-phase (XA) transaction across heterogeneous stores: all participating tables live in the one
+  SQL schema jans-auth-server owns, so one local transaction suffices. (A clustered database is
+  supported; the boundary is one transaction on one logical database, not one physical node.)
+- **Does this restrict Jans deployments?** For **this feature**, yes: a jans-auth-server that issues
+  hardware-anchored SVIDs MUST run its token/client/attestation persistence on the SQL backend, so
+  that the entity and the evidence tables share a transaction domain. It does **not** globally
+  restrict Jans — deployments that do not enable `SPIFFE_SVID_ISSUANCE` / attestation are unaffected
+  — and it introduces **no separate persistence path**: the evidence tables are ordinary `jans-orm`
+  SQL entities in the same schema, not a second datastore or a side-channel. An operator running a
+  non-SQL primary store for other reasons therefore cannot enable this feature on that node without
+  moving its persistence to SQL; the gate (`SPIFFE_SVID_ISSUANCE`) fails closed at startup if the
+  active `PersistenceEntryManager` is not the SQL backend.
+- **Lock is outside the boundary.** Delivery to Lock (**Deliver**) reads the already-committed
+  `jansTraceOutbox` rows and posts them asynchronously; Lock's own persistence choice is irrelevant
+  to the issuer-side atomicity and never participates in the issuer's transaction.
+
 Two facts must not be conflated, and the protocol keeps them separate:
 
 - **Credential persisted** — the action's own entity (`TokenEntity`, enrolled `Client` key +
@@ -2820,7 +2856,7 @@ transaction as the `operation_id`-keyed `IssuanceLog` and the `staged → commit
 |------------|--------------|--------------|----------------|-----------------|
 | **Intake** | Insert `jansTraceIntake` keyed by `operation_id`: the entity locator (`jti`/`client_id`/`jkt`/`kind`), producer role, and the **unsigned** event content (no `sequence_number`, `prev_record_hash`, or outcome yet) | A fresh `operation_id` not already present | The operation is recorded as *attempted*; no chain position yet, so concurrent operations do not contend | If this write never landed, nothing is owed to the chain and the client simply retries. If present, proceed to **Stage** |
 | **Stage** | Journal writer inserts a `jansTraceOutbox` entry `state=staged` with the next `sequence_number`, stamped with `operation_id`, **guarded by `WHERE lease.epoch = :myEpoch`** | Writer holds the current lease `epoch`; this `operation_id` has no outbox entry | A chain position is reserved; a writer whose `epoch` is stale is rejected by the guard, so no fenced-but-committed row exists | An `operation_id` with no outbox entry under the live/advanced epoch is (re)staged by the current lease holder under its own `epoch` — journaled late, never lost or duplicated (`operation_id` is idempotent) |
-| **Commit** | **One SQL transaction:** persist the entity with its `operation_id` + `record_id` receipt (`TokenEntity` / `Client`+`KeyEnrollment` / `AttestationAssessment`+`KeyAttestationState`); write the `operation_id`-keyed `IssuanceLog`; flip the entry `staged → committed`. The entity write is conditioned on the entry's `fence` still matching the writer's `fenceToken` | The `staged` entry exists and its `fence` is unchanged (not cancelled by recovery) | Entity, `IssuanceLog`, and `committed` flip are durable together or not at all — "this operation committed" ⇔ "its `operation_id`-keyed `IssuanceLog` exists" | Probe the `operation_id`-keyed `IssuanceLog`: **present** → promote to `committed` |
+| **Commit** | **One SQL transaction in the issuer-side transaction domain** (the requirement above — all these tables in one `jans-orm` SQL database, one datasource): persist the entity with its `operation_id` + `record_id` receipt (`TokenEntity` / `Client`+`KeyEnrollment` / `AttestationAssessment`+`KeyAttestationState`); write the `operation_id`-keyed `IssuanceLog`; flip the entry `staged → committed`. The entity write is conditioned on the entry's `fence` still matching the writer's `fenceToken` | The `staged` entry exists and its `fence` is unchanged (not cancelled by recovery) | Entity, `IssuanceLog`, and `committed` flip are durable together or not at all — "this operation committed" ⇔ "its `operation_id`-keyed `IssuanceLog` exists" | Probe the `operation_id`-keyed `IssuanceLog`: **present** → promote to `committed` |
 | **Resolve-abort** | Recovery **cancels** the entry first (CAS its `fence`, invalidating the writer's `fenceToken`), then flips `staged → aborted` | Entry still `staged`; `operation_id`-keyed `IssuanceLog` absent **past `resolutionWaitSeconds`**; writer fenced | The position is terminally `aborted`; a cancelled writer's later Commit is rejected, so it cannot land behind recovery | Idempotent: re-running finds the entry already `aborted` (or already `committed` if the writer won the fence race before cancellation) |
 | **Finalize-and-sign** | Build the complete record (resolved `provisioning_outcome` = committed/aborted, `sequence_number`, `prev_record_hash` over position *n-1*'s delivered `content_digest`), sign **once**, persist the canonical signed bytes on the entry | The entry is resolved (`committed` or `aborted`) and *n-1* is delivered | Exactly one signature, covering position + linkage + outcome; the stored bytes are authoritative | Idempotent and deterministic: re-finalizing a resolved entry produces byte-identical bytes |
 | **Deliver** | Post the stored signed bytes to Lock in `sequence_number` order; mark `delivered` on `202` or idempotent replay | The entry is resolved and signed; predecessors delivered | The record is at Lock; retries re-send identical bytes | At-least-once; Lock is keyed by `record_id`, so a retry is idempotent. A `409` (same `record_id`, different content) is an error — it cannot arise from a retry |
@@ -3261,10 +3297,12 @@ lost.
 
 The CAS/lease mechanisms (challenge state 9.3c, the single-row `KeyAttestationState` revision CAS
 for supersession and issuance 9.7/10.4) and the outbox-before-action commit (11.3) MUST be
-validated on **SQL** (the only supported backend) including clustered deployments. Attestation
-state uses a single-entry `revision` CAS because all of a key's state lives in one row (so no
-transition updates two entries), and the issuance/enrollment journal binds its multi-entry commit
-(`IssuanceLog` + entity + flip) into one SQL transaction (11.3). Fault tests MUST cover: a node crash between the outbox write and entity persistence
+validated on **SQL** — the backend this feature requires, since the **Commit** transition needs the
+issuer's entities and local evidence tables in one transaction domain (§11.3 issuer-side
+transaction-boundary requirement) — including clustered deployments. Attestation state uses a
+single-entry `revision` CAS because all of a key's state lives in one row (so no transition updates
+two entries), and the issuance/enrollment journal binds its multi-entry commit (`IssuanceLog` +
+entity + flip) into one native local SQL transaction over that single datasource (11.3). Fault tests MUST cover: a node crash between the outbox write and entity persistence
 (reconciliation emits the compensating record, 11.3); the **rejection-vs-in-flight-issuance race**
 — a `contraindicated` and a concurrent `/token` contending for the same `(client_id, jkt)` row,
 asserting the issuance's `revision` CAS fails when the rejection commits first and that no
