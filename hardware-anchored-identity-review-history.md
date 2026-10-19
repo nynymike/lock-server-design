@@ -113,10 +113,11 @@ execution across renewals. Define execution scope independently of credential li
 
 **Change.** §3 defines three scopes (execution, token lifetime, key lifecycle) with their own
 identifiers; the execution is identified by `(trace_execution_id, execution_authority)` (with `txn`
-as an application alias). An execution is opened by the ID-JAG exchange or the first `/token` of an
-autonomous agent that carries no execution id; the server mints the pair, returns it, and accepts it
-on renewals while the execution is open and bound to the same client/principal (`jansTraceExecution`
-registry, §10.8). Attestation/enrollment records are lifecycle records with their own
+as an application alias). An execution is opened by jans (the Resource AS) when it **redeems** a
+human's ID-JAG at `/token`, or on the first `/token` of an autonomous agent that carries no
+execution id; jans mints the pair there, returns it, and accepts it on renewals while the execution
+is open and bound to the same client/principal (`jansTraceExecution` registry, §10.8). The ID-JAG
+is issued earlier by a separate IdP AS and carries no execution id (§5, Q19). Attestation/enrollment records are lifecycle records with their own
 `trace_execution_id` scope (`att:<attestation_id>`, `enroll:<client_id>`), referenced by
 `parent_record_ids` (§11.2).
 
@@ -434,6 +435,44 @@ and the multi-backend caveats collapse into SQL behaviour:
   `INSERT … WHERE … epoch = :myEpoch`), and the fault tests run on SQL only (including a clustered
   configuration), now also asserting mid-transaction rollback.
 
+## Q19. The ID-JAG two-server correction had not propagated through all documents
+
+**Status: resolved** — every passage now reflects the two-AS model and the artifacts each server
+actually holds.
+
+**Raised.** The revised §5 diagram correctly shows the **Resource AS (jans)** opening the execution
+when it **redeems** the ID-JAG, while the ID-JAG is **issued** by a separate **IdP AS** across a
+trust boundary. Several other passages still assumed the earlier single-authority model: §3's
+renewal paragraph implied the execution pair comes from the ID-JAG; §10.9 described jans as *gating
+ID-JAG issuance* rather than distinguishing issuer-side login policy from redemption-side acceptance;
+§11.2's bootstrap fingerprinted the original ID token, which need not reach jans; PR 5 said it adds
+`txn` to the ID-JAG; and `IdJagServiceTest` minted execution identifiers and tested issuer-side
+behaviour without separating the roles. Separately, an external IdP's authentication/FIDO events
+cannot be resolved against local Jans FIDO records.
+
+**Change (§§3, 5, 10.9, 11.2, appendix).** Added an explicit **"artifacts available at each server"**
+table to §5 (the IdP AS holds the ID token / login / FIDO records and issues the ID-JAG; jans, as
+the Resource AS, sees only the ID-JAG it redeems plus the key material at `/token`, and **mints** the
+`(trace_execution_id, execution_authority)` pair there — the ID-JAG carries no execution id), and
+aligned every passage to it:
+
+- **§3 renewal:** the execution id on a renewal is the pair **jans minted and returned** on the
+  opening call (echoed as the prior SVID's claim / `txn`), explicitly **not** carried by the ID-JAG.
+- **§10.9:** split human assurance into an **issuer-side login bar** (`idJagRequirePhishingResistant`,
+  applied only when this jans is the IdP AS) and a **redemption-side acceptance check** at `/token`
+  that maps the ID-JAG's *asserted* `acr`/`amr` to a server level and refuses an insufficient
+  delegation before issuing. jans records the asserted values; it does not re-derive them.
+- **§11.2:** the `EXECUTION_STARTED` bootstrap fingerprints the **ID-JAG jans redeemed**, not the
+  human's ID token (which it does not hold unless it is the IdP); the diagram node says "ID-JAG
+  **redeemed**."
+- **External-IdP `sid`:** a `sid` from an external IdP resolves to **no** local FIDO record; it is an
+  opaque issuer-scoped reference whose ceremony evidence lives at that IdP (a cross-producer link),
+  recorded in §3, §10.9, §11.2, and the glossary.
+- **Appendix:** PR 5 now describes **redeeming** the ID-JAG and minting the pair into the registry /
+  SVID (not stamping `txn` into the ID-JAG); `IdJagServiceTest`/`IdJagRedemptionTest` separate the
+  issuer side (jans-as-IdP login gate, skipped for external IdPs) from the redemption side
+  (validation, acceptance check, pair minting, external-IdP `sid` non-resolution).
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -445,5 +484,7 @@ delegation-expiry clamp and tenant-scoped principal binding, the §10.9 BE/BS-vs
 distinction, the §10.10 token-privacy scope, the §11.3 sign-once-at-resolution rule, the §11.2/§11.3
 per-producer outcome wire contract (`provisioning_outcome`, bootstrap aborts as `EXECUTION_STARTED`),
 the SQL-only backend reduction (§§9.5/11.3, which removed the `indeterminate` outcome and the
-LDAP/Couchbase portability caveats), and the §16.1 key-revocation delay). This history preserves the
-original questions that drove them; for current behaviour, read the main document.
+LDAP/Couchbase portability caveats), the §5 two-authorization-server model (IdP AS issues the
+ID-JAG, Resource AS redeems it and mints the execution pair; Q19), and the §16.1 key-revocation
+delay). This history preserves the original questions that drove them; for current behaviour, read
+the main document.

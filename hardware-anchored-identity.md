@@ -130,12 +130,15 @@ Execution scope is defined independently of credential lifetime:
 | **Token lifetime** | SVID `jti` | Each issuance | `exp` (minutes) |
 | **Key lifecycle** (attestation, enrollment) | `attestation_id`, `client_id` | Before any execution exists | Key rotation / client removal |
 
-A renewal inside an execution presents the same execution id (as the ID-JAG's
-`https://jans.io/trace/execution_id` claim / `txn` alias, or the `txn` request parameter); the
-server accepts it while the execution is open **and** belongs to the same `client_id`, and refuses
-foreign or expired values with `invalid_request` (`txn_unknown`). The reissued token carries the
-same `(trace_execution_id, execution_authority)` pair, so one execution spans many token renewals
-and tokens never fragment it. Attestation and enrollment
+A renewal inside an execution presents the same execution id — **the pair jans itself minted and
+returned on the opening `/token` call**, carried back on the renewal as the prior SVID's
+`https://jans.io/trace/execution_id` claim / `txn` alias, or as the `txn` request parameter. The
+execution id does **not** come from the ID-JAG: the ID-JAG carries no `trace_execution_id`, and jans
+mints the pair only when it redeems the ID-JAG (§5). The server accepts a presented id while the
+execution is open **and** it belongs to the same `client_id`, and refuses foreign or expired values
+with `invalid_request` (`txn_unknown`). The reissued token carries the same
+`(trace_execution_id, execution_authority)` pair, so one execution spans many token renewals and
+tokens never fragment it. Attestation and enrollment
 records are **not** execution records: they happen before any execution and serve many later
 ones. They keep their own identifiers, and every execution record that relies on them points at
 them through `parent_record_ids` (section 11.2).
@@ -165,7 +168,7 @@ attestation reference rather than a signed capability label.
 
 | Identity | Carried in | Bound by | Recorded as |
 |----------|-----------|----------|-------------|
-| Human | ID-JAG (`sub`, `email`, `acr`, `amr`, `auth_time`, `sid`) | OIDC login at the IdP (gated phishing-resistant by default, §10.9); the ID-JAG is issued by the IdP AS (`aud` = jans) and **redeemed** by jans at `/token` (§5) — delegated authority, not per-execution approval | `subject.human_sponsor` with achieved `acr`/`amr`; `sid` ties the execution to the browser session a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` resolves; `tokens[]` entry `token_type=id-jag` |
+| Human | ID-JAG (`sub`, `email`, `acr`, `amr`, `auth_time`, `sid`) | OIDC login at the IdP (gated phishing-resistant by default, §10.9); the ID-JAG is issued by the IdP AS (`aud` = jans) and **redeemed** by jans at `/token` (§5) — delegated authority, not per-execution approval | `subject.human_sponsor` with the `acr`/`amr` **as asserted by the issuing IdP** (jans records them from the ID-JAG, it does not re-derive them); `sid` is the **IdP's** session id and ties the execution to a local `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` **only when that IdP is this jans instance** — for an external IdP the `sid` is opaque and resolves to no local FIDO record (§10.9); `tokens[]` entry `token_type=id-jag` |
 | Agent | JWT-SVID `sub` | Derived from `client_id` under the server's trust domain; never client-supplied | `subject.workload_id` (the SPIFFE ID); `tokens[]`/`credential_fingerprint` entry for the `jwt-svid` |
 | Hardware key | JWT-SVID `cnf.jkt`; DPoP proof on every request | Attestation assessment binds `jkt` to platform + measurement | `attestation_ref` (verifier, `result_status`, `appraised_at`) and `posture_assessment_ref` (`jkt`, `attestation_id`, `platform`, `measurement`) |
 | Policy decision | AuthZEN response | PDP evaluates agent + principal against the action/resource | `AUTHORIZATION_DECISION` signing `decision { action, resource_type, outcome }` (never a `capability_id`) by the PDP |
@@ -277,6 +280,22 @@ a tenant boundary) rather than loop back to its issuer. One software installatio
 roles, but only across such a boundary with distinct `iss`/`aud`; a genuinely single-domain
 deployment with no boundary to cross must use a different delegation mechanism (e.g. a direct
 token exchange or a local grant), not an ID-JAG redeemed by its own issuer.
+
+**Artifacts available at each server.** Because the two roles sit on opposite sides of a trust
+boundary, each sees a different set of artifacts, and no requirement may assume an artifact that
+never reaches the server enforcing it:
+
+| Artifact | IdP Authorization Server (`idp.example.org`) | Resource Authorization Server — this jans (`op.example.org`) |
+|----------|----------------------------------------------|--------------------------------------------------------------|
+| Human's **ID token** (and the login/FIDO ceremony behind it) | **Yes** — the IdP authenticated the human and holds the session/`sid` and any local FIDO records | **No** — the ID token is consumed at the IdP; it need not, and in the external-IdP case does not, reach jans. jans sees only what the ID-JAG asserts |
+| **ID-JAG** (`iss=idp`, `sub=human`, `aud=op`, `client_id=agent`, `acr`/`amr`/`auth_time`/`sid`) | **Issues** it (token exchange of the ID token); does **not** redeem it | **Redeems** it at `/token` (validates `iss ∈` trusted IdPs, `aud == op`, sig/exp). This is jans's only view of the human |
+| **`trace_execution_id` / `execution_authority`** (the execution pair) | **Not present** — the ID-JAG carries no execution id | **Minted here**, by jans, when it redeems the ID-JAG (or on an autonomous agent's first `/token`); returned in the token response and thereafter echoed by the agent |
+| **Agent key / attestation** (`cnf.jkt`, `KeyAttestationState`, DPoP proof) | **Not involved** | **Yes** — the hardware gate runs here |
+| **Local `AUTHENTICATION_EVENT` / `FIDO_CEREMONY`** resolving `sid` | Exists at whichever server authenticated the human | At jans **only when jans itself is the IdP**; for an external IdP, `sid` is an opaque IdP-scoped value and resolves to **no** local record (§10.9, §11.2) |
+
+The rule that follows: jans's requirements and records are built from the **ID-JAG claims it
+validates plus the key material it sees at `/token`** — never from the human's ID token or the IdP's
+FIDO records, which it does not possess unless it is itself the IdP.
 
 **An ID-JAG is delegated authority, not per-execution human approval.** The ID-JAG establishes that
 *an IdP authorized delegated access on behalf of the human* at login time — it does **not** prove
@@ -2064,43 +2083,64 @@ and this plan must not let a strong hardware binding paper over a weak human log
 make the human side explicit.
 
 **1. A configurable human-assurance policy, phishing-resistant by default — with no assumption that
-`acr` values are ordered.** The ID-JAG is only issued when the subject token's authentication meets
-a configured bar. Following AIMS §10.4.1 ("Users SHOULD be authenticated using phishing-resistant
-authentication mechanisms such as a passkey"), the default bar requires a phishing-resistant `amr`
-(a WebAuthn/passkey method).
+`acr` values are ordered.** Human assurance is enforced at **two distinct points by two distinct
+roles**, and this plan is careful not to conflate them:
 
-The subtle point is **`acr` has no universal ordering.** An `acr` is an opaque, issuer-defined
-string (an authentication-context-class *reference*); `"2"` from one IdP is not "stronger than"
-`"1"` from another, and `"urn:...:loa3"` and `"phr"` are not comparable at all. A `idJagMinAcr`
-"floor" compared with `>=` is therefore meaningless across issuers. Instead the policy maps each
-**trusted issuer's** `acr` (and/or `amr`) values to a small, server-defined **assurance level** via
-`idJagAssuranceMappings`, and the gate compares *that*:
+- **Issuer-side login policy (at the IdP AS).** Whether an ID-JAG is *issued at all* depends on how
+  the human logged in, and that decision belongs to the Authorization Server that authenticated the
+  human and holds the login/FIDO ceremony. Following AIMS §10.4.1 ("Users SHOULD be authenticated
+  using phishing-resistant authentication mechanisms such as a passkey"), the recommended login bar
+  is a phishing-resistant `amr`. **When this jans instance is itself acting as the IdP AS**, it
+  enforces that bar at login (`idJagRequirePhishingResistant`) and declines to issue the ID-JAG
+  otherwise. When the human authenticates at an **external** IdP, jans does not run this login gate
+  — it never saw the login — and `idJagRequirePhishingResistant` applies only to the issuer path.
+- **Redemption-side acceptance check (at the Resource AS — this jans at `/token`).** jans receives
+  an **already-issued** ID-JAG that asserts the human's `acr`/`amr`. It cannot re-run the login, so
+  it does not "gate issuance"; it decides whether to **accept this delegation for SVID issuance** by
+  mapping the *asserted* `acr`/`amr` to its own assurance level and comparing that. A delegation
+  that is accepted-but-insufficient is refused here, before any SVID is minted.
 
-| Property | Default | Meaning |
-|----------|---------|---------|
-| `idJagRequirePhishingResistant` | `true` | The subject token's `amr` must include a phishing-resistant method (passkey / WebAuthn) for the ID-JAG to issue |
-| `idJagAssuranceMappings` | — | Per-issuer map from the issuer's `acr`/`amr` values to a server assurance level (e.g. `low` / `substantial` / `high`). Keyed by the subject token's `iss`; an issuer with no mapping is treated as `unknown` → below any floor |
-| `idJagMinAssuranceLevel` | `substantial` | The minimum *mapped* level the subject authentication must reach; compared on the server's own ordered levels, never on raw `acr` strings |
-| `idJagAllowedAmr` | — | Allowed `amr` values; empty means "any that satisfies `idJagRequirePhishingResistant`" |
+The subtle point on the redemption side is **`acr` has no universal ordering.** An `acr` is an
+opaque, issuer-defined string (an authentication-context-class *reference*); `"2"` from one IdP is
+not "stronger than" `"1"` from another, and `"urn:...:loa3"` and `"phr"` are not comparable at all.
+A `idJagMinAcr` "floor" compared with `>=` is therefore meaningless across issuers. Instead the
+redemption policy maps each **trusted issuer's** `acr` (and/or `amr`) values to a small,
+server-defined **assurance level** via `idJagAssuranceMappings`, and the acceptance check compares
+*that*:
 
-So a deployment that trusts two IdPs declares, per issuer, which of *their* `acr`/`amr` values count
-as `substantial` or `high`; the comparison is then over the server's own ordered levels, which do
-have a defined order, rather than over the issuers' incomparable strings. A subject token whose
-issuer is unmapped, or whose mapped level is below `idJagMinAssuranceLevel`, or that fails the
-phishing-resistance or `amr` check, is refused the ID-JAG (`invalid_grant`,
-`human_assurance_insufficient`) — the gate is at delegation time, not discovered later at audit. The
-raw `acr`/`amr`/`iss` and the **mapped level** are both recorded (item 2), so an auditor sees both
-what the issuer asserted and how this deployment graded it.
+| Property | Role | Default | Meaning |
+|----------|------|---------|---------|
+| `idJagRequirePhishingResistant` | **issuer-side** (jans-as-IdP only) | `true` | At login, the human's `amr` must include a phishing-resistant method (passkey / WebAuthn) for jans to issue the ID-JAG. Inapplicable when the ID-JAG comes from an external IdP |
+| `idJagAssuranceMappings` | **redemption-side** | — | Per-issuer map from the issuer's *asserted* `acr`/`amr` values to a server assurance level (e.g. `low` / `substantial` / `high`). Keyed by the ID-JAG's `iss`; an issuer with no mapping is treated as `unknown` → below any floor |
+| `idJagMinAssuranceLevel` | **redemption-side** | `substantial` | The minimum *mapped* level the delegation must reach to be accepted at `/token`; compared on the server's own ordered levels, never on raw `acr` strings |
+| `idJagAllowedAmr` | **redemption-side** | — | Allowed asserted `amr` values; empty means "any that satisfies the mapping" |
+
+So a deployment that trusts two IdPs declares, per issuer, which of *their* asserted `acr`/`amr`
+values count as `substantial` or `high`; the comparison is then over the server's own ordered
+levels, which do have a defined order, rather than over the issuers' incomparable strings. At
+**redemption**, an ID-JAG whose issuer is unmapped, or whose mapped level is below
+`idJagMinAssuranceLevel`, or whose asserted `amr` is not in `idJagAllowedAmr`, is refused
+(`invalid_grant`, `human_assurance_insufficient`) **before an SVID is issued** — not discovered
+later at audit. The raw asserted `acr`/`amr`/`iss` and the **mapped level** are both recorded
+(item 2), so an auditor sees both what the issuer asserted and how this deployment graded it. jans
+records the asserted values; it does **not** re-derive them, because it did not perform the login.
 
 **2. The achieved assurance is carried and recorded, not inferred.** The ID-JAG carries the
 subject authentication's `acr`, `amr`, and `auth_time`, and the `sid` (OIDC session id) and session
-issuer of the browser session the human authenticated in. These travel into `subject.human_sponsor`
-and the execution registry (`sid`, `sessionIssuer`, `acr`, `amr` above), and the `EXECUTION_STARTED`
-bootstrap records them, so an auditor sees the *strength and session* of the human login behind an
-execution, not merely that some `sub` was present. The `sid` is the join key: it is the same
-session identifier an `id_token` carries, so the execution ties to a **specific web-browser
-session**, and a later `AUTHENTICATION_EVENT` / `FIDO_CEREMONY` for that `sid` (the Auth Server and
-FIDO Server producers) resolves *which ceremony, with which authenticator* established it.
+issuer (`sessionIssuer` = the ID-JAG `iss`) of the browser session the human authenticated in.
+These travel into `subject.human_sponsor` and the execution registry (`sid`, `sessionIssuer`, `acr`,
+`amr` above), and the `EXECUTION_STARTED` bootstrap records them as **asserted by that issuer**, so
+an auditor sees the *strength and session* of the human login behind an execution, not merely that
+some `sub` was present. The `sid` is an **issuer-scoped** join key: it resolves to a local
+`AUTHENTICATION_EVENT` / `FIDO_CEREMONY` — the Auth Server and FIDO Server producers, telling an
+auditor *which ceremony, with which authenticator* established the session — **only when the issuing
+IdP is this jans instance**, so that the `sid` names a session and FIDO record jans actually holds.
+When the ID-JAG comes from an **external** IdP, jans has **no** local FIDO record for that `sid`:
+the `sid`/`sessionIssuer` are recorded as an opaque reference to the external session, and resolving
+"which ceremony" is the external IdP's own evidence, reachable only if that IdP is itself a TRACE
+producer (a cross-producer `parent_record_ids` link, §11.2), never by matching against this
+instance's FIDO records. The records therefore state the asserted login, and point at where its
+ceremony evidence lives, without fabricating a local resolution that does not exist.
 
 **3. Synced vs device-bound passkeys are materially different, and the distinction is drawn from the
 right signal.** Jans FIDO supports hardware security keys, platform authenticators, and
@@ -2379,7 +2419,7 @@ flowchart LR
         E4["CREDENTIAL_PROVISIONED<br/>SVID issued<br/>credential: jwt-svid; delegation: id-jag"]
     end
     subgraph AS["jans-auth-server as OP (producer: jans-auth)"]
-        E3["EXECUTION_STARTED<br/>bootstrap: ID-JAG issued"]
+        E3["EXECUTION_STARTED<br/>bootstrap: ID-JAG redeemed"]
     end
     subgraph PDP["PDP (producer: cedarling)"]
         E5["AUTHORIZATION_DECISION<br/>decision{action:Refund, resource_type:Payment, ALLOW}"]
@@ -2435,7 +2475,12 @@ server events map onto existing event kinds rather than inventing one:
 Note on credentials vs. `tokens[]`: `CREDENTIAL_PROVISIONED` carries **no** `tokens[]` — the
 credential it provisions is named in `event.credential_fingerprint`, and any related credential
 (e.g. the ID-JAG behind a delegated SVID) is referenced through `parent_record_ids`. Only the
-`EXECUTION_STARTED` bootstrap carries `tokens[]` (the source ID-JAG / ID token of the exchange).
+`EXECUTION_STARTED` bootstrap carries `tokens[]`, and it carries the **ID-JAG that jans actually
+redeemed** (`jti` + fingerprint) — that is the grant jans saw. It does **not** carry the human's
+original **ID token**: that token was consumed by the IdP AS at token-exchange time and need not
+reach jans at all (in the external-IdP case it does not). A record never fingerprints a token the
+producer did not hold. The source ID token appears only when **this jans instance is itself the IdP
+AS** that performed the exchange and therefore held the ID token.
 
 Note on producer: the three `CREDENTIAL_PROVISIONED` records are signed by the
 **`jans-svid-issuer`** credential-provisioning producer key; the `EXECUTION_STARTED` bootstrap is
@@ -2496,7 +2541,7 @@ fabricating a fingerprint for an operation that provisioned nothing.
 |-------|--------------|----------|--------------|---------------------|-------------------|
 | Attestation appraised | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance`, no credential yet bound; the appraisal is carried as `posture_assessment_ref` + `attestation_ref`) | `jans-svid-issuer` | `posture_assessment_ref { attestation_id, status, platform, measurement, policy_version, verifier, verifier_result_digest, evidence_digest }`, `assessment_policy` | no `tokens[]`; no `credential_fingerprint` yet (bare-key appraisal) | `workload_id` (the enrolling client where known; absent for a bare key appraisal), `attestation_ref`. **Lifecycle record**: `trace_execution_id = "att:" + attestation_id` |
 | Client enrolled | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance`) | `jans-svid-issuer` | `workload_id`, `validity_period`, `provisioning_authority`, `posture_assessment_ref`, `credential_attributes { trust_domain, spiffe_id }` | `credential_fingerprint` = the enrolled key `jkt`; no `tokens[]` | `workload_id`, `attestation_ref`. **Lifecycle record**: `trace_execution_id = "enroll:" + client_id`; `parent_record_ids → attested_by` the appraisal |
-| Human delegated | `EXECUTION_STARTED` (token-exchange bootstrap form) | `jans-auth` | `bootstrap { source_token_fingerprint, initial_capability_constraints }` | `tokens[]`: `id-jag` (`jti`), `id_token` (`fingerprint`) | `workload_id` (agent), `human_sponsor`. Opens the execution `txn` |
+| Human delegated | `EXECUTION_STARTED` (token-exchange bootstrap form) | `jans-auth` | `bootstrap { redeemed_id_jag_fingerprint, initial_capability_constraints }` — the fingerprint of the **ID-JAG jans redeemed**, the only grant it held | `tokens[]`: `id-jag` (`jti` + fingerprint). The source `id_token` appears **only when this jans is the IdP AS** that did the exchange; for an external-IdP ID-JAG it is absent (jans never received it) | `workload_id` (agent), `human_sponsor` (with the ID-JAG's asserted `acr`/`amr`/`iss`). Opens the execution `txn` and mints the pair |
 | SVID issued | `CREDENTIAL_PROVISIONED` (`provisioning_kind=initial_issuance` or `renewal`) | `jans-svid-issuer` | `workload_id`, `validity_period`, `provisioning_authority`, `posture_assessment_ref`, `credential_attributes { audiences }` | `credential_fingerprint` = `jwt-svid` (`jti`/`fingerprint`, `cnf_key_thumbprint`); the ID-JAG is linked via `parent_record_ids`, not `tokens[]` | `workload_id`, `human_sponsor`, `attestation_ref`. Correlated to the execution `txn` |
 
 The SVID-issuance decision ("may this agent receive this credential?") is a genuine policy
@@ -3430,7 +3475,7 @@ in the cited section.
 | Pairwise `principal_sub` **and** a per-audience delegation `credential_ref` (never the raw ID-JAG `jti`) reduce the *human-identity* correlation path across audiences; they do **not** promise general unlinkability — the stable agent `sub` and `cnf.jkt` remain cross-audience handles by design (the agent is one identity) | §10.5, §10.10 |
 | A shared execution id is correlation, not same-operation proof (which is the Phase-3 operation-binding commitments) | §3, §11.1 |
 | Continuing an execution requires matching client + `execution_authority` + raw principal/delegation (not just client); delegation validity is bounded by `delegationExpiresAt`, independent of token renewal | §10.8 |
-| Human assurance is gated and recorded, not inferred: issuer-specific assurance mappings (no `acr` ordering) and WebAuthn BE/BS for **synced-vs-single-device** (not `authenticator_attachment`); **`BE=0` means single-device, not hardware-protected** — hardware assurance is a separate attestation/AAGUID/MDS signal | §10.9 |
+| Human assurance is enforced at two roles and recorded, not inferred: an **issuer-side login bar** (`idJagRequirePhishingResistant`, only when this jans is the IdP AS) vs a **redemption-side acceptance check** at `/token` that maps the ID-JAG's *asserted* `acr`/`amr` to a server assurance level (issuer-specific mappings, no `acr` ordering) and refuses an insufficient delegation before issuing; WebAuthn BE/BS for **synced-vs-single-device** (not `authenticator_attachment`); **`BE=0` means single-device, not hardware-protected** — hardware assurance is a separate attestation/AAGUID/MDS signal | §10.9 |
 | JWT-SVID signing is restricted to the SPIFFE **algorithm allowlist** (`RS*`/`ES*`/`PS*`) with **no non-permitted JOSE headers** — an explicit allowlist, not "not HMAC"; the bundle and the verifier apply the same list | §8, §10.5 |
 | Delegated SVID `exp` is clamped to `≤ delegationExpiresAt`, so delegation expiry revokes access (expires outstanding SVIDs), not merely stops new issuance — no residual full-TTL window | §10.6, §10.8 |
 | Principal binding for execution continuation includes `principalTenant` where the issuer scopes subjects per tenant (`(iss, sub)` is unique only within a tenant); required for tenant-scoped issuers | §10.8 |
@@ -3568,7 +3613,7 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **WIMSE** | Workload Identity in Multi-System Environments; the identifier/credential family AIMS builds on (SPIFFE is one instance). |
 | **Credential provisioning / posture assessment** | AIMS §8: credential issuance is the point posture is evaluated — modeled here as `CREDENTIAL_PROVISIONED` (§11.2). |
 | **WPT / HTTP Message Signature** | AIMS §9 application-layer proof-of-possession mechanisms; referenced for `workload_authentication` / `pop_binding` (Phase 3). |
-| **`human_sponsor` / `sid`** | The authenticated human behind an agent, and the OIDC session id that ties the execution to a browser session and a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` (§10.9). |
+| **`human_sponsor` / `sid`** | The authenticated human behind an agent (recorded from the ID-JAG's asserted `sub`/`acr`/`amr`/`iss`), and the **issuer-scoped** OIDC session id. The `sid` ties the execution to a local `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` **only when the issuing IdP is this jans instance**; for an external IdP it is an opaque reference whose ceremony evidence lives at that IdP, not in this instance's FIDO records (§10.9, §11.2). |
 | **`acr` / assurance mapping** | `acr` is an opaque, issuer-specific authentication-context reference with **no universal ordering**; the gate maps each trusted issuer's `acr`/`amr` to a server assurance level (`idJagAssuranceMappings`) and compares *that*, never raw `acr` with `>=` (§10.9). |
 | **WebAuthn BE / BS** | Backup Eligibility and Backup State flags (WebAuthn L3 §6.1): `BE=1` = the credential may be synced/backed up (a multi-device passkey), `BS=1` = currently backed up; `BE=0` = **single-device credential**. The correct signal for synced-vs-single-device — **not** `authenticator_attachment`. BE/BS describe *backup* properties only; **hardware protection is a separate assurance** (attestation / AAGUID / FIDO MDS), not implied by `BE=0` (§10.9). |
 | **Delegation validity (`delegationExpiresAt`)** | The bound on how long an agent may keep issuing SVIDs against one human delegation, `min(openedAt + idJagDelegationMaxLifetimeSeconds, ID-JAG exp)`, independent of SVID renewal (§10.8). |
