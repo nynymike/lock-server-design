@@ -2730,7 +2730,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Agent's hardware key `K` destroyed, lost, or compromised | No old-key-authorized rotation is possible, so recovery is the administrative path (section 9.9): an operator authorizes re-enrollment of a fresh attested key (destroyed/lost) or revokes `K` and enrolls a replacement (compromise). Issuance under `K` stops at once; a VM rebuild additionally changes `workload_instance_id`, which stays visible in the evidence. Recorded as `IDENTITY_ROTATED` (`key_lost` / `emergency`) |
 | Agent VM cloned or snapshotted | A clone cannot export the non-exportable `K`, so it holds no usable key and must enroll its own through the gate; detecting two live runtimes sharing one `jkt` (vTPM-in-snapshot case) is a Phase-4 instance-binding concern, out of scope here and stated so (section 9.9) |
 | Bundle endpoint unreachable | Verifiers keep their cached bundle (SPIRE natively; jans's own `SpiffeBundleService` serves stale with negative cache). Degrades only after cached keys rotate out. **SLO:** bundle reachable at least once per `spiffeBundleRefreshHintSeconds`; a `critical`-tier RP MAY cap the accepted cached-bundle age tighter (§16.9) |
-| Signing key rotated | Bundle serves old + new for an overlap window and bumps `spiffe_sequence`; only an emergency rotation that drops the old key immediately invalidates in-flight tokens, by design |
+| Signing key rotated | Bundle serves old + new for an overlap window and bumps `spiffe_sequence`. An **emergency** rotation drops the old key at once at jans, but this is **not** instant revocation at verifiers: a verifier keeps accepting tokens signed by the dropped key until its cached bundle expires. The revocation delay is bounded by the verifier's max bundle cache age — ≤ `spiffeBundleRefreshHintSeconds`, or the tighter `bundleMaxCachedAgeSeconds` for a `critical`-tier RP (§16.1); the short SVID TTL and DPoP binding cover the interval |
 | Client registers its own SPIFFE ID or a foreign trust domain | Impossible by construction: `sub` is derived from `client_id` under jans's own trust domain; the inbound `spiffe_id` attribute plays no role in issuance |
 | jans-lock unreachable | Records queue in the outbox; auth continues. In `inline` mode the request fails, which is correct for a demo of accountability |
 | TRACE producer key compromised (`jans-auth` or `jans-svid-issuer`) | Revoke the affected role's key via Lock's planned producer-key admin API (a Lock dependency, section 11.1/12); later records under that key rejected; rotate that alias. The two roles' keys are independent, so revoking one does not disturb the other |
@@ -2755,6 +2755,7 @@ points at the section that bounds or addresses it.
 | 3 | **The right process inside the attested runtime uses `K`** | Attestation proves the platform and key custody, not which process signs (and not that agent memory/prompts are intact) | Needs agent-runtime measurement (IMA, confidential containers) in `allowed_measurements`, or behavioural TRACE evidence (§15 guarantee) |
 | 4 | **A `measured_guest` key is actually protected by its guest image** | On bare SEV-SNP/TDX/Nitro without a vTPM, `K` is reported-by-a-measured-image, not TPM-certified | `key_binding_strength` records `measured_guest` vs `certified` so a verifier can tell them apart (9.3a) |
 | 5 | **The relying-party PEP performs the full RFC 9449 check** | A `cnf`-ignoring (bearer-only) or thumbprint-only PEP gets no hardware guarantee | Normative PEP presentation requirements; high-value RPs MUST be `cnf`-checking and require DPoP (§6) |
+| 5a | **Signing-key revocation is not instantaneous at verifiers** | A verifier accepts SVIDs signed by a removed key until its *cached* bundle expires; removal from the bundle does not reach verifiers immediately | Revocation delay is bounded by the verifier's max bundle cache age — ≤ `spiffeBundleRefreshHintSeconds`, or the tighter `bundleMaxCachedAgeSeconds` for a `critical` RP; the short SVID TTL and DPoP binding cover the interval (§16.1, §16.9) |
 | 6 | **SNP `PLATFORM_INFO` conditions** (SMT, BadRAM alias check, ECC) | A conformant attestation result has no field for them, so a verifier cannot appraise them | A profile that cares MUST assert them in its measurement policy explicitly (9.3a) |
 | 7 | **The TRACE evidence producers ran in an attested runtime** | The agent's attestation binds its *credential*, not the Auth Server / PDP / PEP producer runtimes | Attested-tier evidence is the Phase-4 RATS + instance-binding assessment, not delivered here (§15, "A hardware-bound credential is not an attested TRACE producer") |
 | 8 | **Lock and its operator are honest about completeness** | A producer chain + receipts prove order/integrity of what Lock holds, not that every event was emitted or the tail not withheld; and Lock is a dependency, not yet shipped | Checkpoints bound tail-withholding to one interval; full collusion-resistance needs external SCITT anchoring (Phase 4, out of scope); Lock subsystem status (§11.1) |
@@ -2788,11 +2789,30 @@ or implied. Each is normative for a production deployment; a demo MAY relax the 
 - **Rotation.** Bundle/SVID signing keys rotate with an overlap window (old + new served, section
   8); TRACE producer keys rotate via Lock's producer-key admin path with an `IDENTITY_ROTATED`
   record; the agent key `K` rotates old-key-authorized (section 9.9). Each rotation is independent.
-- **Compromise response.** A compromised SVID signing key is removed from the bundle immediately
-  (emergency rotation, which invalidates in-flight SVIDs by design); a compromised TRACE producer
-  key is revoked in Lock's registry so later records under it are rejected while historical records
-  stay verifiable; a compromised agent key is revoked administratively (section 9.9). Each path is
-  specified in its own section; this is the index.
+- **Compromise response, and the revocation delay it does *not* beat.** A compromised SVID signing
+  key is removed from the bundle immediately. **Removal is not instantaneous revocation at
+  verifiers.** A relying party verifies an SVID against its *cached* copy of the bundle, so it keeps
+  accepting tokens signed by the removed key until it next refetches the bundle and sees the key
+  gone. The worst-case window during which a stolen key can still mint verifiable SVIDs is therefore
+  bounded by the **maximum bundle cache age at the verifier**, not by the moment of removal:
+  - For a verifier honoring the published refresh hint, the bound is **`spiffeBundleRefreshHintSeconds`**
+    (§8) — the maximum age it will serve a cached bundle before refetching. A verifier that caches
+    longer than the hint is outside this bound and is non-conformant.
+  - A `critical`-tier relying party SHOULD set a tighter **`bundleMaxCachedAgeSeconds`** (§16.9) and
+    reject verification against a bundle older than it, shrinking the window accordingly.
+  - Two independent shorter bounds also cap exposure: an SVID's own **short lifetime**
+    (`spiffeSvidLifetimeSeconds`, minutes — §10.6) expires existing tokens regardless of the bundle,
+    and a `cnf`-checking RP additionally requires a valid DPoP proof, so a stolen *signing* key
+    alone does not let an attacker present a token against a hardware key it does not hold.
+
+  So the honest statement is: key removal stops **new** issuance at jans at once and stops
+  verification at a given RP within that RP's maximum bundle cache age (≤ `spiffeBundleRefreshHintSeconds`,
+  or the tier's `bundleMaxCachedAgeSeconds`); it is **not** instantaneous at verifiers. A deployment
+  that needs a hard upper bound sets the refresh hint and the critical-tier max cached age to the
+  longest acceptable revocation delay, and relies on the short SVID TTL and DPoP binding to cover
+  the interval. A compromised TRACE producer key is revoked in Lock's registry so later records
+  under it are rejected while historical records stay verifiable; a compromised agent key is revoked
+  administratively (section 9.9). Each path is specified in its own section; this is the index.
 
 ### 16.2 Cryptographic agility and canonicalization migration
 
