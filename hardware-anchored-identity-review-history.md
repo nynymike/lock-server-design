@@ -37,6 +37,7 @@ non-**resolved** guarantee as proven.
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
 | Q17 / Q21 — outcome wire contract | outcome records validate per **event kind × operation subtype × outcome**; bootstrap aborts under the right key | per-(subtype × outcome) schema fixtures; identifying artifact per the matrix (fingerprint only for SVID issuance/enrollment; appraisal and bootstrap carry none); bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
 | Q13 / Q22 — appraisal single-transaction commit | assessment + state write-through + `completed` + evidence commit atomically; no window where a negative verdict is durable while issuance reads the old positive state | single-transaction fault test (crash during verifier call / mid-transaction leaves nothing durable; fenced worker aborts at the lease re-check; superseded-generation skips write-through; `none`-outage writes evidence only) |
+| Q15 / Q23 — key-replacement wire format | the key change is an RFC 7592 `PUT`; old-key auth, new-key possession, and the signed mutation occupy distinct, defined locations | `RegisterValidatorTest` (`htm=PUT` accepted, `POST` rejected; `attested_key_pop` body member; `change_digest` on both proofs matches the body, mismatch → `key_change_not_signed`) |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -365,6 +366,13 @@ key (`htm=POST`/`htu`/`iat`/`jti`, `jwk` thumbprint = `attested_jkt`, carried as
 `updateClient` mutation (a DPoP proof over a currently-trusted key with the `ath` claim, or a
 `private_key_jwt` assertion signed by the old key), both validated by `DpopService`.
 
+> **Key-replacement wire format superseded by Q23.** This round assigned *both* proofs to DPoP but
+> left only one `DPoP` header, never defined the "different request locations," and wrongly used
+> `htm=POST` for what is an RFC 7592 `PUT`. Q23 gave the concrete wire format: old-key authentication
+> in the one `DPoP` header (`htm=PUT`), new-key possession as the body member `attested_key_pop`, and
+> a `change_digest` on both so the exact mutation is signed (DPoP/`private_key_jwt` do not sign the
+> body).
+
 ## Q16. Recovery conflated "an entity exists" with "this operation committed"
 
 **Status: partially resolved** — operation-receipt rule specified (§11.3); guarantee pending the
@@ -588,6 +596,39 @@ resubmission: a crash before commit leaves nothing durable (lease repaired to `p
 under a new `leaseEpoch`); a crash after commit is a no-op re-submission (`challenge_used`). This
 also settles the algorithm that Q13's "fenced verifier worker" item had left open.
 
+## Q23. Key rotation assigned two proofs to one header and hard-coded POST
+
+**Status: resolved** — §9.5 defines a concrete RFC 7592 wire format for the key change, distinct from
+the first-enrollment `/register` flow.
+
+**Raised.** The key-replacement rule (Q15) said the update carries both a **new-key** proof and an
+**old-key** authorization "in different request locations," but both were specified as **DPoP** — and
+there is only one `DPoP` header, so the locations were never actually defined. Two further defects:
+the rule used `htm=POST`, but an RFC 7592 registration update is an **HTTP `PUT`** to the client
+configuration endpoint; and it conflated *authenticating the updater* with *signing the mutation* —
+a DPoP proof does not cover the request body (RFC 9449) and a `private_key_jwt` assertion is not a
+signature over the key-change payload (RFC 7523), so neither proof, as specified, attested *which*
+key was being added or removed.
+
+**Change (§9.5, §9.9, appendix).** Defined a concrete three-part wire format for the `updateClient`
+key change, an **RFC 7592 `PUT`** (`htm=PUT`, not `POST`):
+
+- **(a) Authenticate the updater (old key)** — normal registration-management authentication: the
+  registration access token's DPoP proof (`htm=PUT`, `htu`=client-config endpoint, `ath`) signed by
+  a currently-trusted key, or a `private_key_jwt` assertion signed by the old key. This occupies the
+  single `DPoP` header / client-assertion slot.
+- **(b) Prove possession of the new key** — a **separately named body member `attested_key_pop`** (a
+  `typ:attested-key-pop+jwt` signed by `K_new`), **not** a second `DPoP` header, so the two proofs no
+  longer compete for one location.
+- **(c) Sign the exact mutation** — because neither (a) nor (b)'s transport signs the body, both
+  carry a `change_digest` over a canonical `key_change_request = { op, target_jkt, prior_jwks_digest }`;
+  the server recomputes the digest over the received body and rejects a mismatch
+  (`key_change_not_signed`). A `remove` needs (a)+(c) only.
+
+§9.9's dual-key rollover steps and the `RegisterValidatorTest` row were aligned to this wire format
+(including a test that `htm=PUT` is required and that a valid authentication with a `change_digest`
+naming a different `target_jkt` than the body is refused).
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -606,6 +647,8 @@ ID-JAG, Resource AS redeems it and mints the execution pair; Q19), the §11.3 is
 transaction-boundary requirement (entity + evidence tables in one `jans-orm` SQL transaction domain,
 MySQL/PostgreSQL, Lock ingestion outside it; Q20), the §11.2 outcome schema keyed by event kind ×
 operation subtype × outcome with the field renamed `operation_outcome` (Q21, which corrected Q17's
-too-coarse "committed ⇒ fingerprint" rule), the §9.3c/§11.3 unified appraisal commit (Q22), and the
-§16.1 key-revocation delay). This history preserves the original questions that drove them; for
-current behaviour, read the main document.
+too-coarse "committed ⇒ fingerprint" rule), the §9.3c/§11.3 unified appraisal commit (Q22), the
+§9.5 key-replacement RFC 7592 `PUT` wire format (old-key auth in the `DPoP` header, new-key
+`attested_key_pop` body member, `change_digest` signing the mutation; Q23, which corrected the
+two-proofs-one-header / hard-coded-`POST` defects), and the §16.1 key-revocation delay). This history
+preserves the original questions that drove them; for current behaviour, read the main document.

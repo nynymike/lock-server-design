@@ -1333,31 +1333,56 @@ would itself require a fresh assessment per client.)
 
 #### Adding or replacing a key uses the same transaction
 
-`updateClient` adds a key through the **same enrollment transaction** (steps 1–6 for the new
-`(client_id, jkt)`, including the atomic `attestation_id` claim), so a replacement/rollover key gets
-its own `KeyEnrollment` binding and its own initialized `KeyAttestationState` — the assessment that
-justified it is never mutated, and the new key's authoritative state is initialized exactly as at
-first enrollment. A key replacement therefore requires **two distinct proofs**, each presented in a
-different part of the request and validated by `DpopService`:
+A key change is an **RFC 7592 registration update** to the client configuration endpoint, which is
+an **HTTP `PUT`** of the client's full updated registration (not a `POST`). It runs the **same
+enrollment transaction** (steps 1–6) for the new `(client_id, jkt_new)`, so a replacement/rollover
+key gets its own `KeyEnrollment` binding and its own initialized `KeyAttestationState` — the
+assessment that justified it is never mutated, and the new key's authoritative state is initialized
+exactly as at first enrollment. Each newly added key also needs its own fresh `affirming` assessment
+(else `invalid_client_metadata`, `attestation_required_for_new_key`).
 
-- **New-key proof (initializes the added key).** A DPoP proof **over the key being added** (`K_new`),
-  carried as the `DPoP` header on the `updateClient` request exactly as at first enrollment:
-  `htm=POST`, `htu=<register/configuration endpoint>`, fresh `iat`, unseen `jti`, and a `jwk` whose
-  thumbprint equals the new key's `attested_jkt`. This is step 2 of the enrollment transaction for
-  `(client_id, jkt_new)`; it proves possession of `K_new` and authorizes initializing its state.
-  Each newly added key also needs its own fresh `affirming` assessment (else
-  `invalid_client_metadata`, `attestation_required_for_new_key`).
-- **Old-key authorization (authorizes the mutation).** Separately, the `updateClient` operation
-  itself must be **old-key-authorized**: a proof over a key **already trusted for the client**
-  (`K_old`), demonstrating that the current key holder sanctions the change. This is the
-  authentication on the configuration request — either the DPoP proof binding the
-  registration-management access token to `K_old` (`htm`/`htu`/`iat`/`jti` as above, plus the `ath`
-  claim over the access token), or, for clients using `private_key_jwt`, a `private_key_jwt`
-  client assertion signed by `K_old`. Without it the update is refused; only the current key holder
-  can add or remove a key.
+Three concerns must be kept distinct, and the earlier draft conflated them by assigning two DPoP
+proofs to the one `DPoP` header and by assuming request authentication also signs the mutation. The
+concrete wire format separates them:
 
-Outside the administrative recovery paths (destroyed/compromised `K_old`, §9.9) both proofs are
-mandatory. Removing a key retires its `KeyEnrollment` and its `KeyAttestationState` (the evidence log
+- **(a) Authenticate the updater — normal RFC 7592 auth, old key.** The `PUT` is authenticated the
+  way any registration-management request is: with the client's **registration access token**. When
+  that token is DPoP-bound (the SVID case), the single **`DPoP` header** carries the old-key proof —
+  `htm=PUT`, `htu=<client configuration endpoint>`, fresh `iat`, unseen `jti`, `jwk` thumbprint = a
+  key **already trusted for the client** (`K_old`), and the `ath` claim over the access token. For a
+  `private_key_jwt` client the request authentication is instead a `private_key_jwt` client assertion
+  signed by `K_old`. Either way this establishes *the current key holder is making the request* — it
+  occupies the request's **authentication** slot, and there is only one such slot, so the new-key
+  proof cannot also live there.
+- **(b) Prove possession of the new key — a separately named body artifact.** Because (a) occupies
+  the `DPoP` header / client-assertion slot, possession of `K_new` is carried as a **distinct, named
+  registration-metadata member in the `PUT` body**: `attested_key_pop`, a signed JWT (`typ:
+  attested-key-pop+jwt`) whose `jwk` thumbprints to the new key's `attested_jkt`, signed by `K_new`.
+  It is validated by `DpopService`-equivalent checks (fresh `iat`, unseen `jti`), but it is **not** a
+  DPoP header and does not compete for that slot.
+- **(c) Sign the exact mutation — because neither (a) nor (b)'s transport signs the body.** A DPoP
+  proof covers `htm`/`htu`/`iat`/`jti`/`ath` **but not the request body** (RFC 9449), and a
+  `private_key_jwt` assertion authenticates the client **but is not a signature over the key-change
+  payload** (RFC 7523). So authentication alone cannot attest *which* key is being added or removed.
+  The design binds both proofs to the mutation explicitly: the request body carries
+  `key_change_request = { op: "add" | "remove", target_jkt, prior_jwks_digest }` (the mutation
+  described canonically), and **both** the old-key authentication and the new-key `attested_key_pop`
+  **include a `change_digest` claim = the digest of `key_change_request`**. The server accepts the
+  update only when both `change_digest` values match the digest it computes over the received
+  `key_change_request`, so (a) proves *the current holder authorized this exact change* and (b)
+  proves *the holder of `K_new` consented to being added by this exact change* — mutation integrity,
+  not merely request authentication. A mismatch is refused (`invalid_request`,
+  `key_change_not_signed`).
+
+So the one `DPoP` header carries **only** the old-key request authentication; the new-key possession
+proof is the body member `attested_key_pop`; and the exact mutation is signed by the `change_digest`
+claim that both proofs carry. (For `remove`, there is no `K_new`, so only (a) + (c) apply: the
+old-key authentication's `change_digest` over `{ op: "remove", target_jkt }` authorizes retiring the
+named key.)
+
+Outside the administrative recovery paths (destroyed/compromised `K_old`, §9.9) both the old-key
+authentication and — for an `add` — the new-key `attested_key_pop` are mandatory, each bound to the
+mutation. Removing a key retires its `KeyEnrollment` and its `KeyAttestationState` (the evidence log
 entries remain, and its `KeyEnrollmentClaim` stays as the record that its assessment was consumed).
 The full multiplicity, dual-key rollover, and destroyed-key / emergency recovery rules are section
 9.9.
@@ -1567,16 +1592,22 @@ A planned rotation never drops the old key before the new one is trusted:
 
 1. The agent generates `K2` in hardware and attests it (`/attestation`, `purpose=enroll`), getting
    an `affirming` assessment for `jkt(K2)`.
-2. The agent calls `updateClient` adding `K2` to `jwks` **while `K1` is still present**, and the
-   request is authenticated by a `private_key_jwt` / DPoP proof signed by **`K1`** (the existing
-   trusted key). This is the **old-key-authorized** step: the party that controls the current key
-   is the only one who can enroll an additional key, so a stolen `attestation_id` or a third party
-   who attested some unrelated key cannot graft a key onto the client (the same proof-of-possession
-   principle as section 9.3's supersession gate).
+2. The agent calls `updateClient` adding `K2` to `jwks` **while `K1` is still present**, via the
+   RFC 7592 `PUT` wire format of §9.5: the request is **authenticated** by the registration access
+   token with its DPoP proof (or `private_key_jwt`) signed by **`K1`** (the existing trusted key),
+   the new key's possession is the body artifact **`attested_key_pop` signed by `K2`**, and **both**
+   carry the `change_digest` over `key_change_request = { op: "add", target_jkt: jkt(K2),
+   prior_jwks_digest }`. This is the **old-key-authorized** step — only the controller of the current
+   key can authorize the change, and the mutation itself is signed (not merely the request
+   authenticated), so a stolen `attestation_id` or a third party who attested some unrelated key
+   cannot graft a key onto the client (the same proof-of-possession principle as section 9.3's
+   supersession gate).
 3. Both keys are now usable; the agent migrates its issuance to `K2` at its own pace.
-4. The agent calls `updateClient` removing `K1`, again authenticated by a proof over a still-trusted
-   key (`K1` or `K2`). Removing `K1` immediately stops new issuance under it; outstanding
-   `K1`-bound SVIDs expire within their minutes-long TTL.
+4. The agent calls `updateClient` removing `K1` (an RFC 7592 `PUT`, `op: "remove"`), authenticated
+   by a proof over a still-trusted key (`K1` or `K2`) whose `change_digest` covers
+   `{ op: "remove", target_jkt: jkt(K1) }` (no `attested_key_pop` is needed for a removal). Removing
+   `K1` immediately stops new issuance under it; outstanding `K1`-bound SVIDs expire within their
+   minutes-long TTL.
 
 Lock's producer-side `IDENTITY_ROTATED` lifecycle event (where TRACE emission is enabled) records
 the rotation, linking the old and new `jkt`s, so the key change is itself evidence.
@@ -3485,7 +3516,7 @@ in the cited section.
 | Proof of possession of `K` gates negative-verdict supersession; an anonymous negative verdict is evidence (`supersedesEligible=false`) but never reaches issuance state, so it cannot deny service | §9.3, §10.4 |
 | Single authoritative `KeyAttestationState` row per `(client_id, jkt)` with **two orders**: a monotonic `revision` orders *writes* (CAS), and a per-key `appraisalGeneration` (stamped at challenge issuance) orders *evidence* — a state write lands only if its evidence generation is strictly newer, so a stale `affirming` can never overwrite a newer `contraindicated`. Issuance commits under the `revision` CAS; expired state is a read-time check, not deletion | §9.3, §9.7, §10.4 |
 | Default mode (`attestationRequireFreshPerIssuance=false`) commits on a read-check, so **plural** already-authorized in-flight issuances can complete after a rejection; stated exposure, bounded by SVID TTL. The flag (or a `critical` tier) collapses it to one via a mutating consume-CAS. Authorized / persisted / evidenced are three ordered points; a rejection governs only issuances not yet past the first | §10.4, §11.3 |
-| Enrollment is an explicit idempotent transaction that **initializes** the first `KeyAttestationState` for a key — authorized by the DCR DPoP proof over `K`, not by the assessment's `supersedesEligible` (which only governs *overwriting* an existing client's state). The pre-enrollment assessment is left immutable; the client↔key↔assessment link is a separate `KeyEnrollment` binding, never a mutation of the evidence row. One assessment enrolls exactly one client, enforced by an **atomic `KeyEnrollmentClaim` keyed by `attestation_id`** (insert-conditioned-on-absence — concurrent same-`attestation_id` enrollers race on one insert, not a lookup). A replacement key uses the same transaction and requires **two proofs**: a new-key DPoP proof over the added key and old-key authorization of the `updateClient` mutation | §9.5, §9.7, §10.4 |
+| Enrollment is an explicit idempotent transaction that **initializes** the first `KeyAttestationState` for a key — authorized by the DCR DPoP proof over `K`, not by the assessment's `supersedesEligible` (which only governs *overwriting* an existing client's state). The pre-enrollment assessment is left immutable; the client↔key↔assessment link is a separate `KeyEnrollment` binding, never a mutation of the evidence row. One assessment enrolls exactly one client, enforced by an **atomic `KeyEnrollmentClaim` keyed by `attestation_id`** (insert-conditioned-on-absence — concurrent same-`attestation_id` enrollers race on one insert, not a lookup). A replacement key uses the same transaction. The `updateClient` key change is an **RFC 7592 `PUT`** (`htm=PUT`, not `POST`) with a concrete three-part wire format: **(a)** old-key request authentication in the one `DPoP` header (or `private_key_jwt`), **(b)** new-key possession as a **separately named body artifact** `attested_key_pop` (not a second DPoP header), and **(c)** an explicit `change_digest` over the canonical `key_change_request` carried by *both* (a) and (b), because neither DPoP nor `private_key_jwt` signs the request body — so the exact mutation is signed, not merely the request authenticated | §9.5, §9.7, §10.4 |
 | Authorization lifetime is separate from evidence lifetime: `expiresAt` bounds issuance; `retentionExpiresAt` (the only deletion TTL) keeps evidence for `attestationRetentionSeconds` | §9.7, §9.9 |
 | A client may hold up to `clientMaxAttestedKeys` attested keys; rotation is old-key-authorized; destroyed/compromised keys use an administrative re-enrollment/revocation path (`IDENTITY_ROTATED`) | §9.9 |
 | Client lifecycle `active → suspended → decommissioned → tombstoned`, consulted on every `/token`; `client_id` never recycled; owner transfer is an attributed admin action | §9.9, §10.2 |
