@@ -18,7 +18,7 @@ its guarantee as proven until its tests pass on every backend.
 | Item | Guarantee awaiting test | Tests |
 |------|-------------------------|-------|
 | Q3 — single-row attestation state | a rejection is authoritative; no issuance resurrects an overwritten approval | delayed-positive-after-rejection; crash-point on the state write |
-| Q8 — staged-commit evidence durability | no persisted credential lacks evidence; no false-success record; absence never classified as abort; a paused writer cannot commit after recovery | crash-point between every durable write (issuance steps 2–5); paused-writer-resume-after-cancel; LDAP committed-then-token-deleted → `indeterminate` |
+| Q8 — staged-commit evidence durability | no persisted credential lacks evidence; no false-success record; absence never classified as abort; a paused writer cannot commit after recovery | crash-point between every durable write (issuance steps 2–5); paused-writer-resume-after-cancel; crash-mid-entity-transaction rolls back atomically → `aborted` |
 | Q10 — enrollment transaction | first-enrollment state initialization; idempotent redo | first-enrollment init; crash between `KeyEnrollment` and state init |
 | Q11 — evidence precedence / plural in-flight | stale positive never restores approval; bounded in-flight exposure | delayed-positive-after-rejection; plural-in-flight |
 | Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
@@ -26,7 +26,7 @@ its guarantee as proven until its tests pass on every backend.
 | Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
-| Q17 — aborted/indeterminate wire contract | outcome records validate per operation kind and producer; bootstrap aborts under the right key | per-(kind × outcome) schema fixtures; `credential_fingerprint` present iff `committed`; bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
+| Q17 — aborted outcome wire contract | outcome records validate per operation kind and producer; bootstrap aborts under the right key | per-(kind × outcome) schema fixtures; `credential_fingerprint` present iff `committed`; bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -145,9 +145,9 @@ concurrent claim gets `challenge_in_progress` without a fresh nonce; `completed`
 ## Q8. Evidence durability was only partially specified
 
 **Status: partially resolved** — algorithm and failure behaviour specified (§11.3), including the
-embedded per-operation commit receipt (Q16), the `indeterminate` outcome, and writer
-cancellation/fencing; guarantee pending the crash-point-between-every-durable-write,
-voided/aborted-middle-record, and paused-writer-resume-after-cancel tests.
+embedded per-operation commit receipt (Q16) and writer cancellation/fencing; guarantee pending the
+crash-point-between-every-durable-write, voided/aborted-middle-record, and
+paused-writer-resume-after-cancel tests.
 
 **Raised.** Updating chain state and the outbox together prevents some chain failures but does not
 ensure every successful issuance has an evidence record unless issuance and evidence persistence
@@ -169,19 +169,20 @@ exhaustion.
   credential's entity write is confirmed committed (a `staged → committed` CAS flip), closing the
   false-success-evidence hole. "Persisted credential" and "response received by the client" are
   distinguished; the record attests only the former.
-- **Reconciliation witness, embedded in the entity; indeterminate when undecidable.** Successive
-  rounds found that any *separate* marker could be lost after the entity committed, so absence of
-  the marker was mistaken for non-commit. The current design (§11.3) embeds an **operation commit
-  receipt (`operation_id` + `record_id`) inside the entity itself** — `TokenEntity`, `KeyEnrollment`
-  (enrollment), or `AttestationAssessment` (appraisal) — in one atomic write with no separate marker
-  to miss, retains a token-outliving `operation_id`-keyed witness (`IssuanceLog` in the entity
-  transaction on SQL/Couchbase; optionally the retained entity on LDAP), and **classifies the
-  still-ambiguous LDAP case as `indeterminate`, never `aborted`** — absence never proves non-commit.
-  Recovery decides on the **receipt** (did *this* `operation_id` commit?), not on the entity's
-  identifiers (Q16). A paused writer is **fenced by cancellation** before recovery records any
-  terminal outcome, so it cannot commit after recovery acts. A longer wait is explicitly *not* a
-  disambiguator. Outcomes are four-valued: committed / aborted (decidable non-commit only) /
-  indeterminate / unresolved.
+- **Reconciliation witness bound into one transaction.** Successive rounds found that any *separate*
+  marker could be lost after the entity committed, so absence of the marker was mistaken for
+  non-commit. The current design (§11.3) embeds an **operation commit receipt (`operation_id` +
+  `record_id`) inside the entity itself** — `TokenEntity`, `KeyEnrollment` (enrollment), or
+  `AttestationAssessment` (appraisal) — and binds the entity, the `operation_id`-keyed `IssuanceLog`,
+  and the `staged → committed` flip into **one SQL transaction**, so a committed operation always
+  leaves a token-outliving witness and a non-commit leaves none. Recovery decides on the **receipt**
+  (did *this* `operation_id` commit?), not on the entity's identifiers (Q16). A paused writer is
+  **fenced by cancellation** before recovery records a terminal outcome, so it cannot commit after
+  recovery acts. Because commit is one transaction, absence of the `IssuanceLog` past the resolution
+  wait is **decidable non-commit** — outcomes are therefore committed / aborted / unresolved, with
+  no undecidable case. (Earlier rounds, when LDAP was a supported backend, carried a fourth
+  `indeterminate` outcome for the case where a separate marker write could be lost after an
+  LDAP entity committed; the SQL-only decision, Q18, removed it.)
 - **Gapless chain: aborted positions are delivered, not dropped.** A further round noted that a
   sequence number is allocated at stage time, so a never-committed position that was simply voided
   would leave a hole in the chain Lock receives. The design now chooses the **"chain the operation
@@ -368,8 +369,8 @@ receipt (`operation_id` + `record_id`) written in the same single-entity write**
 confirmed only when a probed entity carries *this* entry's `operation_id` in its receipt, or an
 `operation_id`-keyed `IssuanceLog` row is present; a same-identifier entity bearing a different or
 absent `operation_id` proves nothing about this attempt and is not read as commit. The probe table,
-the SQL/Couchbase and LDAP witness rules, and the crash-point / reconciliation tests are all stated
-in terms of the receipt, not identifier existence.
+the witness rule, and the crash-point / reconciliation tests are all stated in terms of the receipt,
+not identifier existence.
 
 ## Q17. Aborted/indeterminate outcomes were not a complete wire contract
 
@@ -387,10 +388,12 @@ not cover an unsuccessful **`EXECUTION_STARTED`** bootstrap — which belongs to
 producer, whose key is **not** authorized to emit `CREDENTIAL_PROVISIONED`.
 
 **Change (§11.2, §11.3, appendix).** The outcome is now an explicit wire contract: a new
-`event.provisioning_outcome` ∈ `{committed, aborted, indeterminate}` discriminator (default
-`committed`, preserving the success shape), with per-outcome required fields — `credential_fingerprint`
-**present iff `committed`**, `reason` = `not_committed` (aborted) / `witness_unavailable`
-(indeterminate), and the chain/identity fields carried on every outcome. The abort rule is restated
+`event.provisioning_outcome` discriminator (default `committed`, preserving the success shape), with
+per-outcome required fields — `credential_fingerprint` **present iff `committed`**, `reason` =
+`not_committed` for an abort, and the chain/identity fields carried on every outcome. (This round
+defined three values, `committed`/`aborted`/`indeterminate`, the last for the case where an LDAP
+entity committed but a separate marker write was lost and the token had since vanished; the SQL-only
+decision, Q18, removed `indeterminate`, leaving `{committed, aborted}`.) The abort rule is restated
 **per producer**: a failed issuance/enrollment/appraisal aborts as a `CREDENTIAL_PROVISIONED` under
 `jans-svid-issuer`; a failed **bootstrap aborts as an `EXECUTION_STARTED` under `jans-auth`**, never
 a `CREDENTIAL_PROVISIONED` (which Lock rejects for that producer key). The appendix's jans-lock row
@@ -398,6 +401,38 @@ now lists the field-level format changes as a **confirmation item against Lock's
 (resolved by a Lock-side schema update if needed, never by fabricating a fingerprint), and a new
 `OutcomeRecordSchemaFixtureTest` adds a canonical fixture for **each (operation kind × outcome)**
 cell, shared with Lock's conformance suite.
+
+## Q18. SQL is the only persistence backend (Ledger drops LDAP and Couchbase)
+
+**Status: resolved** — the design targets SQL only; the backend-portability caveats and the
+LDAP-only `indeterminate` outcome are removed.
+
+**Raised.** Ledger will not support LDAP or Couchbase; the only backend needed is SQL. Earlier
+rounds had carried portability caveats because the Jans `PersistenceEntryManager` abstraction
+surfaces only single-entry CAS uniformly across LDAP/SQL/Couchbase, and several guarantees were
+stated as "varies by backend."
+
+**Change (§§9.3c, 9.5, 9.7, 10.4, 11.3, appendix).** All LDAP and Couchbase references are removed
+and the multi-backend caveats collapse into SQL behaviour:
+
+- **Enrollment (§9.5)** is now **one SQL transaction** (claim insert → binding → state init →
+  client attribute). The `pending`/`committed` claim lifecycle and `enrollmentClaimTimeoutSeconds`
+  are gone — a crash rolls back atomically, so there is no half-enrolled state to reconcile.
+  Concurrency/uniqueness is still the `attestation_id` unique-constraint insert; a losing concurrent
+  enroller's transaction simply rolls back.
+- **Issuance/enrollment/appraisal durability (§11.3)** binds the entity (with its `operation_id`
+  receipt), the `operation_id`-keyed `IssuanceLog`, and the `staged → committed` flip into **one SQL
+  transaction**. Commit is therefore always decidable: absence of the `IssuanceLog` past the
+  resolution wait is decidable non-commit. The **`indeterminate` outcome is removed** (it existed
+  only for the LDAP lost-marker-then-token-deleted case), so `provisioning_outcome ∈ {committed,
+  aborted}`, and `ldapRetainTokenUntilReconciled` is removed.
+- **Single-row `KeyAttestationState` CAS (§9.7/§10.4)** and the **verifier-worker ordered writes
+  (§9.3c)** keep their shape — the single-row CAS is the simplest correct design, and the worker's
+  three writes are genuinely distinct conditional writes — but the `PersistenceEntryManager`
+  abstraction-limit justification (which only made sense across heterogeneous backends) is dropped.
+- The CAS implementation notes collapse to the SQL form (`UPDATE … WHERE revision = :r`,
+  `INSERT … WHERE … epoch = :myEpoch`), and the fault tests run on SQL only (including a clustered
+  configuration), now also asserting mid-transaction rollback.
 
 ## Later review rounds
 
@@ -409,5 +444,6 @@ three-valued `key_binding_strength`, the §10.5/§8 JWT-SVID algorithm allowlist
 delegation-expiry clamp and tenant-scoped principal binding, the §10.9 BE/BS-vs-hardware
 distinction, the §10.10 token-privacy scope, the §11.3 sign-once-at-resolution rule, the §11.2/§11.3
 per-producer outcome wire contract (`provisioning_outcome`, bootstrap aborts as `EXECUTION_STARTED`),
-and the §16.1 key-revocation delay). This history preserves the original questions that drove them;
-for current behaviour, read the main document.
+the SQL-only backend reduction (§§9.5/11.3, which removed the `indeterminate` outcome and the
+LDAP/Couchbase portability caveats), and the §16.1 key-revocation delay). This history preserves the
+original questions that drove them; for current behaviour, read the main document.
