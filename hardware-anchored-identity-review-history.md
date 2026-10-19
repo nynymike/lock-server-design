@@ -132,9 +132,14 @@ exhaustion.
   credential's entity write is confirmed committed (a `staged → committed` CAS flip), closing the
   false-success-evidence hole. "Persisted credential" and "response received by the client" are
   distinguished; the record attests only the former.
-- **Reconciliation on a positive marker, not token absence.** A TTL-independent `IssuanceLog` row
-  (keyed by `record_id`) is the positive evidence of commit; a `staged` entry with a present
-  `IssuanceLog` is promoted and delivered, an absent one is `voided`.
+- **Reconciliation on the entity, not token absence.** A later review round found that treating a
+  separate marker's *absence* as proof of non-commit introduced a new crash gap (entity committed,
+  marker not yet written → evidence wrongly voided). The current design (§11.3) makes the `staged`
+  outbox entry a **three-valued** operation journal (committed / not-committed / unresolved) and
+  resolves it by probing the **authoritative entity** the record names, binding the entity write
+  and the commit flip in one native transaction on SQL/Couchbase. A missing marker means
+  *unresolved* (retry), never *nothing happened*; retention covers unresolved operations and
+  downtime.
 
 Delivery to Lock is at-least-once (idempotent on `record_id`; a content-mismatch `409` is an error,
 never treated as delivered).
