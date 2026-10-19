@@ -25,6 +25,7 @@ its guarantee as proven until its tests pass on every backend.
 | Q13 — fenced verifier worker | a fenced worker never records a verdict | stale-worker insertion after fencing |
 | Q14 — sign the complete record | signature covers sequence/hash/outcome; retries byte-identical | sign-once-at-resolution; reject signing incomplete content; byte-identical-retry |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
+| Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -143,9 +144,9 @@ concurrent claim gets `challenge_in_progress` without a fresh nonce; `completed`
 ## Q8. Evidence durability was only partially specified
 
 **Status: partially resolved** — algorithm and failure behaviour specified (§11.3), including the
-embedded issuance fact, the `indeterminate` outcome, and writer cancellation/fencing; guarantee
-pending the crash-point-between-every-durable-write, voided/aborted-middle-record, and
-paused-writer-resume-after-cancel tests.
+embedded per-operation commit receipt (Q16), the `indeterminate` outcome, and writer
+cancellation/fencing; guarantee pending the crash-point-between-every-durable-write,
+voided/aborted-middle-record, and paused-writer-resume-after-cancel tests.
 
 **Raised.** Updating chain state and the outbox together prevents some chain failures but does not
 ensure every successful issuance has an evidence record unless issuance and evidence persistence
@@ -169,14 +170,17 @@ exhaustion.
   distinguished; the record attests only the former.
 - **Reconciliation witness, embedded in the entity; indeterminate when undecidable.** Successive
   rounds found that any *separate* marker could be lost after the entity committed, so absence of
-  the marker was mistaken for non-commit. The current design (§11.3) embeds the issuance fact
-  **inside the `TokenEntity`** (one atomic write, no separate marker to miss), retains a
-  token-outliving witness (`IssuanceLog` in the entity transaction on SQL/Couchbase; optionally the
-  retained entity on LDAP), and **classifies the still-ambiguous LDAP case as `indeterminate`, never
-  `aborted`** — absence never proves non-commit. A paused writer is **fenced by cancellation**
-  before recovery records any terminal outcome, so it cannot commit after recovery acts. A longer
-  wait is explicitly *not* a disambiguator. Outcomes are four-valued: committed / aborted
-  (decidable non-commit only) / indeterminate / unresolved.
+  the marker was mistaken for non-commit. The current design (§11.3) embeds an **operation commit
+  receipt (`operation_id` + `record_id`) inside the entity itself** — `TokenEntity`, `KeyEnrollment`
+  (enrollment), or `AttestationAssessment` (appraisal) — in one atomic write with no separate marker
+  to miss, retains a token-outliving `operation_id`-keyed witness (`IssuanceLog` in the entity
+  transaction on SQL/Couchbase; optionally the retained entity on LDAP), and **classifies the
+  still-ambiguous LDAP case as `indeterminate`, never `aborted`** — absence never proves non-commit.
+  Recovery decides on the **receipt** (did *this* `operation_id` commit?), not on the entity's
+  identifiers (Q16). A paused writer is **fenced by cancellation** before recovery records any
+  terminal outcome, so it cannot commit after recovery acts. A longer wait is explicitly *not* a
+  disambiguator. Outcomes are four-valued: committed / aborted (decidable non-commit only) /
+  indeterminate / unresolved.
 - **Gapless chain: aborted positions are delivered, not dropped.** A further round noted that a
   sequence number is allocated at stage time, so a never-committed position that was simply voided
   would leave a hole in the chain Lock receives. The design now chooses the **"chain the operation
@@ -340,6 +344,31 @@ key (`htm=POST`/`htu`/`iat`/`jti`, `jwk` thumbprint = `attested_jkt`, carried as
 `DPoP` header) that initializes the added key's state, and **old-key authorization** of the
 `updateClient` mutation (a DPoP proof over a currently-trusted key with the `ath` claim, or a
 `private_key_jwt` assertion signed by the old key), both validated by `DpopService`.
+
+## Q16. Recovery conflated "an entity exists" with "this operation committed"
+
+**Status: partially resolved** — operation-receipt rule specified (§11.3); guarantee pending the
+operation-receipt-discrimination and crash-point tests.
+
+**Raised.** Recovery resolved a `staged` entry by probing the authoritative entity by its locator
+identifiers (`jti`/`client_id`/`jkt`) and treating existence as proof of commit. But finding a
+`Client`, enrolled key, or assessment with those identifiers does not prove that the *particular
+operation* in the intake row committed: the entity may predate the operation (a key enrolled or an
+assessment appraised earlier) or have been rewritten by a later operation sharing the identifiers.
+The `TokenEntity` already carried an embedded `operation_id`, but the probe text still spoke of
+"entity present," and the `IssuanceLog` was keyed by `record_id`; enrollment and appraisal — both
+named in the durability invariant — had no operation-specific receipt at all.
+
+**Change (§11.3).** Recovery now answers **"did *this* `operation_id` commit?"** rather than "does
+an entity with these identifiers exist?". Every provisioning entity carries an **operation commit
+receipt (`operation_id` + `record_id`) written in the same single-entity write** — `TokenEntity`,
+`KeyEnrollment` (already from Q15), and `AttestationAssessment` (new `traceOperationId`/
+`traceRecordId` fields). The token-outliving `IssuanceLog` is **keyed by `operation_id`**. Commit is
+confirmed only when a probed entity carries *this* entry's `operation_id` in its receipt, or an
+`operation_id`-keyed `IssuanceLog` row is present; a same-identifier entity bearing a different or
+absent `operation_id` proves nothing about this attempt and is not read as commit. The probe table,
+the SQL/Couchbase and LDAP witness rules, and the crash-point / reconciliation tests are all stated
+in terms of the receipt, not identifier existence.
 
 ## Later review rounds
 
