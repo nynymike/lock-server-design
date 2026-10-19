@@ -85,14 +85,31 @@ alias** for the execution id so the existing transaction-token machinery keeps w
 | `execution_authority` | `https://jans.io/trace/execution_authority` | — (jans's issuer / configured authority) |
 
 Everyone downstream (PDP, PEP, capability) reads the **pair** — never `txn` alone — and copies both
-into its own records' `trace.trace_execution_id` and `trace.execution_authority` fields; a host,
-sidecar, PEP, or gateway translates the applicable carrier (the canonical HTTP headers
-`Audit-Trace-ID` / `Audit-Execution-Authority`, OTel baggage `audit.trace_id` /
-`audit.execution_authority`, or the signed token claims above) into Cedarling's normalized input
-model, since Cedarling does not parse tokens, headers, or baggage itself. Unsigned headers and
-baggage are correlation hints; the signed token claims are the authoritative binding. Correlation
-is then structural: an auditor queries one `(execution_authority, trace_execution_id)` and gets the
-whole chain.
+into its own records' `trace.trace_execution_id` and `trace.execution_authority` fields. The
+Cedarling interface is specific (and §16.5 pins it): Cedarling **does** parse and validate the
+JWTs it is handed as authentication tokens — the SVID and ID-JAG, checked against the trusted
+issuers in its policy store — and reads the execution pair from *those validated claims*. What it
+does **not** do is sniff arbitrary transport: the canonical HTTP headers
+`Audit-Trace-ID` / `Audit-Execution-Authority` and OTel baggage `audit.trace_id` /
+`audit.execution_authority` are **not** read by Cedarling; a host, sidecar, PEP, or gateway must
+translate those carriers into Cedarling's normalized input model explicitly. Unsigned headers and
+baggage are correlation hints only; the signed, Cedarling-validated token claims are the
+authoritative binding. Correlation is then structural: an auditor queries one
+`(execution_authority, trace_execution_id)` and gets the whole chain.
+
+**Propagation integrity vs. disclosure are two different rules — stated together here so they are
+not read as contradictory.** This "pair, never `txn` alone" rule is about *integrity*: wherever the
+execution identity appears, both halves appear, and no consumer may act on a half. It is **not** a
+claim that the raw pair is disclosed to every audience. What an SVID actually exposes to a given
+relying party is governed by the per-audience disclosure profile in §10.10: within the execution's
+own trust/evidence domain the raw pair propagates (correlation there is intended); to an audience
+**outside** that domain the SVID carries a **pairwise/opaque per-domain execution reference** in
+place of the raw `trace_execution_id`, so it cannot become a global cross-service tracker. In both
+cases the integrity rule still holds — whatever is disclosed (raw pair, or opaque reference +
+authority) travels as a unit and is never reduced to a bare `txn`. So: **integrity is always;
+disclosure is per audience (§10.10).** The `JwtSvidBuilder` test's "the pair is always present
+together" assertion is about integrity within a single minted token, not about unconditional
+cross-domain propagation.
 
 **What the shared execution id proves — and what it does not.** The pair groups records into one
 execution; it is a **correlation** key, not an **operation** binding. Records that share a
@@ -422,9 +439,14 @@ resolved value.
   `ResteasyInitializer`; headers `Cache-Control: public, max-age=<refresh hint>`.
 - Discovery member `spiffe_bundle_endpoint` (OpenID configuration, client
   `OpenIdConfigurationResponse`, swagger), gated on the same flag.
-- **Decision:** reuse the OIDC signing keys for v1 (relabelled `use: jwt-svid` only in the bundle
-  output); SVID rotation stays coupled to OIDC rotation. A dedicated key set is a follow-up. During
-  rotation the bundle serves old + new keys and bumps `spiffe_sequence`.
+- **Decision (v1 / demo-relaxable):** reuse the OIDC signing keys for v1 (relabelled `use: jwt-svid`
+  only in the bundle output); SVID rotation stays coupled to OIDC rotation. This is an **expedience
+  for v1, not the production posture**: §16.1 requires a production deployment to provision a
+  **dedicated SVID signing key set**, distinct from the OIDC keys and from the two TRACE producer
+  keys, so SVID and OIDC rotation decouple and a compromise of one does not implicate the other. The
+  two statements are consistent — reuse is the v1 shortcut, dedicated keys are the production
+  requirement (§16.1). During rotation the bundle serves old + new keys and bumps `spiffe_sequence`
+  under either posture.
 - **Trust domain:** `spiffeOwnTrustDomain` is permanent. `getSpiffeOwnTrustDomain()` returns the
   raw configured value; `getEffectiveSpiffeOwnTrustDomain()` applies the issuer-host fallback.
   `SpiffeTrustDomainService.pinTrustDomainIfNeeded()` (from `AppInitializer`) writes the derived
@@ -1189,7 +1211,10 @@ nullable until enrollment), `status`, `platform`, `measurement`, `policyVersion`
 `verifierResultJwt` (the `AttestationResultJWT`, stored when `attestationStoreVerifierResult=true`,
 default), `verifierResultDigest`, `evidenceFormat`, `evidenceDigest`, raw evidence only when
 `attestationStoreEvidence=true`, `keyCertified` (core-computed, 9.3b), `challengeId`, `appraisedAt`,
-`expiresAt` (ORM TTL attribute, as tokens), `supersedesEligible` (whether this verdict was entitled
+`expiresAt` (**a logical authorization-validity timestamp, *not* a deletion trigger** — see
+"Authorization expiry vs. retention deletion" below), `retentionExpiresAt` (the ORM TTL attribute
+that actually deletes the row, set to `appraisedAt + attestationRetentionSeconds`),
+`supersedesEligible` (whether this verdict was entitled
 to change authoritative state — `true` only when the submission carried a valid DPoP proof of
 possession of the attested key, section 9.3), `traceRecordId`, `reasons`. Once written, a row is
 **immutable**: it is a dated observation, not a mutable status. Appraising a new verdict never
@@ -1230,6 +1255,26 @@ re-reads and re-evaluates against the new state rather than overwriting it. Beca
 one row per key, `revision` is a genuine total order — the earlier `(appraisedAt, version)`
 tie-break across separate assessment entries, which was **not** a total order (two entries could
 share both fields), is gone.
+
+**Authorization expiry vs. retention deletion are two different clocks.** An assessment / state
+stops being usable *for issuance* long before its evidence row is *deleted*, and conflating the two
+would either keep issuing on stale posture or destroy evidence an auditor still needs:
+
+- **`expiresAt` — authorization validity (a comparison, never a delete).** `/token` and the DCR
+  gate reject a state whose `expiresAt <= now` (§10.4). This is a logical field the code *reads*; it
+  does not drive any backend TTL. An "expired" assessment is still fully present in the evidence
+  log — it simply no longer authorizes issuance.
+- **`retentionExpiresAt` — retention deletion (the ORM TTL).** The only field wired to the
+  backend's TTL/expiry mechanism on the `AttestationAssessment` row, set to
+  `appraisedAt + attestationRetentionSeconds` (§9.9, default long — the deployment's evidence
+  retention). The row survives — expired, superseded, or consumed — until *this* time, so "auditor
+  re-checks a historical `AttestationResultJWT`" (§15) works for the whole retention window.
+
+The `KeyAttestationState` row carries only `expiresAt` (the authorization clock); it is overwritten
+in place on each new verdict, so it has no independent retention concern — the *history* lives in
+the append-only evidence log, which `retentionExpiresAt` governs. Nothing in the issuance path ever
+depends on a row disappearing; expiry is always a read-time comparison, and deletion is always the
+separate retention TTL.
 
 ### 9.8 Configuration and discovery
 
@@ -1381,9 +1426,11 @@ evidence unverifiable:
 - An expired, superseded, or consumed `AttestationAssessment` is **retained** (not TTL-deleted
   while any record references it) so an auditor can later resolve a `CREDENTIAL_PROVISIONED`
   record's `posture_assessment_ref`/`attestation_id` and re-check the stored
-  `AttestationResultJWT`. The ORM TTL that expires an assessment *for issuance* is distinct from
-  its *retention* lifetime (`attestationRetentionSeconds`, default long — e.g. the evidence
-  retention policy of the deployment).
+  `AttestationResultJWT`. Authorization expiry and retention deletion are **separate clocks**
+  (§9.7): `expiresAt` is a read-time comparison that stops *issuance*, while the ORM TTL that
+  actually deletes the evidence row is `retentionExpiresAt = appraisedAt + attestationRetentionSeconds`
+  (default long — the deployment's evidence-retention policy). An expired assessment therefore
+  remains fully available for historical re-verification until its retention deletion.
 - A **retired producer key or hardware key** (rotated out, revoked, or belonging to a
   decommissioned client) is kept available for **historical verification** of records it signed,
   independent of whether it may still be *used* — the same "a later revocation never retroactively
@@ -1406,7 +1453,7 @@ retention clock, and the two never share a timer.
 | `attestationAllowAdminReEnrollment` | `true` | Whether the admin re-enrollment / revocation recovery path is enabled |
 | `agentExpiryAction` | `suspend` | Whether reaching `agentExpiresAt` moves the client to `suspended` or `decommissioned` |
 | `clientTombstoneAfterSeconds` | — (long) | Retention window after `decommissioned` before the client is reduced to a `tombstoned` identity marker; the `client_id` stays reserved forever |
-| `attestationRetentionSeconds` | — (long) | How long an expired/superseded `AttestationAssessment` and its stored verifier result are kept for historical verification — distinct from the issuance-freshness TTL |
+| `attestationRetentionSeconds` | — (long) | How long an expired/superseded `AttestationAssessment` and its stored verifier result are kept for historical verification; it sets the row's `retentionExpiresAt` ORM TTL (`appraisedAt + this`), which is the **only** deletion clock — distinct from `expiresAt`, the read-time authorization-validity comparison that stops issuance (§9.7) |
 
 ## 10. JWT-SVID issuance at `/token`
 
@@ -1442,6 +1489,7 @@ In `TokenRestWebServiceImpl.requestAccessToken()` after `validateGrantType`, whe
 | `gt` not `client_credentials` or JWT bearer | `400 unsupported_grant_type` |
 | `SPIFFE_SVID_ISSUANCE` disabled | `400 invalid_request` |
 | No `resource`, or a value is not an absolute URI without fragment (RFC 8707 §2) | `400 invalid_target` (new `TokenErrorResponseType.INVALID_TARGET`) |
+| **More than one `resource` value on a single request (v1)** | `400 invalid_target` (`multiple_audiences_unsupported`). **v1 mints one SVID per audience** so the per-audience disclosure profile (§10.10) is unambiguous — see the note below |
 | A `resource` value is not permitted for this client: not in `ClientAttributes.allowedResources` (exact match, or prefix match when an entry ends with `/`) | `400 invalid_target`. A well-formed URI is not an authorisation to mint a token for that service; the operator decides at registration which audiences an agent may address, and an update-token or client-registration script may narrow (never widen) the list |
 | No DPoP thumbprint | already `invalid_dpop_proof` because `dpopBoundAccessToken` is forced |
 | DPoP key not a registered key (10.3) | `400 invalid_dpop_proof` |
@@ -1452,6 +1500,18 @@ In `TokenRestWebServiceImpl.requestAccessToken()` after `validateGrantType`, whe
 
 `resource` is read with `request.getParameterValues("resource")` (as `TokenExchangeService` does)
 and carried on `ExecutionContext` (new `List<String> resources`).
+
+**One audience per token in v1.** RFC 8707 permits multiple `resource` values, and the reader
+accepts a list, but **v1 requires exactly one** (a second value is `multiple_audiences_unsupported`).
+The reason is the per-audience disclosure profile (§10.10): `attestation`, `delegation`, and the
+execution-id granularity are chosen *per audience*, so a single token carrying two audiences would
+have no well-defined profile — it would either over-disclose to the stricter audience or
+under-disclose to the looser one. Rather than silently pick one, v1 mints a **separate, minimally
+scoped SVID per audience**, each with that audience's profile applied, which is also the stronger
+privacy posture (a token is readable only by the one RP it was scoped to). The `List<String>`
+carrier and the RFC 8707 multi-value parse are kept so a later version MAY lift this to per-audience
+claim sets within one token (e.g. a nested/`aud`-keyed disclosure map) without reworking the request
+path; until then the one-audience rule is enforced at validation.
 
 ### 10.3 Key binding rule
 
@@ -1661,13 +1721,13 @@ parties receive a value they can use to correlate the human across services.
 | header `alg`, `kid`, `typ: JWT` | client `access_token_signing_alg` if asymmetric else `defaultSignatureAlgorithm`; key from `WebKeysConfiguration` (the set the bundle publishes); HMAC rejected at registration and defensively here | existing `JwtSigner` |
 | `iss` | `appConfiguration.getIssuer()` | |
 | `sub` | `SpiffeIdUtil.buildAgentSpiffeId(trustDomain, clientId)` → `spiffe://<td>/agent/<client_id>`. The trust-domain grammar is validated first, so a `/` in the configured domain cannot silently become path segments. | **Derived** by the server, never taken from the `spiffe_id` client attribute (which means the opposite thing — an external identity the client authenticates *in* with). Spoofing and collisions are therefore structurally impossible. |
-| `aud` | exactly the validated `resource` values; `removeClaim` first so neither `client_id` nor `additionalAudience` leak in | **required**; the reverse of the inbound validator where `aud` must equal our issuer |
+| `aud` | the single validated `resource` value (v1 is one audience per token, §10.2); `removeClaim` first so neither `client_id` nor `additionalAudience` leak in | **required**; the reverse of the inbound validator where `aud` must equal our issuer. A single-element `aud` keeps the §10.10 disclosure profile unambiguous |
 | `iat`, `nbf`, `exp` | from `accessToken`; lifetime per 10.6 | |
 | `jti` | `context.getTokenReferenceId()` | |
 | `cnf.jkt` | `context.getDpop()` | always present here |
 | `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` | The canonical correlation **pair** (§3). `execution_id` is the ID-JAG's execution id for a JWT-bearer grant; otherwise the `txn` request parameter when it names an open execution this grant is **bound to** — same client, same execution authority, same principal/delegation, and inside the delegation-validity window (§10.8); otherwise freshly minted. `execution_authority` is this server's configured authority (its issuer by default). Both are returned in the token response so renewals reuse them. | *Role:* the authoritative correlation binding PDP/PEP read. *Rule:* the two MUST travel together — one pair per execution, not per token. A presented `txn` that fails the §10.8 binding is `invalid_grant` (`execution_binding_mismatch`), never silently re-minted as a fresh execution. *Disclosure (§10.10):* raw only to a same-domain audience; a cross-domain audience gets a pairwise/opaque reference, never the global id. |
 | `txn` | Same value as `execution_id`, kept for the existing transaction-token machinery. | An application alias for `execution_id`, not a separate correlation key. Shares the execution id's per-audience disclosure rule (§10.10). |
-| `attestation` | The assessment that satisfied 10.4 — the hardware state the token was issued under. | *Disclosure (§10.10):* default is `status`-only (`{status, appraised_at}`). `platform` / `measurement` / `policy_version` / `id` go only to an audience whose profile is `full`, since raw measurements are fingerprinting material. |
+| `attestation` | The assessment that satisfied 10.4 — the hardware state the token was issued under. | *Disclosure (§10.10):* **omitted by default** — it is emitted only to an audience whose profile opts in. When an audience opts in, the granularity defaults to `status_only` (`{status, appraised_at}`); `platform` / `measurement` / `policy_version` / `id` go only to an audience whose profile is `full`, since raw measurements are fingerprinting material. The minimized default SVID (`svidDefaultClaims`) carries no `attestation` at all. |
 | `delegation` | *Contains:* `principal_iss` / `principal_sub` from the ID-JAG, `credential_type` (the ID-JAG token-type URI), and `credential_id` (the ID-JAG `jti`). Omitted for pure `client_credentials`. | *Role:* ties the human to the agent inside the token. *Why not `act`:* RFC 8693 `act` names the *current actor* acting for `sub` (that would read as "Alice acts for the agent"), and `may_act` names a party allowed to *become* an actor — neither means "the principal who delegated." So the SPIFFE agent stays `sub`, and the delegator is a separate, explicit reference to the credential that carried the delegation. *Disclosure (§10.10):* omitted unless the audience opts in; `principal_sub` is **pairwise** per `(audience, human)` unless the audience is authorized for the raw subject, so unrelated RPs cannot correlate the human. The raw identity otherwise lives only in access-controlled TRACE evidence, resolved by `sid`. |
 | `client_id`, `scope`, `token_type` | as today | harmless additive claims |
 
@@ -1857,7 +1917,10 @@ interop (section 6, bearer-vs-bound): the token stays spec-valid, and only a `cn
 high-assurance RP that is *authorized* for the richer claims ever receives them.
 
 The disclosure profile hangs off the audiences an agent is already restricted to
-(`ClientAttributes.allowedResources`, section 10.2). Each `resource` entry MAY carry a profile:
+(`ClientAttributes.allowedResources`, section 10.2). Because **v1 mints one SVID per audience**
+(§10.2), each issued token has exactly one audience and therefore exactly one applicable profile —
+there is no ambiguity about which profile governs a token. Each `resource` entry MAY carry a
+profile:
 
 ```json
 {
@@ -1870,9 +1933,9 @@ The disclosure profile hangs off the audiences an agent is already restricted to
 }
 ```
 
-| Claim | Default | `none` | middle | widest |
-|-------|---------|--------|--------|--------|
-| `attestation` | `status_only` → `{status, appraised_at}` | omitted | `status_only` | `full` adds `platform`/`measurement`/`policy_version`/`id` (fingerprinting material — only for an audience that must apply its own measurement policy) |
+| Claim | Default (no profile) | `none` | middle | widest |
+|-------|----------------------|--------|--------|--------|
+| `attestation` | **omitted** (not in `svidDefaultClaims`) | omitted | `status_only` → `{status, appraised_at}` (the granularity default **when an audience opts in** without naming one) | `full` adds `platform`/`measurement`/`policy_version`/`id` (fingerprinting material — only for an audience that must apply its own measurement policy) |
 | `delegation` | `none` (omitted) | omitted | `pairwise` → `principal_sub` is a PPID per `(audience, human)`, `principal_iss` omitted or generalized | `raw` → the real `principal_iss`/`principal_sub` (only for an audience explicitly authorized for the human's identity) |
 | execution id / `txn` | `same_domain` | omitted | `same_domain` → raw id only when the audience is in the execution's own trust domain | `always` (discouraged; see cross-domain rule) |
 
@@ -1926,7 +1989,7 @@ The evidence surface reuses the design's existing privacy discipline rather than
 |----------|---------|---------|
 | `svidDefaultClaims` | `iss,sub,aud,iat,nbf,exp,jti,cnf` | The minimized default claim set; richer claims are opt-in per audience |
 | `svidPairwiseHumanSubject` | `true` | `delegation.principal_sub` is a pairwise PPID per audience unless the audience's profile is `raw` |
-| `svidAttestationDisclosureDefault` | `status_only` | Default `attestation` granularity when an audience profile does not override it |
+| `svidAttestationDisclosureDefault` | `status_only` | Default `attestation` **granularity** applied when an audience opts in without naming one. It does **not** add `attestation` to a token whose audience has no profile — the token-level default is omission (`svidDefaultClaims`). |
 | `svidExecutionIdDisclosureDefault` | `same_domain` | Default execution-id disclosure; a cross-domain audience gets a pairwise reference |
 
 None of this changes what Lock stores or how the SVID is verified; it changes only **which claims
@@ -2563,10 +2626,10 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `ExternalAttestationServiceTest` | selection by `evidence_format`; `false` → rejected; result copied; `VerifierUnavailableException` → `status=none` |
 | `VerifierHttpClientTest` | `callVerifier`: timeout, size bound, no redirects, server trust store, API key header never logged |
 | `RegisterValidatorTest` (extend) | `validateAttestation` by id; expired; wrong purpose; key not in `jwks`; missing DPoP proof on `/register`; proof key ≠ attested key; `allowed_resources` empty for `JWT-SVID`; `stale_evidence` has `challenge_id`; **multi-key / rollover (9.9):** a `jwks` with two attested keys is accepted and each key needs its own `affirming` assessment; adding a key without a fresh assessment → `attestation_required_for_new_key`; adding/removing a key requires an old-key-authorized proof outside the admin path; exceeding `clientMaxAttestedKeys` is rejected; the admin re-enrollment / revocation path binds a new key or revokes `K1` without old-key authorization |
-| `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, and not-in-`allowed_resources` (exact and prefix); freshness rule none / stale / fresh; inline paths; `attestation_required` body; **lifecycle gate (§9.9):** issuance refused for `suspended` (`403 client_suspended`) and `decommissioned`/`tombstoned` (`403 client_decommissioned`), allowed again after `resume`, and refused once past `agentExpiresAt` per `agentExpiryAction` |
+| `TokenRestWebServiceValidatorTest` (extend) | grant type; flag; `invalid_target` for malformed, fragment, not-in-`allowed_resources` (exact and prefix), **and more than one `resource` value (`multiple_audiences_unsupported`, v1 one-audience rule §10.2)**; freshness rule none / stale / fresh; inline paths; `attestation_required` body; **lifecycle gate (§9.9):** issuance refused for `suspended` (`403 client_suspended`) and `decommissioned`/`tombstoned` (`403 client_decommissioned`), allowed again after `resume`, and refused once past `agentExpiresAt` per `agentExpiryAction` |
 | `AuthorizationGrantTest` (extend) | protected SVID claims re-applied after `modifyAccessToken()` alters or removes them; `WARN` logged; additive claims kept |
 | `DpopServiceTest` (extend) | `validateDpopKeyIsRegistered`: match, mismatch, no JWKS, `jwks_uri` |
-| `JwtSvidBuilderTest` | `sub` derivation; `aud` = resources only; `cnf.jkt`; the `https://jans.io/trace/execution_id` + `https://jans.io/trace/execution_authority` pair is always present together, sourced correctly, and reused across renewals, with `txn` carrying the same execution-id value; `attestation`; `delegation` present / absent; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
+| `JwtSvidBuilderTest` | `sub` derivation; `aud` is a **single** audience (v1, §10.2); `cnf.jkt`; **integrity vs. disclosure (§3/§10.10):** when the execution id is disclosed at all it is **always** the full pair (`execution_id` + `execution_authority`) — never `txn` alone — but for an audience with no profile the pair is **omitted entirely** (minimized default), and a cross-domain audience gets a pairwise/opaque reference, not the raw id; the pair is reused across renewals with `txn` carrying the same execution-id value; **minimized default:** `attestation` and `delegation` are **omitted** unless the audience's profile opts in (default SVID = `svidDefaultClaims` only); when opted in, `attestation` defaults to `status_only` and `delegation.principal_sub` is pairwise unless `raw`; HMAC rejected; `iss`, `jti`, `exp`, `nbf` |
 | `TpmCertifyVerifierTest` | `TPMS_ATTEST` parse; AK signature; `extraData` mismatch; name mismatch; attribute policy; key material equals JWK; **AK-binding (§9.3a):** a certify whose signing key is bound to the appraised VM (AKCert chain, or AK committed in the SNP-measured HCL runtime data) is accepted; **a certify signed by a key that merely appears in `x-ms-runtime.keys` (e.g. a stand-in for `HCLTransferKey` or any non-AK runtime key) but carries no VM binding is rejected**, and a certify signed by a key absent from any binding path is rejected |
 | `AttestationResultVerifierTest` | profile lookup by `verifier_kind`; signature / issuer / `exp`; claim-path extraction; script-supplied JWKS ignored; **the AK is selected by its VM binding, never by position/name in the `akClaimPath` JWK set; a profile without a demonstrated AK binding cannot yield `certified` (falls back to `measured_guest`)** |
 | `AttestationChallengeServiceTest` | `pending → processing` CAS and the losing racer; `completed` terminal; retry after `verifier_unavailable` keeps nonce; retry limit; lease expiry repair |
@@ -2772,9 +2835,16 @@ tightens the windows rather than widening them.
 
 When Cedarling is the PDP, the deployment MUST configure:
 
-- **Trusted issuers.** The Jans SVID issuer and the ID-JAG issuer are registered as trusted issuers
-  in Cedarling's policy store, so an SVID/ID-JAG is validated (signature, `exp`, status) before its
-  claims become policy input.
+- **Trusted issuers (the token-validation interface).** The Jans SVID issuer and the ID-JAG issuer
+  are registered as trusted issuers in Cedarling's policy store. Cedarling **does** parse and
+  validate these JWTs itself — signature against the issuer JWKS, `exp`/`nbf`, and token status —
+  before any of their claims become policy input; this is the standard Cedarling authentication-token
+  path, not a bypass. The precise division (consistent with §3): **Cedarling validates and reads
+  token claims (SVID, ID-JAG); it does not read non-token carriers** (HTTP `Audit-*` headers, OTel
+  baggage), which the PEP/gateway must supply in Cedarling's input model if a policy needs the
+  execution pair from a non-token source. So "Cedarling validates the SVID/ID-JAG" and "Cedarling
+  does not sniff headers/baggage" are the same interface stated from two sides — the token is
+  parsed, the transport is not.
 - **Claim-to-entity mapping.** A mapping from the SVID/ID-JAG claims this plan mints — the SPIFFE
   `sub`, `delegation`/`human_sponsor`, `attestation`/`posture_assessment_ref`, `cnf`, the
   `(action, resource_type)` of the request, and the execution pair — to the Cedar entities and
@@ -2871,7 +2941,8 @@ availability budget, and the tier chooses how much of it may be spent:
 | **Verifier unavailable**, existing appraisal still inside its window | Issue | Issue | Issue (unless a tighter max age has already expired it) |
 | **Verifier unavailable**, no fresh appraisal left | MAY issue under `warning`/degraded **only if** the capability's policy opts in; recorded as degraded | `attestation_required` (fail closed) | `attestation_required` (fail closed) |
 | **Bundle unreachable** at the RP | Accept a stale-but-cached bundle within the refresh hint | Accept within the refresh hint | Accept within the refresh hint; reject once cached keys are older than a tier-set max bundle age |
-| **Lock (TRACE) unavailable** | Proceed; record queues in the outbox | Proceed; outbox | **Fail closed**: no committed evidence record → no SVID (`503 evidence_unavailable`), because a `critical` action must be accountable before it happens (section 11.3 `fail-closed`, the default for `JWT-SVID`) |
+| **Lock (TRACE) unreachable, outbox healthy** | Proceed; record queues in the outbox | Proceed; outbox | **Proceed.** A durable local outbox commit *is* the committed evidence record (§11.3); Lock acceptance is asynchronous at-least-once delivery, not a precondition of issuance. A `critical` action is accountable the moment its record is durably committed locally — it need not wait for Lock to be reachable |
+| **Outbox cannot durably accept the record** (full, or the local evidence store is down) | MAY proceed under `fail-open` with a `coverage_gap` marker if policy opts in | `fail-closed` by default | **Fail closed**: no durable local commitment is possible → no SVID (`503 evidence_unavailable`), because a `critical` action must be committed-as-accountable before it happens (§11.3 `fail-closed`, the default for `JWT-SVID`) |
 
 Two rules keep this honest:
 
@@ -2957,11 +3028,15 @@ resolution.
 - **Privacy: the SVID is minimized and disclosed per audience.** The default SVID carries only the
   claims a plain SPIFFE/PEP verifier needs (`iss`/`sub`/`aud`/`iat`/`nbf`/`exp`/`jti`/`cnf`);
   `attestation`, `delegation`, and the correlation id are opt-in per audience via a disclosure
-  profile on `allowedResources`. `delegation.principal_sub` is pairwise per audience unless the
-  audience is authorized for the raw subject, `attestation` defaults to `status`-only (raw
-  measurement is `full`-only), and a cross-domain audience gets a pairwise execution reference, not
-  the global `trace_execution_id` — aligning with AIMS §10.9 and `design.md`'s privacy-preserving
-  cross-domain correlation. The raw human identity otherwise lives only in access-controlled TRACE
+  profile on `allowedResources`. `attestation` and `delegation` are **omitted** unless the audience
+  opts in (once opted in, `attestation` granularity defaults to `status_only`, raw measurement is
+  `full`-only; `delegation.principal_sub` is pairwise per audience unless the audience is authorized
+  for the raw subject), and a cross-domain audience gets a pairwise execution reference, not the
+  global `trace_execution_id` — aligning with AIMS §10.9 and `design.md`'s privacy-preserving
+  cross-domain correlation. **v1 mints one SVID per audience** (`multiple_audiences_unsupported`
+  on a multi-`resource` request, §10.2) so each token has exactly one applicable disclosure
+  profile; the raw pair always travels together as a unit (integrity), while *what* is disclosed is
+  per audience (§3/§10.10). The raw human identity otherwise lives only in access-controlled TRACE
   evidence, resolved by `sid` (section 10.10).
 - **Human assurance is gated and recorded, not just correlated — and not on false signals.** The
   ID-JAG issues only when the subject authentication meets a configurable bar: phishing-resistant
