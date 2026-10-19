@@ -1,10 +1,19 @@
 # Hardware-Anchored Identity — Review History
 
+# Hardware-anchored identity — review history
+
 This document records review questions raised against
 [`hardware-anchored-identity.md`](./hardware-anchored-identity.md) and the change each one
 produced. It is a history, not a specification: the authoritative behaviour is in the main design
 document's numbered sections, which these entries point to. Keep new review rounds here so the main
 document stays a clean specification rather than a running changelog.
+
+**How to read an entry.** Each entry's **Raised** and (where present) earlier-round text describes
+the design *as it was when the question was raised* — it is a record of a superseded state, **not a
+current requirement**. Only the main document's numbered sections state current requirements; where
+a later round changed an earlier one, the earlier entry carries a *"superseded by Qn"* note. If an
+entry and the main document disagree, the main document is authoritative and the entry is stale by
+construction.
 
 **Status legend.** An item's status is tracked on **three independent axes**, because "the design
 is decided" is not the same claim as "a test proves it" or "an external system accepts it":
@@ -224,9 +233,11 @@ exhaustion.
   would leave a hole in the chain Lock receives. The design now chooses the **"chain the operation
   with explicit aborted outcomes"** model: every allocated position is delivered — a committed one
   as the success record, a never-committed one as a signed aborted-outcome record at the same
-  position. `prev_record_hash` is bound at resolution over the predecessor's *delivered* digest
-  (not at stage time, since the predecessor's final content is not yet known), and delivery is
-  strictly in sequence order. The tail pointer therefore no longer caches a record hash (§11.3).
+  position. `prev_record_hash` is bound at resolution over the predecessor's digest (not at stage
+  time, since the predecessor's final content is not yet known), and delivery is strictly in sequence
+  order. The tail pointer therefore no longer caches a record hash (§11.3). *(This round said
+  "delivered" digest; Q31 later corrected the hash link to the predecessor's **durably finalized**
+  digest so local finalization proceeds during a Lock outage — see the main document.)*
 
 Delivery to Lock is at-least-once (idempotent on `record_id`; a content-mismatch `409` is an error,
 never treated as delivered).
