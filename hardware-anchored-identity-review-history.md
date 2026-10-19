@@ -222,11 +222,39 @@ general unlinkability, and named the residual handles: the agent `sub` and `cnf.
 across audiences by design (the agent is one identity), so colluding RPs can still see "the same
 agent," just not which human or the delegation credential.
 
+## Q13. A batch of precision fixes across attestation, delegation, privacy, and signing
+
+**Raised (seven items).** (1) §9.3c claimed a verdict and `completed` are "written in one operation"
+though challenge, assessment, state, and outbox are separate entities — and a verifier worker whose
+lease expired was not fenced. (2) §9.3a / appendix treated a missing Azure AK binding as grounds to
+*auto*-fall back to `measured_guest`. (3) §10.8 principal binding used only `iss`+`sub`, ignoring
+tenant scope. (4) §10.9 called `BE=0` a hardware binding. (5) §§8, 10.5 accepted any asymmetric
+algorithm ("not HMAC"). (6) §§10.8/10.6 stopped new issuance at delegation expiry but left
+outstanding SVIDs usable. (7) §10.10 defaulted execution disclosure to both "omitted" and
+"same_domain."
+
+**Change.** (1) §9.3c: the worker holds a lease `epoch`; the assessment / `completed` / state writes
+are separate, recoverable, **epoch-guarded** transitions (a fenced worker cannot write any of them),
+resolved by `challenge_id` on recovery. (2) §9.3a: `key_binding_strength` is three-valued —
+`certified` / `measured_guest` / **`none`** — and a failed AK binding downgrades to `measured_guest`
+**only if** that weaker binding is independently shown, else `none` (`binding_unestablished`) and
+issuance does not proceed; no silent relabel. (3) §10.8: added `principalTenant` to the binding and
+registry, required for issuers that scope subjects per tenant (per the ID-JAG draft). (4) §10.9:
+`BE=0` = **single-device credential**; hardware protection is a separate attestation/AAGUID/MDS
+signal, stated separately. (5) §§8, 10.5: enforce the SPIFFE JWT-SVID **algorithm allowlist**
+(`RS*`/`ES*`/`PS*`) and permitted JOSE headers, on both the bundle and the verifier — an explicit
+allowlist, not a denylist. (6) §10.6: clamp a delegated SVID's `exp` to `≤ delegationExpiresAt`, so
+delegation expiry revokes access, not merely new issuance. (7) §10.10: chose **omitted** as the
+no-profile execution-disclosure default (aligned with `svidDefaultClaims`), with `same_domain` the
+granularity once an audience opts in; aligned table, config, and tests.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
-folded into the numbered sections of the main document (notably the §9.5 enrollment transaction, the
-§9.7/§10.4 single-row state model with `revision` + `appraisalGeneration`, the §11.3 append/commit
-protocol, the §9.3a Azure AK-binding gap, the §10.8–§10.9 execution-binding and human-assurance
-rules, the §10.10 token-privacy scope, and the §16.1 key-revocation delay). This history preserves
-the original questions that drove them; for current behaviour, read the main document.
+folded into the numbered sections of the main document (notably the §9.3c fenced verifier worker,
+the §9.5 enrollment transaction, the §9.7/§10.4 single-row state model with `revision` +
+`appraisalGeneration`, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap and
+three-valued `key_binding_strength`, the §10.5/§8 JWT-SVID algorithm allowlist, the §10.6/§10.8
+delegation-expiry clamp and tenant-scoped principal binding, the §10.9 BE/BS-vs-hardware
+distinction, the §10.10 token-privacy scope, and the §16.1 key-revocation delay). This history
+preserves the original questions that drove them; for current behaviour, read the main document.

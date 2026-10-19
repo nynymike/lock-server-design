@@ -449,10 +449,15 @@ resolved value.
 ```
 
 - `SpiffeOwnBundleService` (`@ApplicationScoped`) builds the bundle from
-  `WebKeysConfiguration.getKeys()`: keep `use == SIGNATURE` keys with an asymmetric `alg` (never
-  HMAC, never `enc`), apply the same `jwksAlgorithmsSupported` filter as `JwkRestWebServiceImpl`
-  (extract to a shared helper), emit a minimal RFC 7517 JWK per key (`kty`, `kid`, `alg`,
-  `use: "jwt-svid"`, `n`/`e` or `crv`/`x`/`y`; no jans-specific members). `spiffe_sequence` =
+  `WebKeysConfiguration.getKeys()`: keep `use == SIGNATURE` keys whose `alg` is on the **JWT-SVID
+  allowlist** — `RS256`/`RS384`/`RS512`, `ES256`/`ES384`/`ES512`, `PS256`/`PS384`/`PS512` (SPIFFE
+  JWT-SVID §2.1) — which excludes HMAC (`HS*`), `none`, `EdDSA`, and `enc` keys; this allowlist is a
+  stricter, explicit subset of `jwksAlgorithmsSupported` (a bundle key whose `alg` is not on it is
+  dropped even if the OP otherwise supports it). Emit a minimal RFC 7517 JWK per key (`kty`, `kid`
+  — **required** per §6.1, `alg`, `use: "jwt-svid"`, `n`/`e` or `crv`/`x`/`y`; no jans-specific
+  members). An SVID is only ever signed by a key that appears in this bundle under an allowlisted
+  `alg`, so a verifier applying the same allowlist (§10.5) and the bundle keys cannot be led into an
+  alg-confusion acceptance. `spiffe_sequence` =
   `Conf.revision` (new `ConfigurationFactory.getLoadedRevision()`), `spiffe_refresh_hint` =
   `spiffeBundleRefreshHintSeconds`. An empty key list is a valid bundle.
 - `SpiffeBundleRestWebService` / `Impl` in `io.jans.as.server.spiffe.ws.rs`, registered in
@@ -694,7 +699,7 @@ Response `200`:
 ```
 
 Nonce ≥ 128 bits random, stored as a persistent `AttestationChallenge` entry (section 9.3c) with
-`{ jkt, client_id, purpose, state: pending, expires_at, appraisalGeneration }` under `challenge_id`
+`{ jkt, client_id, purpose, state: pending, expires_at, appraisalGeneration, lease: { holder, leaseEpoch, expires_at } }` under `challenge_id`
 (TTL `attestationChallengeLifetimeSeconds`). A script may add response members via
 `modifyChallengeResponse`.
 
@@ -859,11 +864,14 @@ verifies; (4) the certification's `extraData`/nonce equals the challenge nonce; 
 key name equals `Name(key_public)`; (6) `key_public` attributes mark it non-duplicable (`fixedTPM`,
 `fixedParent`, `sensitiveDataOrigin`, `sign`, not `restricted`/`decrypt`-duplicable); (7) the key
 material inside `key_public` equals `attested_key`. For a **`measured_guest`** profile, (2) and
-(5)–(7) are replaced by "the measured guest image is in policy and the report binds
-`SHA-256(nonce ‖ thumbprint(K.public))`", and the assessment records `key_binding_strength=measured_guest`.
-These are the vendor-neutral checks; the generic-TPM instance is the one with captured vectors
-targeted first (implementation appendix, PR 3), and check (2) is exactly what those vectors must
-demonstrate.
+(5)–(7) are replaced by "the measured guest image is in policy **and** the report binds
+`SHA-256(nonce ‖ thumbprint(K.public))`" — and that binding is a **precondition**, not a default: if
+it is not demonstrated, the strength is **`none`** (`binding_unestablished`), not `measured_guest`,
+and the verdict is not `affirming` for key custody (see "The Azure AK-binding gap"). `key_binding_strength`
+is therefore a three-value outcome — `certified` / `measured_guest` / `none` — each requiring its
+own evidence. These are the vendor-neutral checks; the generic-TPM instance is the one with captured
+vectors targeted first (implementation appendix, PR 3), and check (2) is exactly what those vectors
+must demonstrate.
 
 #### The Azure AK-binding gap (stated honestly, unproven until vectors)
 
@@ -889,9 +897,24 @@ appraised*. The documented MAA result does not hand this over for free:
   for a high-risk capability MUST refuse it (the `experimental`-refusal switch, 9.3b). The profile
   config below carries `akClaimPath` only as a *candidate* location to inspect; it is not treated as
   proof of AK identity, and core's check (2) is what the Azure vector set must satisfy to earn
-  `validated`. If the captured MAA result turns out to expose no verifiable AK-to-VM binding at all,
-  the honest outcome is to **downgrade the Azure profile to `measured_guest`** rather than assert a
-  `certified` guarantee the evidence does not support.
+  `validated`.
+- **A failed AK binding does not *automatically* become `measured_guest`.** `measured_guest` is not
+  a free consolation strength — it has its **own** binding obligation (the report binds
+  `SHA-256(nonce ‖ thumbprint(K.public))` to a *measured, trusted guest image*, checks (2)/(5)–(7)
+  replaced accordingly). A result that establishes neither the AK-to-VM binding **nor** that
+  measured-guest binding proves **no** key custody at all, and core MUST **not** silently relabel it
+  `measured_guest`. The outcomes are explicit:
+  - AK-to-VM binding shown → `certified`.
+  - AK binding not shown, **but** the measured-guest binding is **independently** shown (the SNP/TDX
+    report binds `SHA-256(nonce ‖ thumbprint(K.public))` under a measured image the profile trusts)
+    → `measured_guest`, recorded as such with the reason it is not `certified`.
+  - Neither shown → **binding unestablished**: core records `key_binding_strength=none` with reason
+    `binding_unestablished` and the verdict is **not** `affirming` for key custody (it is
+    `contraindicated`/`warning` per policy, or the profile is refused). Issuance never proceeds on
+    an unestablished binding dressed up as `measured_guest`.
+  So the honest fallback is "downgrade to `measured_guest` **only if** its binding is independently
+  demonstrated; otherwise reject and report the binding as unestablished" — never an automatic
+  relabel.
 
 What a `certified` profile establishes, in words a relying party can rely on: *"The private half of
 `K` was generated inside, and cannot be exported from, hardware whose launch/image measurement the
@@ -1070,11 +1093,39 @@ Rules:
   (`verifier_unavailable`, script runtime error), at most `attestationChallengeMaxRetries` (3)
   times; the original nonce and `expires_at` are kept so the agent can resubmit the **same**
   evidence. Beyond the limit the challenge is `expired`.
-- A node that crashes in `processing` leaves a lease (`attestationProcessingLeaseSeconds`, 30);
-  the repair timer (same pattern as Lock's receipt repair timer) returns leased-out entries to
+- A node that crashes in `processing` leaves a lease (`attestationProcessingLeaseSeconds`, 30); the
+  repair timer (same pattern as Lock's receipt repair timer) returns leased-out entries to
   `pending` with `retry_count++`.
-- A verdict and the transition to `completed` are written in one operation; the assessment carries
-  the `challenge_id`, so "which challenge produced this verdict" is always answerable.
+- **The verifier worker is fenced by its lease, and the outcome is written as recoverable
+  transitions — not "one operation."** The `pending → processing` CAS stamps the challenge with a
+  lease `{ holder, leaseEpoch, expires_at }` (`leaseEpoch` increments on every claim, as the journal
+  lease does, §11.3). The worker then does the slow work (call the verifier, verify the binding),
+  and **every** write it makes afterward — the immutable `AttestationAssessment`, the challenge's
+  `processing → completed`, and (only for a `supersedesEligible` eligible verdict) the
+  `KeyAttestationState` overwrite — is **conditioned on the challenge still carrying this worker's
+  `leaseEpoch`**. A worker whose lease expired and was repaired (the challenge went back to
+  `pending`, possibly reclaimed by another node at a higher `leaseEpoch`) therefore **cannot** write
+  any of them: its guarded writes are rejected as fenced-off, so a slow or zombie worker never
+  records a verdict for a challenge another worker has taken over. This is the same fence as the
+  journal writer (§11.3): the authoritative write checks the epoch, it is not checked after the
+  fact.
+- These are **separate entities written in order** (assessment → `completed` → optional state
+  overwrite), not a single atomic write — `PersistenceEntryManager` has no portable multi-entry
+  transaction (§9.7). They are made recoverable the same way the issuance path is (§11.3): each is
+  keyed and idempotent, and the challenge's state is the journal. On recovery / re-submission the
+  transitions resolve as follows, all keyed by `challenge_id`:
+  - **assessment written, `completed` not yet set** → the worker (or a resumer holding the current
+    lease) finishes: it finds the assessment by `challenge_id`, sets `completed`, and applies the
+    state overwrite if eligible. Re-doing is safe — the assessment is immutable and the state write
+    is generation-guarded (§10.4), so a replay cannot double-apply or regress.
+  - **`completed` set, state overwrite not yet applied** (eligible verdict, crash between the two)
+    → the state overwrite is redone from the assessment the `completed` challenge names; the
+    `appraisalGeneration` guard (§10.4) makes it idempotent and prevents a stale re-apply.
+  - **neither written, lease expired** → repaired to `pending`; a fresh submission re-runs under a
+    new `leaseEpoch`. The old worker is fenced out of all three writes above.
+  The assessment carries `challengeId` and `leaseEpoch`, so "which challenge, under which worker,
+  produced this verdict" is always answerable, and a verdict from a fenced worker is never
+  authoritative.
 - Expired entries are removed by the ORM TTL.
 
 ### 9.4 The interception script: `attestation`
@@ -1859,7 +1910,7 @@ the guarantee is minimization and reduced human-correlation, not agent anonymity
 
 | Part | Value | Rule |
 |------|-------|------|
-| header `alg`, `kid`, `typ: JWT` | client `access_token_signing_alg` if asymmetric else `defaultSignatureAlgorithm`; key from `WebKeysConfiguration` (the set the bundle publishes); HMAC rejected at registration and defensively here | existing `JwtSigner` |
+| header `alg`, `kid`, `typ` | `alg` MUST be one of the **JWT-SVID allowlist** — `RS256`/`RS384`/`RS512`, `ES256`/`ES384`/`ES512`, `PS256`/`PS384`/`PS512` (SPIFFE JWT-SVID §2.1; RFC 7518 §§3.3–3.5). Chosen from the client `access_token_signing_alg` if it is on the allowlist, else `defaultSignatureAlgorithm` if on the allowlist, else registration/issuance is refused. **"Not HMAC" is insufficient** — `none`, HMAC (`HS*`), `EdDSA`, and any value off the allowlist are rejected (an explicit allowlist, not a denylist, to block alg-confusion). `kid` is set (and MUST match a bundle JWK, §8). `typ` is omitted, or if present MUST be `JWT` or `JOSE` (§2.3). **No other JOSE header** — registered or private — is emitted; JWS Compact Serialization only (§2). Key from `WebKeysConfiguration` (the set the bundle publishes). The verifier side applies the same allowlist and header restriction, rejecting anything else | existing `JwtSigner`, header-allowlist guard |
 | `iss` | `appConfiguration.getIssuer()` | |
 | `sub` | `SpiffeIdUtil.buildAgentSpiffeId(trustDomain, clientId)` → `spiffe://<td>/agent/<client_id>`. The trust-domain grammar is validated first, so a `/` in the configured domain cannot silently become path segments. | **Derived** by the server from the authenticated `client_id` and the pinned trust domain, never taken from the `spiffe_id` client attribute (which means the opposite thing — an external identity the client authenticates *in* with). Because the client never supplies `sub` and `client_id` is unique per client, a client cannot spoof another's SPIFFE ID or collide with it: the only way to change `sub` is to be a different authenticated client. |
 | `aud` | the single validated `resource` value (v1 is one audience per token, §10.2); `removeClaim` first so neither `client_id` nor `additionalAudience` leak in | **required**; the reverse of the inbound validator where `aud` must equal our issuer. A single-element `aud` keeps the §10.10 disclosure profile unambiguous |
@@ -1889,6 +1940,18 @@ different audience or lifetime uses the inputs that feed those claims (`allowed_
 `spiffeSvidLifetimeSeconds` instead of `accessTokenLifetime`, honour the client-specific lifetime
 and the update-token override, clamp to `spiffeSvidMaxLifetimeSeconds`, and keep the
 key-regeneration adjustment (an SVID must not outlive its signing key's presence in the bundle).
+
+**Clamp the SVID `exp` to the delegation's expiry.** For a human-delegated SVID (one bound to an
+execution, §10.8), the computed lifetime is **additionally clamped so `exp ≤ delegationExpiresAt`**
+— the SVID can never outlive the delegation it was issued under. Without this clamp, `delegationExpiresAt`
+would stop *new* issuance while an SVID minted just before it still granted access for its full TTL
+afterward — a residual window of up to one SVID lifetime of access on an expired delegation. With
+the clamp the two bounds coincide: when the delegation expires, outstanding delegated SVIDs expire
+too (within clock skew). The residual window is therefore **zero by construction** for the common
+case; the only remaining exposure is the normal one of any short-lived bearer token between its
+mint and a resource server's clock. (A `client_credentials` SVID has no delegation and is clamped
+only by its own lifetime bounds.) This makes "delegation expiry revokes access," not merely "stops
+renewal," true without a revocation channel.
 
 ### 10.7 Response and introspection
 
@@ -1920,7 +1983,7 @@ assert that the human approved this specific execution (§5). Per-operation huma
 deployment requires it, is enforced by the PDP/PEP at the operation, not carried by the ID-JAG.
 
 Open executions are tracked in a small persistent registry (`jansTraceExecution`: `txn`,
-`clientId`, `principalIss`, `principalSub`, `delegationCredentialId`, `executionAuthority`, `sid`,
+`clientId`, `principalIss`, `principalSub`, `principalTenant`, `delegationCredentialId`, `executionAuthority`, `sid`,
 `sessionIssuer`, `acr`, `amr`, `authTime`, `openedAt`, `expiresAt`, `delegationExpiresAt`,
 `closed`) so that an auditor can list executions per client and so that `/token` can validate a
 presented `txn` — and the validation is **not** merely "same client."
@@ -1938,7 +2001,7 @@ only when **all** of these hold (otherwise `invalid_grant`, `execution_binding_m
 |-------------------------------|---------|-----|
 | `clientId` | the requesting client | The agent is the one that opened it |
 | `executionAuthority` | this server's configured authority | An execution id is only meaningful under the authority that minted it; a `txn` from another authority is not this execution |
-| `principalIss` + `principalSub` | the delegation of the **current** grant (the presenting ID-JAG's `iss`/`sub`), compared on the *raw* subject, not a pairwise alias | The human continuing the execution must be the human who opened it |
+| `principalIss` + `principalSub` + **`principalTenant` (where the issuer scopes subjects by tenant)** | the delegation of the **current** grant (the presenting ID-JAG's `iss`/`sub`, and the issuer's tenant/org claim), compared on the *raw* subject, not a pairwise alias | The human continuing the execution must be the same human **in the same tenant**. An `iss`+`sub` pair is unique only within a tenant for issuers that scope subjects per tenant (the ID-JAG draft explicitly addresses tenant-scoped subjects); a multi-tenant IdP can reuse a `sub` across tenants, so matching `(iss, sub)` alone could let a same-named subject in a *different* tenant continue the execution. `principalTenant` is read from the issuer's tenant claim per its registered profile, is **required** for an issuer marked tenant-scoped (absence → `invalid_grant`, `tenant_scope_required`), and is recorded on the execution registry alongside `principalIss`/`principalSub` |
 | `delegationCredentialId` | the presenting ID-JAG `jti`, **or** a renewal within the same `sid` + `sessionIssuer` + unbroken delegation chain (below) | Ties the continuation to the same delegation act, not merely the same person re-authenticating into an unrelated session |
 | execution not `closed`, `now < expiresAt`, **and `now < delegationExpiresAt`** | the registry entry | Freshness, and the delegation-validity bound below |
 
@@ -1960,6 +2023,11 @@ carries the same `principalIss`/`principalSub` and `sid`). This makes "how long 
 acting for a human on one delegation" an explicit, policy-set bound rather than an emergent
 property of token TTLs. Entries expire by ORM TTL at `traceExecutionMaxAgeSeconds`;
 `delegationExpiresAt` is the stricter, delegation-scoped bound inside that window.
+
+**`delegationExpiresAt` bounds *access*, not just new issuance**, because each delegated SVID's
+`exp` is clamped to `≤ delegationExpiresAt` at mint (§10.6). So when the delegation expires it both
+stops new issuance (`delegation_expired`) **and** expires the outstanding SVIDs issued under it —
+there is no residual window of a full SVID lifetime on an expired delegation.
 
 ### 10.9 Human assurance: establish it, don't just correlate it
 
@@ -2020,12 +2088,19 @@ authenticator connects*, not *whether the private key is replicated to a cloud*.
 The signal that actually distinguishes them is the WebAuthn **backup eligibility (BE)** and **backup
 state (BS)** flags in the authenticator data (WebAuthn Level 3, §6.1): `BE=1` means the credential
 *may* be backed up / synchronized (it is a multi-device/"passkey" credential), and `BS=1` means it
-*currently is* backed up. A single-device, hardware-bound credential has `BE=0`. So this plan
-carries, on the `FIDO_CEREMONY` evidence and in what the policy reads, the **BE/BS** flags (plus, in
-the FIDO full design, attestation/MDS trust detail) — not `authenticator_attachment` as a proxy. A
-high-risk capability's policy can then demand `BE=0` (device-bound) or enterprise-attested
-authenticators while a low-risk one accepts `BE=1`/`BS=1` synced passkeys. The grading is the
-verifier's / PDP's to apply from the recorded BE/BS and attestation facts; this plan's job is to
+*currently is* backed up. `BE=0` means the credential is a **single-device credential** — it cannot
+be backed up or synced. **`BE=0` is not, by itself, evidence of hardware protection:** BE/BS
+describe *backup* properties, not *where the key lives or how it is protected*. Hardware-bound
+assurance (a discrete secure element, a non-exportable key) requires **additional authenticator
+assurance** — attestation with a trusted AAGUID / FIDO MDS metadata — which is separate from the
+backup flags. So this plan carries, on the `FIDO_CEREMONY` evidence and in what the policy reads,
+the **BE/BS** flags **and**, separately, the attestation/AAGUID/MDS trust detail (the FIDO full
+design) — not `authenticator_attachment` as a proxy, and not `BE=0` as a stand-in for hardware. A
+high-risk capability's policy can then demand `BE=0` (**single-device**, not synced) **and/or**
+attested hardware-backed authenticators, while a low-risk one accepts `BE=1`/`BS=1` synced passkeys;
+"single-device" and "hardware-backed" are two distinct requirements the policy states separately.
+The grading is the verifier's / PDP's to apply from the recorded BE/BS and attestation facts; this
+plan's job is to
 carry them honestly, never to assert "MFA" generically or to read sync-state off the wrong field.
 (`authenticator_attachment` is still recorded as context, but it is not the sync signal.)
 
@@ -2086,7 +2161,7 @@ profile:
 |-------|----------------------|--------|--------|--------|
 | `attestation` | **omitted** (not in `svidDefaultClaims`) | omitted | `status_only` → `{status, appraised_at}` (the granularity default **when an audience opts in** without naming one) | `full` adds `platform`/`measurement`/`policy_version`/`id` (fingerprinting material — only for an audience that must apply its own measurement policy) |
 | `delegation` | `none` (omitted) | omitted | `pairwise` → `principal_sub` is a PPID per `(audience, human)`, `principal_iss` omitted or generalized, and `credential_ref` is a per-`(audience, ID-JAG)` opaque value (**never** the raw ID-JAG `jti`, which would re-link across audiences) | `raw` → the real `principal_iss`/`principal_sub` and the raw ID-JAG `jti` (only for an audience explicitly authorized for the human's identity) |
-| execution id / `txn` | `same_domain` | omitted | `same_domain` → raw id only when the audience is in the execution's own trust domain | `always` (discouraged; see cross-domain rule) |
+| execution id / `txn` | **omitted** (not in `svidDefaultClaims`) | omitted | `same_domain` → raw pair only when the audience is in the execution's own trust domain (the granularity default **when an audience opts in** without naming one) | `always` (discouraged; see cross-domain rule) |
 
 An operator sets these per audience; an update-token or client-registration script may **narrow**
 a profile (never widen it), the same monotonic rule `allowed_resources` already follows.
@@ -2155,7 +2230,7 @@ The evidence surface reuses the design's existing privacy discipline rather than
 | `svidDefaultClaims` | `iss,sub,aud,iat,nbf,exp,jti,cnf` | The minimized default claim set; richer claims are opt-in per audience |
 | `svidPairwiseHumanSubject` | `true` | `delegation.principal_sub` is a pairwise PPID per audience unless the audience's profile is `raw` |
 | `svidAttestationDisclosureDefault` | `status_only` | Default `attestation` **granularity** applied when an audience opts in without naming one. It does **not** add `attestation` to a token whose audience has no profile — the token-level default is omission (`svidDefaultClaims`). |
-| `svidExecutionIdDisclosureDefault` | `same_domain` | Default execution-id disclosure; a cross-domain audience gets a pairwise reference |
+| `svidExecutionIdDisclosureDefault` | `same_domain` | Default execution-id **granularity** applied when an audience opts in without naming one (a same-domain audience gets the raw pair, a cross-domain audience gets a pairwise reference). It does **not** add the execution id/`txn` to a token whose audience has no profile — the token-level default is omission (`svidDefaultClaims`), matching `svidAttestationDisclosureDefault` |
 
 None of this changes what Lock stores or how the SVID is verified; it changes only **which claims
 reach which audience**, so the hardware guarantee and the correlation model are intact while the
@@ -3250,7 +3325,13 @@ in the cited section.
 | Pairwise `principal_sub` **and** a per-audience delegation `credential_ref` (never the raw ID-JAG `jti`) reduce the *human-identity* correlation path across audiences; they do **not** promise general unlinkability — the stable agent `sub` and `cnf.jkt` remain cross-audience handles by design (the agent is one identity) | §10.5, §10.10 |
 | A shared execution id is correlation, not same-operation proof (which is the Phase-3 operation-binding commitments) | §3, §11.1 |
 | Continuing an execution requires matching client + `execution_authority` + raw principal/delegation (not just client); delegation validity is bounded by `delegationExpiresAt`, independent of token renewal | §10.8 |
-| Human assurance is gated and recorded, not inferred: issuer-specific assurance mappings (no `acr` ordering) and WebAuthn BE/BS for synced-vs-device-bound (not `authenticator_attachment`) | §10.9 |
+| Human assurance is gated and recorded, not inferred: issuer-specific assurance mappings (no `acr` ordering) and WebAuthn BE/BS for **synced-vs-single-device** (not `authenticator_attachment`); **`BE=0` means single-device, not hardware-protected** — hardware assurance is a separate attestation/AAGUID/MDS signal | §10.9 |
+| JWT-SVID signing is restricted to the SPIFFE **algorithm allowlist** (`RS*`/`ES*`/`PS*`) with **no non-permitted JOSE headers** — an explicit allowlist, not "not HMAC"; the bundle and the verifier apply the same list | §8, §10.5 |
+| Delegated SVID `exp` is clamped to `≤ delegationExpiresAt`, so delegation expiry revokes access (expires outstanding SVIDs), not merely stops new issuance — no residual full-TTL window | §10.6, §10.8 |
+| Principal binding for execution continuation includes `principalTenant` where the issuer scopes subjects per tenant (`(iss, sub)` is unique only within a tenant); required for tenant-scoped issuers | §10.8 |
+| `key_binding_strength` is a three-value outcome (`certified`/`measured_guest`/`none`); a failed AK binding does **not** auto-downgrade to `measured_guest` — that needs its own independent binding evidence, else the binding is `none` (`binding_unestablished`) and issuance does not proceed | §9.3a |
+| The verifier worker is fenced by its challenge lease epoch; the assessment / `completed` / state writes are separate, recoverable, epoch-guarded transitions, not "one operation" | §9.3c |
+| No-profile execution-id disclosure default is **omitted** (aligned with `svidDefaultClaims`); `same_domain` is the granularity once an audience opts in | §10.10 |
 | The ID-JAG is issued by the IdP AS and redeemed by a distinct Resource AS across a trust boundary (distinct `iss`/`aud`); the IdP never redeems its own ID-JAG, and a single-domain deployment with no boundary uses another delegation mechanism | §5 |
 | An ID-JAG is delegated authority, not per-execution human approval; per-operation consent, where required, is enforced by the PDP/PEP at the operation | §5, §10.8 |
 | Delegator is a dedicated `delegation` claim, not RFC 8693 `act`/`may_act` | §10.5 |
@@ -3384,7 +3465,7 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **WPT / HTTP Message Signature** | AIMS §9 application-layer proof-of-possession mechanisms; referenced for `workload_authentication` / `pop_binding` (Phase 3). |
 | **`human_sponsor` / `sid`** | The authenticated human behind an agent, and the OIDC session id that ties the execution to a browser session and a later `AUTHENTICATION_EVENT`/`FIDO_CEREMONY` (§10.9). |
 | **`acr` / assurance mapping** | `acr` is an opaque, issuer-specific authentication-context reference with **no universal ordering**; the gate maps each trusted issuer's `acr`/`amr` to a server assurance level (`idJagAssuranceMappings`) and compares *that*, never raw `acr` with `>=` (§10.9). |
-| **WebAuthn BE / BS** | Backup Eligibility and Backup State flags (WebAuthn L3 §6.1): `BE=1` = the credential may be synced/backed up (a multi-device passkey), `BS=1` = currently backed up. The correct signal for synced-vs-device-bound — **not** `authenticator_attachment` (§10.9). |
+| **WebAuthn BE / BS** | Backup Eligibility and Backup State flags (WebAuthn L3 §6.1): `BE=1` = the credential may be synced/backed up (a multi-device passkey), `BS=1` = currently backed up; `BE=0` = **single-device credential**. The correct signal for synced-vs-single-device — **not** `authenticator_attachment`. BE/BS describe *backup* properties only; **hardware protection is a separate assurance** (attestation / AAGUID / FIDO MDS), not implied by `BE=0` (§10.9). |
 | **Delegation validity (`delegationExpiresAt`)** | The bound on how long an agent may keep issuing SVIDs against one human delegation, `min(openedAt + idJagDelegationMaxLifetimeSeconds, ID-JAG exp)`, independent of SVID renewal (§10.8). |
 | **Execution-continuation binding** | Continuing an open execution requires matching client, `execution_authority`, and raw principal/delegation — not just the same `client_id` — so a shared agent cannot continue another human's execution (§10.8). |
 
