@@ -31,12 +31,13 @@ where it has an external dependency). The weaker states name the missing axis:
 See "Crash-point and concurrency fault tests" in the implementation appendix for the V-axis tests.
 Do not treat a runtime guarantee as proven until its V (and any X) is met.
 
-**Items currently algorithm-incomplete** (behaviour not yet fully pinned, not merely untested):
+**Items currently algorithm-incomplete**: **none.** The two that were open have had their design
+pinned and are now *design decided, tests pending*:
 
-| Item | What is still open |
-|------|--------------------|
-| Q8 — staged-commit evidence durability (fencing + recovery) | the fence-then-resolve ordering, the paused-writer cancellation interaction with **Commit**, and the recovery drain across **Intake → Stage → Commit → Resolve-abort** are specified as a transition table (§11.3) but the cancellation/fence protocol and its recovery edges are still being nailed down; the guarantee is not yet reducible to a settled algorithm a test can pin |
-| ~~Q13 — fenced verifier worker~~ | **Resolved by Q22** (algorithm now settled): the appraisal commit is a single atomic transaction (verifier call outside it; then lease re-check under row lock + assessment + state write-through + `completed` + evidence, all-or-nothing), so there are no "partial states" to order or recover. Now **design decided, tests pending** (D met, V pending the single-transaction fault test) rather than algorithm-incomplete |
+| Formerly algorithm-incomplete | Now |
+|-------------------------------|-----|
+| Q8 — staged-commit evidence durability (fencing + recovery) | **D settled by Q26**: Stage serializes under a lease-row `SELECT … FOR UPDATE`, and Commit/Resolve-abort are competing atomic conditional updates on the one operation row — the fence-then-resolve ordering is pinned. V pending the lease-transfer-vs-insert and Commit-vs-cancellation tests |
+| Q13 — fenced verifier worker | **D settled by Q22**: the appraisal commit is one atomic transaction (verifier call outside it; then lease re-check under row lock + assessment + state write-through + `completed` + evidence). V pending the single-transaction fault test |
 
 **Items currently design decided, tests pending** (D met; V — a named test — not yet):
 
@@ -49,15 +50,18 @@ Do not treat a runtime guarantee as proven until its V (and any X) is met.
 | Q14 / Q25 — sign the complete record | signature covers sequence/hash/outcome; **one authoritative byte sequence** across rebuilds and concurrent finalizers | sign-once-at-resolution; reject signing incomplete content; freeze-input + install-once-CAS + adopt-winner (`signed_at`/`kid` do not drift; CAS loser adopts stored bytes) |
 | Q15 — one assessment, one client | concurrent same-`attestation_id` enrollers → exactly one wins | concurrent-same-`attestation_id` enrollment; enrollment crash-point (claim/binding/state/commit) |
 | Q16 — operation-specific commit receipt | recovery decides "did operation X commit?" by receipt, not identifier existence | operation-receipt discrimination (same-identifier different-operation entity does not resolve); receipt carried on `TokenEntity`/`KeyEnrollment`/`AttestationAssessment` |
-| Q17 / Q21 — outcome wire contract | outcome records validate per **event kind × operation subtype × outcome**; bootstrap aborts under the right key | per-(subtype × outcome) schema fixtures; identifying artifact per the matrix (fingerprint only for SVID issuance/enrollment; appraisal and bootstrap carry none); bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
+| Q17 / Q21 / Q28 — outcome wire contract | outcome records validate per the signed **`operation_kind` × `operation_outcome`** discriminator (Q28); bootstrap aborts under the right key. **(X pending:** Lock-schema confirmation) | per-(`operation_kind` × outcome) schema fixtures; identifying artifact per the matrix (fingerprint only for `svid_issuance`/`key_enrollment`; `bare_key_appraisal` and `execution_bootstrap` carry none); subtype read from signed `operation_kind`, not inferred; bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED` |
 | Q13 / Q22 — appraisal single-transaction commit | assessment + state write-through + `completed` + evidence commit atomically; no window where a negative verdict is durable while issuance reads the old positive state | single-transaction fault test (crash during verifier call / mid-transaction leaves nothing durable; fenced worker aborts at the lease re-check; superseded-generation skips write-through; `none`-outage writes evidence only) |
-| Q15 / Q23 — key-replacement wire format | the key change is an RFC 7592 `PUT`; old-key auth, new-key possession, and the signed mutation occupy distinct, defined locations | `RegisterValidatorTest` (`htm=PUT` accepted, `POST` rejected; `attested_key_pop` body member; `change_digest` on both proofs matches the body, mismatch → `key_change_not_signed`) |
-| Q15 / Q24 — enrollment HTTP-retry idempotency | a lost-response retry keyed by client-held `(attestation_id, K)` replays the committed enrollment; a different client or wrong key is refused | enrollment HTTP-retry idempotency (lost-response replay without the internal `operationId`; `attestation_id` + proof-key == `claimedJkt` binding; crash-before-commit re-runs fresh) |
+| Q15 / Q23 / Q29 — key-replacement wire format | RFC 7592 `PUT`; old-key auth, new-key possession, signed mutation in distinct locations; **the full submitted JWKS must differ from the locked current set by exactly the one signed key** (Q29) | `RegisterValidatorTest` (`htm=PUT` accepted, `POST` rejected; `attested_key_pop` body member; `change_digest` mismatch → `key_change_not_signed`; **extra unsigned key mutation → `unsigned_key_mutation`**; stale `prior_jwks_digest` → `stale_jwks`; `private_key_jwt` config auth gated as an extension) |
+| Q8 / Q26 — journal fence + competing terminal transitions | Stage serializes under a lease-row lock; Commit and Resolve-abort are competing conditional updates, exactly one lands | `TraceChainStateTest` lease-transfer-vs-insert; `TraceEmitterTest` Commit-vs-cancellation |
+| Q24 / Q27 — lost-first-registration idempotency | a retry that cannot supply `client_id` recovers it internally; a metadata change is not a silent replay | lost-first-registration-response (no client-supplied `client_id`, fresh DPoP proof); changed-metadata retry → `enrollment_conflict` |
+| Q30 — appraisal lease/retry boundaries | expired challenge/lease rejected pre-repair; per-attempt assessment+`operation_id`; cancelled-during-verifier-call rolls back | `AttestationChallengeServiceTest` (expiry rejection; per-`(challenge_id, leaseEpoch)` uniqueness; `appraised_at` at verifier-result moment; staged-entry-cancelled rollback) |
 
 These reach **resolved** when their V-axis test passes (and any X-axis confirmation lands). The
 entries below describe the raised question and the change; each entry's status line names the axes
-met and still outstanding. Items that are pure design/scope decisions (e.g. Q18–Q24) are **resolved
-at D** with no V/X to add.
+met and still outstanding. Pure design/scope decisions (e.g. Q18, Q19, Q20, Q21, Q28, Q31) are
+**resolved at D** with no V/X to add; the others listed above carry a runtime guarantee still pending
+its V-axis test.
 
 ## Q1. Key named in evidence ≠ hardware-protected key
 
@@ -726,6 +730,116 @@ one byte sequence with the loser adopting it. The decision log and the §11.3 `T
 note were corrected from "signing is deterministic, so bytes are reused" to this freeze-and-install
 rule.
 
+## Q26. The journal's SQL fence was a snapshot read, not a lock
+
+**Status: design decided, tests pending** — D: Stage is a lease-row-lock transaction (§11.3); V
+pending the lease-transfer-vs-insert test (`TraceChainStateTest`).
+
+**Raised.** The fence was `INSERT … WHERE (SELECT epoch FROM lease) = :myEpoch`. On PostgreSQL's
+snapshot isolation a sub-select reads a snapshot and does not serialize the insert against a
+concurrent lease transfer, so two writers could each read their own `epoch` as current and both
+append. Commit/Resolve-abort were "cancel first, then flip," leaving the transaction boundary unclear.
+
+**Change (§11.3).** **Stage** is now a transaction that `SELECT … FOR UPDATE` on the lease row first,
+validates `(holder, epoch, expires_at)` under that lock, allocates the sequence, inserts the outbox
+entry, advances `next_sequence`, and commits; lease acquisition/transfer locks the same row, so a
+transfer and an in-flight Stage cannot interleave. **Commit** and **Resolve-abort** are restated as
+two **competing atomic conditional updates** on the one operation row (`WHERE state='staged' AND
+fence=…`, Resolve-abort bumping `fence` atomically with its flip), so exactly one lands. Engine
+mapping: `SELECT … FOR UPDATE` on PostgreSQL / MySQL InnoDB; a snapshot read of `epoch` does not
+qualify.
+
+## Q27. First-registration idempotency required an unknown `client_id`
+
+**Status: design decided, tests pending** — D: idempotency recovers `client_id` internally and keys
+on a metadata digest (§9.5); V pending the lost-first-registration-response and changed-metadata
+retry tests.
+
+**Raised.** Q24's retry rule required the retry to match `claimingClientId`, but after a lost
+`/register` response the caller does not yet know the server-assigned `client_id` (RFC 7591 returns
+it in the response). The binding also could not distinguish a true retry from a request reusing the
+same assessment and key but changing audiences/redirect URIs/disclosure, and "re-send exactly the
+same request" conflicts with DPoP replay detection rejecting the original proof.
+
+**Change (§9.5).** For initial enrollment the server **recovers the original `client_id` internally**
+from the `KeyEnrollmentClaim` (keyed by `attestation_id`, proof key == `claimedJkt`); the caller
+never supplies it. The claim stores a `registrationMetadataDigest`; a retry whose metadata digest
+matches **replays**, a differing digest is **not** a retry (`enrollment_conflict`, directed to
+`updateClient`). Each retry carries a **fresh** DPoP proof (new `jti`); a re-sent original proof is
+replay-rejected, so idempotency is `(attestation_id, proof-key == claimedJkt, metadata digest)`, not
+byte-identical resend.
+
+## Q28. The outcome matrix lacked a wire discriminator
+
+**Status: resolved (D)** — a signed `operation_kind` discriminator with fixed values is defined;
+V/X of the matrix remain under Q17/Q21.
+
+**Raised.** SVID issuance, key enrollment, and bare-key appraisal all share `event_kind =
+CREDENTIAL_PROVISIONED`, `provisioning_kind = initial_issuance`, yet their required fields differ. The
+matrix referred to an "operation subtype" without a field the validator keys on — impossible to infer
+on an `aborted` record, where the distinguishing success artifacts are absent.
+
+**Change (§11.2).** Introduced an explicit **signed `event.operation_kind`** ∈ `{svid_issuance,
+key_enrollment, bare_key_appraisal, execution_bootstrap}`; the per-kind schema is selected from it,
+never inferred from artifact presence. The three validation invariants are rekeyed on
+`operation_kind` × `operation_outcome`.
+
+## Q29. The key-change digest did not cover the full accepted mutation
+
+**Status: design decided, tests pending** — D: full-mutation enforcement + version CAS + remove-shape
+consistency + `private_key_jwt`-as-extension (§9.5); V pending the signed-single-key-change-with-extra-mutation
+test (`RegisterValidatorTest`).
+
+**Raised.** RFC 7592 updates submit the full registration, but the signed `key_change_request`
+covered only `{op, target_jkt, prior_jwks_digest}`, so a request could describe one signed change
+while submitting additional key changes. The `remove` shape was inconsistent (`prior_jwks_digest` in
+one place, `{op, target_jkt}` in another), and `private_key_jwt` config auth was mislabelled as
+ordinary RFC 7592 auth.
+
+**Change (§9.5).** The server now enforces, under a `SELECT … FOR UPDATE` client-row lock, that the
+submitted `jwks` equals the current set ∓ exactly `target_jkt` (`unsigned_key_mutation` otherwise),
+with `prior_jwks_digest` as a version CAS (`stale_jwks`). Both `add` and `remove` use the same
+three-field signed shape (`prior_jwks_digest` always included). `private_key_jwt` at the
+configuration endpoint is labelled a **jans extension** (`dcrAllowPrivateKeyJwtConfigAuth`), not
+RFC 7592 registration-access-token auth.
+
+## Q30. Appraisal lease/retry boundaries were underspecified
+
+**Status: design decided, tests pending** — D: expiry rejection, per-attempt identity, `appraised_at`
+capture, and cancelled-during-verifier-call behaviour are specified (§9.3c); V pending the
+lease/retry-boundary assertions (`AttestationChallengeServiceTest`).
+
+**Raised.** The appraisal transaction checked `processing` and `leaseEpoch` but did not state whether
+it rejects an expired challenge or an expired worker lease before a repair worker reclaims it; and
+since one challenge can now produce several outage observations, it left open whether each retry gets
+a distinct assessment/operation id, whether uniqueness is per challenge or per attempt, when
+`appraised_at` is captured, and what happens if the staged entry was cancelled during the verifier call.
+
+**Change (§9.3c).** The in-transaction validation also rejects an **expired challenge** and an
+**expired worker lease** (before any repair), committing nothing. Each attempt gets a **fresh
+`operation_id` and a distinct immutable assessment**; uniqueness is **per `(challenge_id, leaseEpoch)`
+attempt**, not per challenge; `appraised_at` is captured at the **verifier-result moment** of that
+attempt. If the staged entry was cancelled during the verifier call, the attempt's fenced
+`staged → committed` flip rolls back the whole transaction and a fresh attempt runs under a new
+`leaseEpoch`.
+
+## Q31. "Established" overstated the delivery guarantees
+
+**Status: resolved (D)** — the §11.3 guarantees are restated as a durable local obligation plus the
+conditions delivery needs.
+
+**Raised.** "No lost evidence" and "no chain gap" were marked *established*, but they depend on
+recovery, finalization, retained signing material, and delivery — not on the atomic Commit alone; an
+unresolved earlier position blocks delivery of every later one. Separately, requiring the predecessor
+to be **delivered** before finalizing its successor serialized progress on Lock acknowledgements.
+
+**Change (§11.3).** Only "no false success" rests on Commit alone. The rest are restated: **every
+committed operation has a durable local evidence obligation; eventual delivery requires successful
+recovery, retained signing material, and restored collector availability**, with in-order delivery
+meaning an unresolved/undelivered earlier position blocks later ones. Finalization now chains over
+the predecessor's **durably finalized** digest (not its delivery), so a producer can finalize locally
+during a Lock outage while delivery stays ordered.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -750,6 +864,11 @@ too-coarse "committed ⇒ fingerprint" rule), the §9.3c/§11.3 unified appraisa
 two-proofs-one-header / hard-coded-`POST` defects), the §9.5 enrollment-retry idempotency key
 `(attestation_id, K)` (Q24, which replaced the client-invisible `operationId` retry rule), the
 §11.3 freeze-signing-input + install-once-CAS rule (Q25, which qualified "re-finalizing is
-byte-identical" into one authoritative byte sequence, not one signer execution), and the
-§16.1 key-revocation delay). This history preserves the original questions that drove them; for
-current behaviour, read the main document.
+byte-identical" into one authoritative byte sequence, not one signer execution), the §11.3
+lease-row-lock journal fence and competing Commit/Resolve-abort transitions (Q26, replacing the
+snapshot-read `epoch` predicate), the §9.5 lost-first-registration idempotency that recovers
+`client_id` internally and keys on a metadata digest (Q27), the §11.2 signed `operation_kind`
+discriminator (Q28), the §9.5 full-mutation key-change enforcement under a client-row lock (Q29),
+the §9.3c appraisal lease/retry boundaries (Q30), the §11.3 delivery-guarantee restatement as a
+durable local obligation (Q31), and the §16.1 key-revocation delay). This history preserves the
+original questions that drove them; for current behaviour, read the main document.

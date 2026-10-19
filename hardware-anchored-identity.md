@@ -1122,9 +1122,16 @@ Rules:
   network I/O that must not hold a database transaction open. *Then*, in **one SQL transaction in
   the issuer-side transaction domain** (§11.3), it:
   1. **re-reads and validates the challenge under a row lock** (`SELECT … FOR UPDATE` on the
-     `AttestationChallenge`), confirming the challenge is still `processing` and still carries **this
-     worker's `leaseEpoch`** — this is the fence, re-checked *inside* the transaction so a worker
-     whose lease was repaired/reclaimed aborts here and commits nothing;
+     `AttestationChallenge`), confirming (i) the challenge is still `processing`, (ii) it still
+     carries **this worker's `leaseEpoch`**, (iii) the **challenge itself is unexpired**
+     (`now < challenge.expires_at`), and (iv) **this worker's lease is unexpired**
+     (`now < lease.expires_at`). This is the fence, re-checked *inside* the transaction. A worker
+     whose lease was repaired/reclaimed fails (ii); a worker whose own lease has **already expired**
+     fails (iv) and **aborts even if the repair timer has not yet run** — it does not get to commit a
+     verdict under a dead lease on the theory that no one has reclaimed the challenge yet; and an
+     **expired challenge** fails (iii). In every case the transaction commits nothing, and the
+     expired/fenced path returns `invalid_challenge` (reason `challenge_expired` or
+     `challenge_in_progress`) rather than a verdict;
   2. **inserts the immutable `AttestationAssessment`** (carrying `challengeId`, `leaseEpoch`,
      `appraisalGeneration`, `supersedesEligible`);
   3. **applies the authoritative `KeyAttestationState` write-through** — but only for a
@@ -1161,8 +1168,8 @@ Rules:
   with its `completed` challenge and its own staged record) but **does not** overwrite the row. So a
   slow verifier call that finishes late can never regress the authoritative state, and both verdicts
   remain in the evidence log with their generations (§10.4). A negative verdict that *is* the newest
-  generation overwrites the positive state in the same transaction that records it — closing the
-  failure window the reviewer flagged.
+  generation overwrites the positive state in the same transaction that records it, so no window
+  exists in which a negative verdict is durable while issuance still reads the old positive state.
 - **Outage case (`status=none`).** If the platform verifier is unreachable or the script yields no
   verdict, the worker produces a **`none`** verdict (§9.3). There is no authoritative state change:
   `none` is recorded as evidence (so outages are visible in the trail) but is **never** written
@@ -1172,6 +1179,32 @@ Rules:
   `attestationChallengeMaxRetries`, so the agent may resubmit the same evidence); the HTTP response
   is `503 verifier_unavailable`. Beyond the retry limit the challenge `expires`. An outage therefore
   neither grants nor revokes authority; it is logged, not acted on.
+- **One challenge, many attempts — identity and uniqueness are per *attempt*, not per challenge.**
+  Because an outage (or a crash) can legitimately produce several observations for one challenge
+  before a final verdict, each attempt is its own operation:
+  - **Distinct assessment and `operation_id` per attempt.** Each `pending → processing` claim bumps
+    `leaseEpoch` and allocates a **fresh `operation_id`**; the attempt's transaction inserts a
+    **new immutable `AttestationAssessment`** (a dated observation — a `none` outage observation is
+    just as immutable as a verdict). So two outage attempts on the same challenge produce two
+    distinct assessments and two distinct operation records, never a mutated one.
+  - **Uniqueness is per challenge-*attempt*** (`(challenge_id, leaseEpoch)`), **not per challenge.**
+    The `operation_id` is unique per attempt; the `AttestationAssessment` carries both `challengeId`
+    and `leaseEpoch`, so the evidence log shows every attempt against a challenge distinctly and
+    "which attempt produced this observation" is always answerable. Only the attempt that reaches a
+    terminal verdict sets the challenge `completed`; outage attempts leave it `pending`.
+  - **`appraised_at` is captured when the verifier result is obtained** (the appraisal moment),
+    carried into the assessment inserted by that attempt's transaction — not at challenge issuance
+    and not at the later commit. A `none` outage observation records the `appraised_at` of *that*
+    failed attempt. (The `appraisalGeneration` that orders evidence is the per-key generation stamped
+    at challenge issuance, §9.3, distinct from `appraised_at`.)
+  - **If the attempt's staged outbox entry was cancelled while the verifier call was running**
+    (recovery fenced/cancelled it as abandoned during the long external call, §11.3 **Resolve-abort**):
+    the attempt's commit transaction (step 5's `staged → committed` flip) is **conditioned on the
+    entry's `fence`**, so it finds the entry already `aborted`/fenced and the whole transaction
+    **rolls back** — no assessment, no state change, no `completed`. The challenge returns to
+    `pending` (the attempt simply did not land) and a fresh attempt runs under a new `leaseEpoch` and
+    a new `operation_id`. The cancelled attempt's position is delivered as an aborted-outcome record
+    (§11.3); it does not strand the challenge.
 - Expired entries are removed by the ORM TTL.
 
 ### 9.4 The interception script: `attestation`
@@ -1290,7 +1323,7 @@ The claim replaces the lookup with a write that one and only one enroller can wi
 
 | Step | What | Property |
 |------|------|----------|
-| 1 | **Claim the assessment atomically by `attestation_id`.** Insert a `KeyEnrollmentClaim` entity (`ou=keyEnrollmentClaims`, `jansEnrollClaim`; **key `attestationId`**) recording `{ attestationId, claimingClientId, claimedJkt, operationId, claimedAt }` as an **insert conditioned on absence** (a unique constraint on `attestationId`), as the first write of the enrollment transaction. It makes "this assessment is bound to exactly one enrollment" a uniqueness guarantee the transaction cannot violate: if a row already exists for this `attestation_id`, the insert fails the constraint, the whole transaction rolls back, and the request is resolved by the **client-visible idempotency rule** below — the same client re-presenting the same `(attestation_id, K)` gets its committed enrollment back; a *different* client is refused (`invalid_client_metadata`, `assessment_already_enrolled`). Two concurrent enrollers naming the same `attestation_id` therefore race on this one insert; exactly one transaction commits. (`operationId` is a server-internal id for cross-table recovery matching only — it is **not** the idempotency key the client presents.) | Uniqueness is enforced by the write that conflicts, not by a lookup that can be stale under concurrency — the race cannot produce two bindings |
+| 1 | **Claim the assessment atomically by `attestation_id`.** Insert a `KeyEnrollmentClaim` entity (`ou=keyEnrollmentClaims`, `jansEnrollClaim`; **key `attestationId`**) recording `{ attestationId, clientId (the server-assigned id, for lost-response recovery), claimedJkt, registrationMetadataDigest, operationId, claimedAt }` as an **insert conditioned on absence** (a unique constraint on `attestationId`), as the first write of the enrollment transaction. The `clientId` and `registrationMetadataDigest` let a retry recover the original `client_id` internally and distinguish a true retry from a changed-metadata re-`/register` (above). It makes "this assessment is bound to exactly one enrollment" a uniqueness guarantee the transaction cannot violate: if a row already exists for this `attestation_id`, the insert fails the constraint, the whole transaction rolls back, and the request is resolved by the **client-visible idempotency rule** below — the same client re-presenting the same `(attestation_id, K)` gets its committed enrollment back; a *different* client is refused (`invalid_client_metadata`, `assessment_already_enrolled`). Two concurrent enrollers naming the same `attestation_id` therefore race on this one insert; exactly one transaction commits. (`operationId` is a server-internal id for cross-table recovery matching only — it is **not** the idempotency key the client presents.) | Uniqueness is enforced by the write that conflicts, not by a lookup that can be stale under concurrency — the race cannot produce two bindings |
 | 2 | **Verify the registration proof against the assessed key.** `validateAttestation()` has already checked `status=affirming`, unexpired, `purpose=enroll`, `attested_jkt ∈ jwks`, and the `/register` **DPoP proof key == `attested_jkt`**. This proof — not the assessment's `supersedesEligible` — is the authorization to initialize state for this key | The registrant demonstrably holds `K`; a third party who merely learned an `attestation_id` cannot enroll around it |
 | 3 | **Preserve the original assessment unchanged.** The `AttestationAssessment` is **immutable** (§9.7); `clientId` is **not** written back onto it | The evidence log stays append-only and re-verifiable exactly as appraised |
 | 4 | **Create a separate enrollment binding.** A new `KeyEnrollment` entity (`ou=keyEnrollments`, `jansKeyEnroll`; key `(clientId, jkt)`) records `{ clientId, jkt, attestationId, operationId, enrolledAt, enrolledByProofJti }` — the durable link from this client+key to the assessment that justified it, kept **outside** the immutable assessment. It carries the same `operationId` as the claim so recovery can match binding to claim | The client↔key↔assessment binding lives in its own mutable-by-append record, not by mutating evidence |
@@ -1311,38 +1344,47 @@ state to reconcile. The two concerns the transaction keeps separate are:
   wins, and the second's insert violates the unique constraint and its whole transaction rolls back
   (`invalid_client_metadata`, `assessment_already_enrolled`). Uniqueness is decided by the
   conflicting write, not by a lookup.
-- **Idempotence on an HTTP retry — keyed by what the client actually holds, not the internal
-  `operationId`.** After a lost `/register` response the client has **no** way to know the
-  server-allocated `operationId` (it is a fresh internal UUID the client never saw), so idempotency
-  cannot hinge on it. The client *does* hold a stable, authenticated key for this enrollment: the
-  **`attestation_id`** it received from `/attestation`, together with possession of **`K`**. These
-  are the idempotency key, and a retry re-presents exactly the same request:
-  - **Authenticated idempotency key:** the `attestation_id` (the `attestation` DCR parameter). It is
-    *authenticated* because the same request carries the **DPoP proof over `K`** (step 2), and the
-    claim records the `claimedJkt` it was first enrolled under; a retry is honoured only when the
-    presented proof key equals the claim's `claimedJkt`, so a party that merely learned an
-    `attestation_id` cannot drive the idempotent path. (This is the same key-possession binding the
-    enrollment already requires, reused as the idempotency binding — no new secret.)
-  - **Request binding:** the retry MUST name the same `attestation_id`, resolve to the same
-    `client_id`, and prove possession of the same `K`. The server compares the incoming request
-    against the existing `KeyEnrollmentClaim`:
-    - same `attestation_id` + same `claimingClientId` + proof key == `claimedJkt` → **replay**:
-      return the already-committed enrollment result (`200`/`201` with the same `client_id`
-      registration) without re-running the transaction. A no-op success.
-    - same `attestation_id` but a **different** `claimingClientId` (or a proof key ≠ `claimedJkt`) →
-      **conflict**: `400 invalid_client_metadata`, `assessment_already_enrolled` — the assessment is
-      already spoken for by another client; this is not a retry.
-  - **Crash before commit** left no claim at all (the transaction rolled back atomically), so a
-    retry simply re-runs the enrollment transaction fresh under the same `(attestation_id, K)` and
-    commits — the first attempt that reaches commit wins, later retries replay it.
-  - **Retention and replay window:** the `KeyEnrollmentClaim` is retained for the life of the
-    enrollment it records (it is the durable record that the assessment was consumed, §9.5), so the
-    idempotent-replay answer is available for as long as the client could meaningfully retry and
-    well beyond — there is no short idempotency-key TTL to miss. Because the key is the
-    client-held `(attestation_id, K)` and the claim is permanent, a retry is deterministic whether it
-    arrives seconds or days after the lost response. An `attestation_id` whose assessment expired
-    before any enrollment committed never produced a claim; the client re-attests (cheap, §9.5) and
-    enrolls with a fresh `attestation_id`.
+- **Idempotence on an HTTP retry — keyed by what the client holds *before* it has a `client_id`.**
+  After a lost `/register` response the client knows neither the internal `operationId` nor the
+  **server-assigned `client_id`** — RFC 7591 returns the `client_id` only *in* that lost response. So
+  idempotency must not require the caller to supply either. The client *does* hold the
+  **`attestation_id`** (from `/attestation`) and possession of **`K`**; the server **recovers the
+  original `client_id` internally** from the assessment claim and the verified key:
+  - **Authenticated idempotency key:** the `attestation_id`, authenticated by the **DPoP proof over
+    `K`** (step 2). The `KeyEnrollmentClaim` is keyed by `attestation_id` and records the
+    `claimedJkt` it first enrolled and the `client_id` it assigned. On a retry the server looks the
+    claim up by `attestation_id`, checks the presented proof key equals `claimedJkt`, and **reads the
+    original `client_id` off the claim** — the caller never supplies it. A party that merely learned
+    an `attestation_id` but cannot prove `K` cannot drive this path.
+  - **Distinguish a true retry from a changed-metadata request — stored metadata digest.** The claim
+    also stores `registrationMetadataDigest`, a digest of the **original registration metadata** as
+    accepted (redirect URIs, audiences/`allowed_resources`, disclosure settings, …). On a retry the
+    server digests the incoming metadata and compares:
+    - proof key == `claimedJkt` **and** `registrationMetadataDigest` matches → **replay**: re-return
+      the already-committed registration (including the recovered `client_id`) without re-running the
+      transaction.
+    - proof key == `claimedJkt` but the metadata digest **differs** → **not a retry**: this reuses
+      the same assessment and key but changes audiences / redirect URIs / disclosure. Refuse
+      (`400 invalid_client_metadata`, `enrollment_conflict`); a metadata change is a separate
+      `updateClient` on the already-registered `client_id` (§9.5 key-change path for keys; standard
+      RFC 7592 update for other metadata), not a re-`/register`.
+    - `attestation_id` already claimed by a **different** key/assessment binding → `400
+      invalid_client_metadata`, `assessment_already_enrolled`.
+  - **Fresh DPoP proof on every attempt, not "exactly the same request."** Each retry MUST carry a
+    **fresh** DPoP proof (new `jti`, current `iat`) signed by `K`; the server's normal DPoP
+    replay-detection **rejects a re-sent original proof** (`jti` already seen), so "replay the exact
+    bytes" is not a viable retry and must not be required. Idempotency is established by
+    `(attestation_id, proof-key == claimedJkt, registrationMetadataDigest)`, each proof being
+    individually fresh and valid.
+  - **Crash before commit** left no claim (the transaction rolled back atomically), so a retry
+    re-runs the enrollment transaction fresh under the same `(attestation_id, K)`; the first attempt
+    to reach commit wins and assigns the `client_id`, later retries replay it.
+  - **Retention and replay window:** the `KeyEnrollmentClaim` (with its `client_id` and
+    `registrationMetadataDigest`) is retained for the life of the enrollment, so the replay answer —
+    including the recovered `client_id` — is available however long after the lost response the retry
+    arrives; there is no short idempotency-key TTL to miss. An `attestation_id` whose assessment
+    expired before any enrollment committed never produced a claim; the client re-attests (cheap)
+    and enrolls with a fresh `attestation_id`.
 
   An optional client-chosen **`Idempotency-Key` request header** MAY additionally be accepted and
   stored on the claim for deployments that prefer an explicit key; when present it must agree with
@@ -1379,15 +1421,17 @@ Three concerns are kept distinct — authenticating the updater, proving possess
 and signing the exact mutation (a DPoP proof and `private_key_jwt` authenticate the request but do
 not sign its body). The concrete wire format gives each its own location:
 
-- **(a) Authenticate the updater — normal RFC 7592 auth, old key.** The `PUT` is authenticated the
-  way any registration-management request is: with the client's **registration access token**. When
-  that token is DPoP-bound (the SVID case), the single **`DPoP` header** carries the old-key proof —
+- **(a) Authenticate the updater — RFC 7592 registration-access-token auth, old key.** The `PUT` is
+  authenticated the way RFC 7592 defines: with the client's **registration access token**. When that
+  token is DPoP-bound (the SVID case), the single **`DPoP` header** carries the old-key proof —
   `htm=PUT`, `htu=<client configuration endpoint>`, fresh `iat`, unseen `jti`, `jwk` thumbprint = a
-  key **already trusted for the client** (`K_old`), and the `ath` claim over the access token. For a
-  `private_key_jwt` client the request authentication is instead a `private_key_jwt` client assertion
-  signed by `K_old`. Either way this establishes *the current key holder is making the request* — it
-  occupies the request's **authentication** slot, and there is only one such slot, so the new-key
-  proof cannot also live there.
+  key **already trusted for the client** (`K_old`), and the `ath` claim over the access token. A
+  deployment MAY instead authenticate the configuration request with a `private_key_jwt` client
+  assertion signed by `K_old` — but this is a **jans extension to RFC 7592** (RFC 7592 specifies the
+  registration access token, not `private_key_jwt`, at the configuration endpoint), enabled by
+  `dcrAllowPrivateKeyJwtConfigAuth` and advertised as such, not "ordinary RFC 7592 auth." Either way
+  this establishes *the current key holder is making the request* — it occupies the request's single
+  **authentication** slot, so the new-key proof cannot also live there.
 - **(b) Prove possession of the new key — a separately named body artifact.** Because (a) occupies
   the `DPoP` header / client-assertion slot, possession of `K_new` is carried as a **distinct, named
   registration-metadata member in the `PUT` body**: `attested_key_pop`, a signed JWT (`typ:
@@ -1397,22 +1441,33 @@ not sign its body). The concrete wire format gives each its own location:
 - **(c) Sign the exact mutation — because neither (a) nor (b)'s transport signs the body.** A DPoP
   proof covers `htm`/`htu`/`iat`/`jti`/`ath` **but not the request body** (RFC 9449), and a
   `private_key_jwt` assertion authenticates the client **but is not a signature over the key-change
-  payload** (RFC 7523). So authentication alone cannot attest *which* key is being added or removed.
-  The design binds both proofs to the mutation explicitly: the request body carries
-  `key_change_request = { op: "add" | "remove", target_jkt, prior_jwks_digest }` (the mutation
-  described canonically), and **both** the old-key authentication and the new-key `attested_key_pop`
-  **include a `change_digest` claim = the digest of `key_change_request`**. The server accepts the
-  update only when both `change_digest` values match the digest it computes over the received
-  `key_change_request`, so (a) proves *the current holder authorized this exact change* and (b)
-  proves *the holder of `K_new` consented to being added by this exact change* — mutation integrity,
-  not merely request authentication. A mismatch is refused (`invalid_request`,
-  `key_change_not_signed`).
+  payload** (RFC 7523). So authentication alone cannot attest *which* keys are being changed, and
+  signing only `target_jkt` would let the `PUT` body carry **additional** unsigned key changes the
+  signed object never mentioned. The design closes this two ways, both enforced:
+  - The body carries a canonical `key_change_request = { op: "add" | "remove", target_jkt,
+    prior_jwks_digest }` — **`prior_jwks_digest` is required for both `add` and `remove`** (it pins
+    the exact old set the change applies to). **Both** the old-key authentication and (for `add`) the
+    new-key `attested_key_pop` carry a `change_digest` claim = digest of `key_change_request`; the
+    server recomputes it over the received object and refuses a mismatch (`invalid_request`,
+    `key_change_not_signed`).
+  - **The server enforces that the submitted `jwks` equals the old set ∓ exactly `target_jkt`, under
+    a client-row lock.** Within a transaction it `SELECT … FOR UPDATE` on the client row, verifies
+    `digest(current jwks) == prior_jwks_digest` (so the change applies to the set the client signed
+    over — a version CAS, rejecting a concurrent change with `invalid_request`,
+    `stale_jwks`), computes the **exact set difference** between the current `jwks` and the submitted
+    `jwks`, and **rejects unless that difference is precisely `{ target_jkt }` added (for `add`) or
+    removed (for `remove`)** — `invalid_request`, `unsigned_key_mutation`, if the `PUT` adds,
+    removes, or alters *any other* key. So a request cannot "describe one signed change while
+    submitting additional key changes": the signed `key_change_request` and the actual set-delta must
+    match exactly, checked and committed under the row lock.
 
 So the one `DPoP` header carries **only** the old-key request authentication; the new-key possession
-proof is the body member `attested_key_pop`; and the exact mutation is signed by the `change_digest`
-claim that both proofs carry. (For `remove`, there is no `K_new`, so only (a) + (c) apply: the
-old-key authentication's `change_digest` over `{ op: "remove", target_jkt }` authorizes retiring the
-named key.)
+proof is the body member `attested_key_pop`; the exact mutation is signed by the `change_digest` both
+proofs carry; and the submitted JWKS is proven to differ from the locked current set by exactly the
+single signed key. A `remove` uses (a) + (c) only (no `K_new`, no `attested_key_pop`): the old-key
+authentication's `change_digest` over `{ op: "remove", target_jkt, prior_jwks_digest }` — the **same
+three-field shape**, `prior_jwks_digest` included — authorizes retiring the named key, and the
+set-difference check confirms only `target_jkt` was removed.
 
 Outside the administrative recovery paths (destroyed/compromised `K_old`, §9.9) both the old-key
 authentication and — for an `add` — the new-key `attested_key_pop` are mandatory, each bound to the
@@ -1639,8 +1694,10 @@ A planned rotation never drops the old key before the new one is trusted:
 3. Both keys are now usable; the agent migrates its issuance to `K2` at its own pace.
 4. The agent calls `updateClient` removing `K1` (an RFC 7592 `PUT`, `op: "remove"`), authenticated
    by a proof over a still-trusted key (`K1` or `K2`) whose `change_digest` covers
-   `{ op: "remove", target_jkt: jkt(K1) }` (no `attested_key_pop` is needed for a removal). Removing
-   `K1` immediately stops new issuance under it; outstanding `K1`-bound SVIDs expire within their
+   `{ op: "remove", target_jkt: jkt(K1), prior_jwks_digest }` (the same three-field shape as `add`,
+   `prior_jwks_digest` included; no `attested_key_pop` is needed for a removal), and the server's
+   set-difference check under the client-row lock confirms *only* `K1` was removed. Removing `K1`
+   immediately stops new issuance under it; outstanding `K1`-bound SVIDs expire within their
    minutes-long TTL.
 
 Lock's producer-side `IDENTITY_ROTATED` lifecycle event (where TRACE emission is enabled) records
@@ -2614,36 +2671,46 @@ credential. On the SQL-only backend an operation's commit is always decidable �
 the entity, and the flip are one transaction, §11.3 — so there is no third "could-not-decide"
 outcome.)
 
-**The required identifying artifact is defined by event kind × operation subtype × outcome, not by
-outcome alone.** A single "`committed` ⇒ `credential_fingerprint` present" rule would be *wrong* for
+**The required identifying artifact is keyed on the signed `operation_kind` × `operation_outcome`, not
+on outcome alone.** A single "`committed` ⇒ `credential_fingerprint` present" rule would be *wrong* for
 two legitimate success shapes already defined above: a bare-key appraisal provisions no credential,
 and an `EXECUTION_STARTED` bootstrap carries its source grant in `tokens[]` and provisions nothing.
-Each committed success therefore carries the identifying artifact proper to *its* operation, and
-`aborted` carries none (the operation produced nothing to identify):
+The subtype is **not** inferred from which artifacts happen to be present — that is impossible on an
+`aborted` record, where the distinguishing success artifacts are by definition absent. Instead every
+record carries an **explicit signed discriminator, `event.operation_kind`**, with fixed values, and
+the schema is defined **against that field**. `event_kind`/producer and `provisioning_kind` stay as
+they are (several subtypes share `CREDENTIAL_PROVISIONED` / `initial_issuance`); `operation_kind` is
+the field a validator keys on:
 
-| Operation (kind · subtype) | `committed` — required identifying artifact | `aborted` |
-|----------------------------|----------------------------------------------|-----------|
-| **SVID issuance** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, `provisioning_kind=initial_issuance`\|`renewal` | `credential_fingerprint` = the SVID (`jti`, `cnf_key_thumbprint`) | no `credential_fingerprint` |
-| **Key enrollment** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, `provisioning_kind=initial_issuance` | `credential_fingerprint` = the enrolled-key thumbprint (`jkt`) | no `credential_fingerprint` |
-| **Bare-key appraisal** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, `provisioning_kind=initial_issuance`, no credential bound | **no `credential_fingerprint`**; identified by `posture_assessment_ref.attestation_id` + the assessed-key thumbprint (`jkt`) | no `credential_fingerprint`; `posture_assessment_ref` present but `status`-less / aborted |
-| **Execution bootstrap** — `EXECUTION_STARTED`/`jans-auth` | **no `credential_fingerprint`**; identified by the execution pair (`trace_execution_id` + `execution_authority`) and the source-grant reference (`tokens[]` ID-JAG `jti`/fingerprint, `bootstrap.redeemed_id_jag_fingerprint`) | no `credential_fingerprint`; execution pair + source-grant reference present |
+| `operation_kind` (signed discriminator) | `event_kind` / producer | `committed` — required identifying artifact | `aborted` |
+|------------------------------------------|-------------------------|----------------------------------------------|-----------|
+| `svid_issuance` | `CREDENTIAL_PROVISIONED` / `jans-svid-issuer` (`provisioning_kind=initial_issuance`\|`renewal`) | `credential_fingerprint` = the SVID (`jti`, `cnf_key_thumbprint`) | no `credential_fingerprint` |
+| `key_enrollment` | `CREDENTIAL_PROVISIONED` / `jans-svid-issuer` (`provisioning_kind=initial_issuance`) | `credential_fingerprint` = the enrolled-key thumbprint (`jkt`) | no `credential_fingerprint` |
+| `bare_key_appraisal` | `CREDENTIAL_PROVISIONED` / `jans-svid-issuer` (`provisioning_kind=initial_issuance`, no credential bound) | **no `credential_fingerprint`**; `posture_assessment_ref.attestation_id` + assessed-key `jkt` | no `credential_fingerprint`; `posture_assessment_ref.attestation_id` + assessed-key `jkt` still present (identifies *which* appraisal aborted) |
+| `execution_bootstrap` | `EXECUTION_STARTED` / `jans-auth` | **no `credential_fingerprint`**; execution pair (`trace_execution_id` + `execution_authority`) + source-grant reference (`tokens[]` ID-JAG, `bootstrap.redeemed_id_jag_fingerprint`) | no `credential_fingerprint`; execution pair + source-grant reference present |
 
-Every outcome also carries the chain/identity fields: `operation_outcome`, `trace_execution_id`,
-`execution_authority`, `subject`, `sequence_number`, `prev_record_hash`, and the `parent_record_ids`
-the success record would have carried; `aborted` additionally carries `reason = not_committed`.
+Every outcome also carries the chain/identity fields: `operation_kind`, `operation_outcome`,
+`trace_execution_id`, `execution_authority`, `subject`, `sequence_number`, `prev_record_hash`, and
+the `parent_record_ids` the success record would have carried; `aborted` additionally carries
+`reason = not_committed`.
 
-Three invariants make these validatable rather than free-form, **keyed by (kind, subtype, outcome)**:
+Three invariants make these validatable rather than free-form, **keyed on the signed
+`operation_kind` × `operation_outcome`** (never inferred from artifact presence):
 
-1. **`credential_fingerprint` is required exactly for the two credential-provisioning subtypes when
-   `committed`** — SVID issuance and key enrollment. It MUST be **absent** for a bare-key appraisal,
-   for an `EXECUTION_STARTED` bootstrap, and for **any** `aborted` record. A validator that applies
-   "`committed` ⇒ fingerprint" uniformly is wrong; the rule is per the matrix above.
-2. **The subtype's own identifying artifact is required when `committed`:** the enrolled-key `jkt`
-   for enrollment, `attestation_id` + assessed-key `jkt` for a bare-key appraisal, the execution
-   pair + source-grant reference for a bootstrap. A `committed` record missing its subtype's artifact
-   is rejected.
-3. **`operation_outcome` ∈ `{committed, aborted}`**, `reason` is present iff `aborted` (`= not_committed`),
-   and the `event_kind`/producer is the operation's own (per §11.2 producer scope).
+1. **`operation_kind` ∈ `{svid_issuance, key_enrollment, bare_key_appraisal, execution_bootstrap}`**
+   and is **signed** (inside the record, covered by the §11.3 signature), and its `event_kind` +
+   producer must match the table (e.g. `execution_bootstrap` only ever `EXECUTION_STARTED`/`jans-auth`).
+   The validator reads `operation_kind` first and selects the per-kind schema from it.
+2. **`credential_fingerprint` is required iff `operation_kind ∈ {svid_issuance, key_enrollment}` AND
+   `operation_outcome = committed`.** It MUST be **absent** for `bare_key_appraisal`,
+   `execution_bootstrap`, and **any** `aborted` record. A validator that applies "`committed` ⇒
+   fingerprint" uniformly is wrong; the rule is per `operation_kind`.
+3. **The kind's own identifying artifact is required when `committed`** (enrolled-key `jkt`;
+   `attestation_id` + assessed-key `jkt`; execution pair + source-grant reference), and on an
+   `aborted` record the kind's **stable, outcome-independent** identifiers are still required
+   (`attestation_id` for an appraisal, the execution pair for a bootstrap) so the aborted record is
+   attributable even with no success artifact. `operation_outcome` ∈ `{committed, aborted}`, `reason`
+   present iff `aborted`.
 
 **Lock compatibility is a confirmation item, not an assumption.** Lock "enforces event schemas" and
 validates "the complete TRACE schema and the `trace.event_kind` discriminated union" server-side
@@ -2652,14 +2719,15 @@ cryptographically-relevant structure. Adding `operation_outcome` and allowing an
 `credential_fingerprint`** on `CREDENTIAL_PROVISIONED` / `EXECUTION_STARTED` is therefore a change
 Lock's per-kind schema must accept, even though **no new `event_kind` is introduced**. Before the
 demo this plan verifies against Lock's actual `CREDENTIAL_PROVISIONED` and `EXECUTION_STARTED`
-schema and validation rules that: (a) `operation_outcome` is an accepted member (or is added),
-(b) an absent `credential_fingerprint` is accepted wherever the matrix allows it — every `aborted`
-record, **and** committed bare-key appraisals and `EXECUTION_STARTED` bootstraps — and not rejected
-as malformed, and (c) the producer-key scope rejects a bootstrap abort sent as `CREDENTIAL_PROVISIONED`.
-If Lock's current schema requires `credential_fingerprint` unconditionally on `CREDENTIAL_PROVISIONED`,
-that is itself the contradiction this fix resolves (a committed bare-key appraisal already has none):
-the gap is closed by a Lock-side schema update keyed to (kind, subtype, outcome), never by
-fabricating a fingerprint for an operation that provisioned nothing.
+schema and validation rules that: (a) `operation_kind` and `operation_outcome` are accepted signed
+members (or are added) and the per-kind schema is selected from `operation_kind`, (b) an absent
+`credential_fingerprint` is accepted wherever the matrix allows it — every `aborted` record, **and**
+committed `bare_key_appraisal` and `execution_bootstrap` — and not rejected as malformed, and (c) the
+producer-key scope rejects a bootstrap abort sent as `CREDENTIAL_PROVISIONED`. A committed
+`bare_key_appraisal` carries no `credential_fingerprint`, so a Lock schema that requires it
+unconditionally on `CREDENTIAL_PROVISIONED` must be updated to key the requirement on
+`operation_kind` × `operation_outcome`; the field is never satisfied by fabricating a fingerprint for
+an operation that provisioned nothing.
 
 | Event | `event_kind` | Producer | Signed facts | Credential / tokens | `subject` + scope |
 |-------|--------------|----------|--------------|---------------------|-------------------|
@@ -2830,12 +2898,15 @@ New package `io.jans.as.server.trace`:
   outcome is known" model: once position *n* is allocated it is **always** emitted to Lock, either
   as the committed `CREDENTIAL_PROVISIONED` (the operation succeeded) or as an explicit
   **aborted-outcome record** at that same `sequence_number` (the operation never committed). A
-  position is never silently dropped. Each delivered record is built and signed once at resolution
-  (below), so `prev_record_hash` chains over real, signed, delivered records and an aborted position
-  is a genuine link, not a hole. The position is **assigned** early (fixing chain order under
-  concurrency), but the record is **finalized and signed** late, once its outcome and predecessor
-  are known; so sequence allocation stays on the append protocol while the signature still covers
-  the complete record.
+  position is never silently dropped. Each record is built and signed once at resolution (below), and
+  **`prev_record_hash` chains over position *n-1*'s durably *finalized* `content_digest`, not over
+  its *delivery***. Decoupling the hash link from delivery lets a producer keep finalizing records
+  locally during a Lock outage (the chain still forms), while **delivery** remains strictly in
+  `sequence_number` order so Lock receives an ordered, unbroken chain once reachable. The position is
+  **assigned** early (fixing chain order under concurrency), the record is **finalized and signed**
+  once its outcome and predecessor's finalized digest are known, and it is **delivered** after its
+  predecessor is delivered — three separable points, so a Lock outage stalls delivery without
+  stalling local finalization.
 
 #### The outbox append protocol: a per-chain single-writer journal
 
@@ -2863,28 +2934,45 @@ do not touch the chain; they record their intent and hand it to the journal writ
   my operation?" is answered by an `operation_id` lookup, never by inspecting or adopting a record
   some other thread wrote.
 - **The single writer, holding a fenced lease, assigns positions serially.** The journal writer
-  acquires a per-chain lease (`jansTraceChainLease`: `{ holder_node, holder_thread, epoch,
-  expires_at }`) via CAS and renews it; `epoch` increments on every acquisition. It then loops:
-  pick the oldest unprocessed intake row, assign it the next `sequence_number`, and insert the
-  outbox entry **in a single authoritative write that carries the lease `epoch`** (below). Because
-  exactly one lease holder assigns numbers, no two entries ever compute the same `sequence_number`;
-  the unique index on `(producer_id, chain_id, sequence_number)` is a backstop invariant, not the
-  mechanism that resolves contention.
-- **The fence is enforced at the authoritative append, not after it.** The outbox insert is
-  **conditional on the writer's `epoch` still being the current chain epoch** — one atomic
-  store operation, not insert-then-check. Concretely: the insert is guarded by a compare against
-  `jansTraceChainLease.epoch` (a SQL `INSERT … WHERE (SELECT epoch FROM lease …) = :myEpoch`, or the
-  equivalent conditional in the ORM). A writer whose lease was revoked
-  (its `epoch` is stale) **cannot insert at all** — the guarded write is rejected before any
-  authoritative row exists, so there is no fenced-but-committed record to undo. The unique index on
-  `(producer_id, chain_id, sequence_number)` remains as a backstop invariant, but it is never the
-  primary contention mechanism; a healthy chain never relies on it to reject a duplicate, because
-  the single writer never produces one.
+  holds a per-chain lease (`jansTraceChainLease`: `{ holder_node, holder_thread, epoch,
+  expires_at, next_sequence }`); `epoch` increments on every acquisition, and `next_sequence` is the
+  cursor. It drains the oldest unprocessed intake row per **Stage** (below). Because exactly one
+  lease holder assigns numbers, no two entries ever compute the same `sequence_number`; the unique
+  index on `(producer_id, chain_id, sequence_number)` is a backstop invariant, not the mechanism
+  that resolves contention.
+- **The fence is a lock on the lease row, not a snapshot read of its `epoch`.** A conditional
+  `INSERT … WHERE (SELECT epoch FROM lease) = :myEpoch` is **not** sufficient on a snapshot-isolation
+  engine: under PostgreSQL's default `READ COMMITTED`/`REPEATABLE READ` the sub-select reads a
+  snapshot and does not serialize the insert against a concurrent lease transfer, so two writers
+  could each read their own `epoch` as current and both append. **Stage** is therefore a transaction
+  that **locks the lease row first** and does everything under that lock:
+
+  1. `SELECT … FROM jansTraceChainLease WHERE (producer_id, chain_id) = … **FOR UPDATE**` — this is
+     the serialization point; a concurrent **Stage** or lease transfer blocks here.
+  2. Validate ownership: the locked row's `(holder_node, holder_thread, epoch)` equals this writer's,
+     and `expires_at` is in the future. If not, this writer is fenced — abort, append nothing.
+  3. Allocate `sequence_number = next_sequence`.
+  4. Insert the `jansTraceOutbox` entry `state=staged` with that `sequence_number` and `operation_id`.
+  5. Advance the cursor: `UPDATE jansTraceChainLease SET next_sequence = next_sequence + 1`.
+  6. Commit. The `FOR UPDATE` lock releases, so the next **Stage** sees the advanced cursor.
+
+  **Lease acquisition and transfer lock the same row** (`SELECT … FOR UPDATE`, then bump `epoch` and
+  rewrite `holder_*`), so a transfer and an in-flight **Stage** cannot interleave: whichever takes the
+  row lock first runs to commit; the other then sees the changed `epoch`/holder and is fenced at
+  step 2. A writer whose lease was revoked **cannot insert at all** — it fails ownership validation
+  under the lock, before any outbox row exists, so there is no fenced-but-committed record to undo.
+  (**Engine mapping.** PostgreSQL / MySQL InnoDB: `SELECT … FOR UPDATE` as above. The design targets
+  SQL only, §11.3; any future engine must provide a row lock with the same mutual-exclusion and
+  write-visibility-on-commit semantics — a snapshot read of `epoch` does not qualify.) The unique
+  index on `(producer_id, chain_id, sequence_number)` remains a backstop invariant only; a healthy
+  chain never relies on it, because the single writer under the lease lock never produces a duplicate.
 - **The record is finalized and signed once, at resolution — predecessor and outcome included.**
   The writer assigns `sequence_number` eagerly (so chain order is fixed early), but the record is
   **not built or signed** until the **Finalize-and-sign** transition (below), when its outcome has
-  resolved and its predecessor's delivered digest is known. The signature therefore covers position,
-  linkage, and outcome with no qualification — there is nothing signed before those fields exist.
+  resolved and its predecessor's **durably finalized** digest is known (finalization chains over the
+  predecessor's finalized `content_digest`, not its delivery, so local finalization proceeds during a
+  Lock outage; delivery stays ordered). The signature therefore covers position, linkage, and
+  outcome with no qualification — there is nothing signed before those fields exist.
 - **Optional signed intent (not the record's signature).** A deployment that wants a producer-signed
   artifact *at attempt time* — e.g. to prove "this issuer intended to provision credential `jti`
   under `operation_id`" before the outcome is known — MAY carry a separate **signed intent object**
@@ -2978,46 +3066,50 @@ transaction as the `operation_id`-keyed `IssuanceLog` and the `staged → commit
 | Transition | Atomic write | Precondition | Durable result | Recovery action |
 |------------|--------------|--------------|----------------|-----------------|
 | **Intake** | Insert `jansTraceIntake` keyed by `operation_id`: the entity locator (`jti`/`client_id`/`jkt`/`kind`), producer role, and the **unsigned** event content (no `sequence_number`, `prev_record_hash`, or outcome yet) | A fresh `operation_id` not already present | The operation is recorded as *attempted*; no chain position yet, so concurrent operations do not contend | If this write never landed, nothing is owed to the chain and the client simply retries. If present, proceed to **Stage** |
-| **Stage** | Journal writer inserts a `jansTraceOutbox` entry `state=staged` with the next `sequence_number`, stamped with `operation_id`, **guarded by `WHERE lease.epoch = :myEpoch`** | Writer holds the current lease `epoch`; this `operation_id` has no outbox entry | A chain position is reserved; a writer whose `epoch` is stale is rejected by the guard, so no fenced-but-committed row exists | An `operation_id` with no outbox entry under the live/advanced epoch is (re)staged by the current lease holder under its own `epoch` — journaled late, never lost or duplicated (`operation_id` is idempotent) |
-| **Commit** | **One SQL transaction in the issuer-side transaction domain** (the requirement above — all these tables in one `jans-orm` SQL database, one datasource): persist the entity with its `operation_id` + `record_id` receipt (`TokenEntity` / `Client`+`KeyEnrollment` / `AttestationAssessment`+`KeyAttestationState`); write the `operation_id`-keyed `IssuanceLog`; flip the entry `staged → committed`. The entity write is conditioned on the entry's `fence` still matching the writer's `fenceToken` | The `staged` entry exists and its `fence` is unchanged (not cancelled by recovery) | Entity, `IssuanceLog`, and `committed` flip are durable together or not at all — "this operation committed" ⇔ "its `operation_id`-keyed `IssuanceLog` exists" | Probe the `operation_id`-keyed `IssuanceLog`: **present** → promote to `committed` |
-| **Resolve-abort** | Recovery **cancels** the entry first (CAS its `fence`, invalidating the writer's `fenceToken`), then flips `staged → aborted` | Entry still `staged`; `operation_id`-keyed `IssuanceLog` absent **past `resolutionWaitSeconds`**; writer fenced | The position is terminally `aborted`; a cancelled writer's later Commit is rejected, so it cannot land behind recovery | Idempotent: re-running finds the entry already `aborted` (or already `committed` if the writer won the fence race before cancellation) |
-| **Finalize-and-sign** | **Freeze** the complete signing input the first time the entry is finalized — the canonical record (resolved `operation_outcome` with the per-(kind, subtype) identifying artifact of §11.2, `sequence_number`, `prev_record_hash` over *n-1*'s delivered `content_digest`) **plus every otherwise-generated field**: `signed_at`, the selected signing `kid`, and any nonce — persisting that frozen input on the entry. Sign it and **atomically install the resulting bytes once** via a CAS that sets `signed_bytes` only if still unset. A finalizer that loses the CAS (concurrent or post-crash retry) **adopts the stored winner's bytes** and does not re-sign | The entry is resolved (`committed` or `aborted`) and *n-1* is delivered | **One authoritative byte sequence** on the entry — not necessarily one execution of the signer | Re-finalizing re-reads the **frozen** input (so `signed_at`/`kid` do not drift) or, if bytes are already installed, adopts them; either way the stored bytes are unchanged |
-| **Deliver** | Post the stored signed bytes to Lock in `sequence_number` order; mark `delivered` on `202` or idempotent replay | The entry is resolved and signed; predecessors delivered | The record is at Lock; retries re-send identical bytes | At-least-once; Lock is keyed by `record_id`, so a retry is idempotent. A `409` (same `record_id`, different content) is an error — it cannot arise from a retry |
+| **Stage** | A transaction that **`SELECT … FOR UPDATE` on the lease row**, validates `(holder, epoch, expires_at)` ownership under that lock, allocates `sequence_number = next_sequence`, inserts the `jansTraceOutbox` entry `state=staged` stamped with `operation_id`, advances `next_sequence`, and commits | Writer owns the locked lease row (not merely read its `epoch`); this `operation_id` has no outbox entry | A chain position is reserved serially under the lock; a writer whose lease was transferred fails ownership validation and inserts nothing | An `operation_id` with no outbox entry is re-staged by the current lease holder under the same lock — journaled late, never lost or duplicated (`operation_id` is idempotent) |
+| **Commit** and **Resolve-abort** are **two competing atomic transitions on the one `jansTraceOutbox` operation row**, each a `WHERE state='staged' AND fence=:expected` conditional update — exactly one wins. | **Commit:** one SQL transaction in the issuer-side domain (all tables in one `jans-orm` SQL database): persist the entity with its `operation_id` + `record_id` receipt (`TokenEntity` / `Client`+`KeyEnrollment` / `AttestationAssessment`+`KeyAttestationState`), write the `operation_id`-keyed `IssuanceLog`, and flip `staged → committed` **conditioned on `state='staged' AND fence` unchanged** | The entry is `staged` and its `fence` is the writer's `fenceToken` | Entity, `IssuanceLog`, and `committed` flip are durable together or not at all; the conditional flip is what makes it a *competing* transition — if recovery's cancel landed first, `fence` changed and this whole transaction rolls back | Probe the `operation_id`-keyed `IssuanceLog`: **present** → the entry is (or becomes) `committed` |
+| | **Resolve-abort:** one transaction that flips `staged → aborted` **conditioned on `state='staged' AND fence=:oldFence`, bumping `fence` in the same update** (cancel and flip are one atomic step, not "cancel, then flip") | Entry `staged`; `operation_id`-keyed `IssuanceLog` absent **past `resolutionWaitSeconds`** | The position is terminally `aborted`, and because the fence bump is atomic with the flip, a Commit transaction racing it either committed first (then Resolve-abort's `WHERE state='staged'` fails and it is a no-op) or loses (its `fence` precondition now fails and it rolls back) — the two cannot both land | Idempotent: re-running finds the entry already `aborted`, or already `committed` if Commit won the race |
+| **Finalize-and-sign** | **Freeze** the complete signing input the first time the entry is finalized — the canonical record (resolved `operation_outcome` with the per-(kind, subtype) identifying artifact of §11.2, `sequence_number`, `prev_record_hash` over *n-1*'s **durably finalized** `content_digest`) **plus every otherwise-generated field**: `signed_at`, the selected signing `kid`, and any nonce — persisting that frozen input on the entry. Sign it and **atomically install the resulting bytes once** via a CAS that sets `signed_bytes` only if still unset. A finalizer that loses the CAS (concurrent or post-crash retry) **adopts the stored winner's bytes** and does not re-sign | The entry is resolved (`committed` or `aborted`) and *n-1* is **finalized** (its `content_digest` durable) — **not** necessarily *delivered* | **One authoritative byte sequence** on the entry — not necessarily one execution of the signer | Re-finalizing re-reads the **frozen** input (so `signed_at`/`kid` do not drift) or, if bytes are already installed, adopts them; either way the stored bytes are unchanged |
+| **Deliver** | Post the stored signed bytes to Lock in `sequence_number` order; mark `delivered` on `202` or idempotent replay | The entry is finalized and its predecessors are **delivered** | The record is at Lock; retries re-send identical bytes | At-least-once; Lock is keyed by `record_id`, so a retry is idempotent. A `409` (same `record_id`, different content) is an error — it cannot arise from a retry |
 
 Returning the HTTP response to the agent is **not** a transition in this table: the server cannot
 observe whether the agent received it, so no record ever claims delivery to the client — a
 persisted-but-undelivered credential is benign (the agent retries). The record attests
 *persistence*, never client receipt.
 
-**What the table is required to guarantee** (each requirement follows from a single row). The first
-three rest only on the atomic **Commit** transaction, which is settled; the last two additionally
-depend on the **fencing / crash-recovery** path still being pinned down (the acknowledged Q8 gap, see
-review history), so they are stated as **requirements the protocol must meet**, not yet as
-established facts, until that algorithm is settled and its fault test passes:
+**What the table is required to guarantee** (each requirement follows from a single row). Only the
+commit-side property rests solely on the atomic **Commit** transaction and holds unconditionally; the
+rest depend on **recovery, finalization, retained signing material, and delivery**, so they are
+stated as the **durable local obligation plus the conditions eventual delivery needs** — not as
+unconditional "no gap at Lock" facts:
 
-- **No false success** (established). A `committed` position exists only after the **Commit**
-  transaction, whose witness is the `operation_id`-keyed `IssuanceLog`; a success record is signed
-  (**Finalize-and-sign**) and delivered (**Deliver**) only for a `committed` entry. A position that
-  never committed is **Resolve-abort**'d, so no success record names an uncommitted credential.
-- **No lost evidence** (established). Once **Intake** lands, the journal writer owes the chain a
-  position (**Stage**) and a resolved outcome; a `staged` entry is never TTL-expired, only resolved
-  to `committed` or `aborted`, and both are delivered — so a committed operation always yields a
-  delivered record.
-- **No chain gap** (established). Every reserved `sequence_number` is delivered — as the success
-  record or an explicit aborted-outcome record (same `sequence_number`/`prev_record_hash`, the
-  operation's own kind/producer per §11.2). Lock never sees a hole.
-- **Non-commit must be decidable, not guessed** (requirement). Because **Commit** binds entity +
-  `IssuanceLog` + flip into one SQL transaction, a committed operation *always* left the
-  token-outliving `IssuanceLog`; the protocol therefore **requires** **Resolve-abort**'s precondition
-  — `IssuanceLog` absent past `resolutionWaitSeconds`, after fencing — to be read as proof of
-  non-commit, never "witness unavailable," and the decision to rest on the `operation_id` receipt,
-  never on a same-identifier entity from another operation. This holds once the fencing order is
-  settled (Q8).
-- **A paused writer must not race recovery** (requirement). **Resolve-abort** cancels (fences) the
-  entry before declaring a terminal outcome, and **Commit** is conditioned on the unchanged `fence`,
-  so a writer that committed before cancellation leaves the `IssuanceLog` (→ `committed`) and one
-  cancelled before committing cannot commit afterward (→ safe to abort). The exact cancel-then-resolve
-  ordering is the open part of Q8; this is the behaviour that path **must** deliver.
+- **No false success** (holds on **Commit** alone). A `committed` position exists only after the
+  **Commit** transaction, whose witness is the `operation_id`-keyed `IssuanceLog`; a success record
+  is signed (**Finalize-and-sign**) and delivered (**Deliver**) only for a `committed` entry. A
+  position that never committed is **Resolve-abort**'d, so no success record ever names an
+  uncommitted credential.
+- **Durable local evidence obligation, not guaranteed delivery.** **Every committed operation has a
+  durable local evidence obligation**: once **Intake** lands and **Stage** reserves a position, that
+  position is recorded locally and is never TTL-expired, only resolved to `committed` or `aborted`.
+  But **eventual delivery to Lock requires successful recovery, retained signing material, and
+  restored collector availability** — it is not implied by the local commit. In particular, because
+  delivery is strictly in `sequence_number` order, **an unresolved or undelivered earlier position
+  blocks delivery of every later position** until it resolves and is sent; so "no gap at Lock" is a
+  liveness property contingent on recovery completing and Lock being reachable, not a safety fact the
+  table establishes on its own. What the table *does* establish is that no position is silently
+  dropped locally: every allocated `sequence_number` is destined for delivery as either the success
+  record or an explicit aborted-outcome record (same `sequence_number`/`prev_record_hash`, §11.2).
+- **Non-commit must be decidable, not guessed** (requirement, pending the Q8 fencing/recovery
+  algorithm). Because **Commit** binds entity + `IssuanceLog` + flip into one SQL transaction, a
+  committed operation *always* left the token-outliving `IssuanceLog`; the protocol therefore
+  **requires** **Resolve-abort**'s precondition — `IssuanceLog` absent past `resolutionWaitSeconds` —
+  to be read as proof of non-commit, never "witness unavailable," and the decision to rest on the
+  `operation_id` receipt, never on a same-identifier entity from another operation.
+- **The two terminal transitions cannot both land** (requirement, pending Q8). **Commit** and
+  **Resolve-abort** are competing conditional updates on the one `staged` operation row
+  (`WHERE state='staged' AND fence=…`), and Resolve-abort bumps `fence` atomically with its flip, so
+  exactly one wins: a writer that committed first makes Resolve-abort a no-op, and a Resolve-abort
+  that landed first makes the Commit transaction's conditional flip fail and roll back.
 
 **The aborted record, so the chain is honest about what happened.** It is a signed record at the
 allocated position whose event states the operation did not complete, with
@@ -3589,8 +3681,8 @@ in the cited section.
 | One profile per record (`tag:jans.io,2026:trace-v1`); canonicalization/signing/digest from the shared `jans-trace-core` (or byte-identical to its vectors), no jans-local fork | §11.1, §11.3 |
 | Evidence before action: a durable local outbox commit is the accountable record (Lock delivery is async at-least-once); `JWT-SVID` issuance fails closed when evidence cannot be durably committed | §11.3 |
 | The staged outbox entry is the operation journal with a **three-valued** outcome (committed / not-committed / **unresolved**); recovery answers **"did *this* `operation_id` commit?"** by matching an **operation commit receipt** (`operation_id` + `record_id`) embedded in the entity (`TokenEntity`/`KeyEnrollment`/`AttestationAssessment`) or an `operation_id`-keyed `IssuanceLog` — **never** by a same-identifier entity's existence or a separate marker's absence, so a crash after the entity committed cannot void its evidence and a stray same-identifier entity cannot fake a commit. Receipt/journal retention ≥ resolution-wait + downtime + reconciliation interval | §11.3 |
-| **Chain the operation, with explicit aborted outcomes** (not "assign the position only after the outcome is known"): every allocated sequence position is delivered — a committed one as the success record, a never-committed one as a signed aborted-outcome record at the same position — so the chain Lock receives has no gap. The outcome is an `event.operation_outcome` ∈ `{committed, aborted}` discriminator on the operation's **own `event_kind`/producer** (`CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, or `EXECUTION_STARTED`/`jans-auth` for a bootstrap); the required identifying artifact is defined per **event kind × operation subtype × outcome** (§11.2 matrix), **not** by outcome alone — `credential_fingerprint` only for committed SVID issuance / key enrollment, while a committed bare-key appraisal (`attestation_id` + assessed-key `jkt`) and a committed bootstrap (execution pair + source-grant reference) carry none; `prev_record_hash` is bound at resolution over the predecessor's delivered digest; delivery is strictly in sequence order | §11.2, §11.3 |
-| Append is a **per-chain single-writer journal**, not multi-writer CAS: issuance threads write unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially; the `epoch` fence is enforced **in the authoritative guarded insert** (a stale writer cannot create a row at all); records are matched to operations by stored `operation_id`, never "adopted" from a colliding row | §11.3 |
+| **Chain the operation, with explicit aborted outcomes** (not "assign the position only after the outcome is known"): every allocated sequence position is delivered — a committed one as the success record, a never-committed one as a signed aborted-outcome record at the same position — so the chain Lock receives is gapless **once delivery completes** (a durable local obligation per position; delivery needs recovery done, signing material retained, and Lock reachable). The outcome is an `event.operation_outcome` ∈ `{committed, aborted}` discriminator on the operation's **own `event_kind`/producer** (`CREDENTIAL_PROVISIONED`/`jans-svid-issuer`, or `EXECUTION_STARTED`/`jans-auth` for a bootstrap); the required identifying artifact is defined per **event kind × operation subtype × outcome** (§11.2 matrix), **not** by outcome alone — `credential_fingerprint` only for committed SVID issuance / key enrollment, while a committed bare-key appraisal (`attestation_id` + assessed-key `jkt`) and a committed bootstrap (execution pair + source-grant reference) carry none; `prev_record_hash` is bound at resolution over the predecessor's **durably finalized** digest (not its delivery, so local finalization proceeds during a Lock outage); delivery is strictly in sequence order | §11.2, §11.3 |
+| Append is a **per-chain single-writer journal**, not multi-writer CAS: issuance threads write unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially; the fence is a **`SELECT … FOR UPDATE` lock on the lease row** (not a snapshot read of its `epoch`), under which Stage validates ownership, allocates the sequence, inserts, and advances the cursor, and lease transfer locks the same row; Commit and Resolve-abort are competing conditional updates (`WHERE state='staged' AND fence=…`) on the one operation row, exactly one wins; records are matched to operations by stored `operation_id`, never "adopted" from a colliding row | §11.3 |
 | Availability posture is per-capability-risk tier, fail-closed by default (untiered = `critical`); degraded issuance is recorded as degraded | §16.9 |
 | Trust domain is pinned on first start and never re-derived | §8 |
 | Update-token script may add but not remove the SVID's identity, binding, and correlation claims | §10.5 |
@@ -3696,10 +3788,11 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **`capability_id`** | The governance label Lock *derives* from signed `(action, resource_type)` facts — never signed by a producer (§11.5). |
 | **Settlement / Evidence Packet / lineage checkpoint** | Lock-side assurance layers (Phase 2/4), referenced for phase scoping (§11.1). |
 | **`jans-trace-core`** | The shared Rust library for canonicalization / Ed25519 signing / digest, with normative cross-language vectors (§11.3). |
-| **Outbox append protocol** | A per-chain **single-writer journal**: issuance threads enqueue unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially; the `epoch` fence is enforced in the authoritative guarded insert, so a stale writer never creates a record (§11.3). |
+| **Outbox append protocol** | A per-chain **single-writer journal**: issuance threads enqueue unordered `operation_id`-keyed intake rows; one fenced-lease journal writer per chain assigns sequence numbers serially under a **`SELECT … FOR UPDATE` lock on the lease row** (Stage validates ownership, allocates the sequence, inserts, and advances the cursor in one transaction; lease transfer locks the same row), so a stale writer never creates a record. Commit and Resolve-abort are competing conditional updates on the one operation row (§11.3). |
 | **`operation_id` / journal lease** | The per-issuance identity that ties an intake row to its chain entry (ownership is never inferred from a colliding record), and the per-chain `epoch`-fenced lease that makes exactly one writer append at a time (§11.3). |
-| **Record states `staged` / `committed` / `aborted` / `delivered`** | The outbox lifecycle: `staged` = position allocated, outcome unresolved, not yet posted; `committed` = entity confirmed, success record will be delivered; `aborted` = positive evidence of non-commit, an aborted-outcome record is delivered **at the same sequence position** so the chain has no gap; `delivered` = Lock accepted whichever record occupies the position. Every allocated position is delivered (§11.3). |
-| **`operation_outcome`** | The `event.operation_outcome` discriminator ∈ `{committed, aborted}` (default `committed`), on `CREDENTIAL_PROVISIONED` **and** `EXECUTION_STARTED` — named `operation_outcome` (not `provisioning_outcome`) because a bootstrap starts an execution rather than provisioning a credential. The required identifying artifact for a `committed` record is defined by **event kind × operation subtype × outcome** (§11.2), not by outcome alone: `credential_fingerprint` for SVID issuance / key enrollment only; `attestation_id` + assessed-key `jkt` for a bare-key appraisal; execution pair + source-grant reference for a bootstrap (§11.2, §11.3). |
+| **Record states `staged` / `committed` / `aborted` / `delivered`** | The outbox lifecycle: `staged` = position allocated, outcome unresolved, not yet posted; `committed` = entity confirmed, success record to be delivered; `aborted` = positive evidence of non-commit, an aborted-outcome record to be delivered **at the same sequence position**; `delivered` = Lock accepted whichever record occupies the position. Every allocated position carries a **durable local delivery obligation**; actual gapless delivery to Lock additionally needs recovery to complete, signing material retained, and Lock reachable (§11.3). |
+| **`operation_kind`** | The **signed wire discriminator** ∈ `{svid_issuance, key_enrollment, bare_key_appraisal, execution_bootstrap}` on every TRACE provisioning/bootstrap record. The validator selects the per-kind schema from it — the subtype is **never** inferred from which artifacts are present (impossible on an `aborted` record). Several kinds share one `event_kind`/`provisioning_kind`; `operation_kind` disambiguates them (§11.2). |
+| **`operation_outcome`** | The `event.operation_outcome` discriminator ∈ `{committed, aborted}` (default `committed`), on `CREDENTIAL_PROVISIONED` **and** `EXECUTION_STARTED` — named `operation_outcome` (not `provisioning_outcome`) because a bootstrap starts an execution rather than provisioning a credential. The required identifying artifact is keyed on the signed `operation_kind` × `operation_outcome` (§11.2), not on outcome alone: `credential_fingerprint` for committed `svid_issuance`/`key_enrollment` only; `attestation_id` + assessed-key `jkt` for a `bare_key_appraisal`; execution pair + source-grant reference for an `execution_bootstrap` (§11.2, §11.3). |
 | **Aborted-outcome record** | A signed record with `operation_outcome=aborted` (reason `not_committed`, no `credential_fingerprint`) delivered at an allocated sequence position whose operation never committed, so the hash chain Lock receives is gapless. It uses the operation's **own `event_kind` and producer key** — `CREDENTIAL_PROVISIONED`/`jans-svid-issuer` for issuance/enrollment/appraisal, `EXECUTION_STARTED`/`jans-auth` for a bootstrap — never a cross-producer kind (§11.2, §11.3). |
 | **`IssuanceLog`** | A TTL-independent witness (**keyed by `operation_id`**) proving a specific operation committed; it outlives the SVID so **token absence is never read as failed issuance**, and recovery matches it by `operation_id` rather than by credential identifiers (§11.3). |
 | **Persisted vs. delivered** | "Credential persisted" (committed by the issuer, what a record attests) vs. "response received by the client" (unobservable by the server, never asserted) (§11.3). |
