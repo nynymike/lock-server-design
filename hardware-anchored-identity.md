@@ -1153,8 +1153,13 @@ construction. Schema in `jans-linux-setup`, ORM entries for all backends, alongs
 trail joins the log's `attestationId` to this row's `assessmentId`.
 
 Every state transition is an **optimistic compare-and-set (CAS) on `revision`** of this single row
-— the same mechanism the challenge state machine already uses (section 9.3c), and the only kind of
-atomicity all backends offer (LDAP and Couchbase have no multi-entry transaction):
+— the same mechanism the challenge state machine already uses (section 9.3c). Single-entry CAS is
+the atomicity the Jans persistence abstraction (`PersistenceEntryManager`) exposes uniformly across
+every backend, so the design relies only on it. (This is a limit of the *abstraction*, not of the
+stores: Couchbase has supported multi-document ACID transactions since 6.5, and SQL has them too —
+but `PersistenceEntryManager` does not surface a portable multi-entry transaction across LDAP, SQL,
+and Couchbase, so the design does not depend on one.) Keeping all of a key's state in one row means
+single-entry CAS is also all the design *needs*:
 
 | Transition | Who writes it | The CAS |
 |------------|---------------|---------|
@@ -2211,25 +2216,36 @@ credential's own commit is established.** An outbox entry has three states:
 |------|-------|-----|
 | 1 | Build the record *as if the action succeeds* (`credential_fingerprint` is the SVID `jti`, known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later; signing early does **not** publish it |
 | 2 | Insert the outbox entry `state=staged` via the append protocol (unique position, tail CAS, fence) | Allocates the durable chain position. If it fails after the retry cap, the action is refused `503 evidence_unavailable` and nothing else is written |
-| 3 | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`) **and the `IssuanceLog` marker keyed by `record_id`** together | On SQL, steps 2–3 are **one transaction**, so the entry is born `committed` and the `IssuanceLog` is atomic with it. On LDAP / Couchbase (no multi-entry transaction) the entity and `IssuanceLog` are written before the step-4 flip, so recovery can read the marker |
-| 4 | **Promote the entry `staged → committed`** once step 3 is confirmed durable. On SQL this is implicit in the shared transaction; on LDAP / Couchbase it is a CAS flip on the outbox row *after* the entity write returns success | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves a `staged` entry that is never delivered |
+| 3 | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`) **and the `IssuanceLog` marker keyed by `record_id`**, each durable before step 4 | The `IssuanceLog` is the positive proof of commit recovery reads. These are separate single-entry writes through `PersistenceEntryManager` (see below on why the design does not assume a multi-entry transaction) |
+| 4 | **Promote the entry `staged → committed`** once step 3's writes are confirmed durable — a CAS flip on the outbox row *after* the entity and `IssuanceLog` writes return success | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves a `staged` entry that recovery resolves from the `IssuanceLog` |
 | 5 | Return the HTTP response | The client may or may not receive it; the record already says only "persisted," so a lost response changes nothing |
 | 6 | Emitter posts `committed` entries to Lock, marks `delivered` on `202` **or** on an idempotent-replay acceptance (Lock already has `record_id`) | At-least-once; Lock is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is never expected and is surfaced as an error, not treated as delivered |
 
 So a `staged` entry whose entity write never committed is **never published** — the false-success
-window is closed. The cost is one extra state flip on the two-write backends; the SQL path pays
-nothing because the flip is the transaction commit itself.
+window is closed.
+
+**Why staging rather than one transaction.** The outbox insert (step 2), the entity + `IssuanceLog`
+writes (step 3), and the promotion flip (step 4) are **separate single-entry writes**, not one
+atomic unit. This is deliberate and is a property of the *abstraction*, not the datastores: all
+three supported backends can do multi-item atomicity in their native API — SQL has transactions, and
+**Couchbase has supported distributed multi-document ACID transactions since 6.5** — but the Jans
+`PersistenceEntryManager` does not expose a portable multi-entry transaction spanning LDAP, SQL, and
+Couchbase (LDAP has no general multi-entry transaction to expose). Rather than fork the persistence
+path per backend, the design assumes only single-entry CAS everywhere and makes correctness rest on
+the `staged → committed` commit point plus the `IssuanceLog` marker, which recover the same outcome
+on every backend. A deployment on SQL or Couchbase MAY wrap steps 2–4 in a native transaction as an
+optimization (the flip then coincides with commit), but correctness never depends on it.
 
 Crash recovery: on startup the emitter **resolves every `staged` entry before delivering anything**.
 For each `staged` entry it checks whether the named credential actually committed — not by token
-presence (see below) but by a **durable issuance-fact marker** written in the same step-3
-transaction/write: an `IssuanceLog` row keyed by the record's `record_id` (and carrying the SVID
-`jti`, `client_id`, `jkt`, and `issued_at`). The `IssuanceLog` is **not** the token and does **not**
+presence (see below) but by a **durable issuance-fact marker** written in step 3: an `IssuanceLog`
+row keyed by the record's `record_id` (and carrying the SVID `jti`, `client_id`, `jkt`, and
+`issued_at`). The `IssuanceLog` is **not** the token and does **not**
 share the token's TTL; it is retained for `issuanceLogRetentionSeconds` (default ≥ the longest
 reconciliation interval, independent of SVID lifetime). Resolution:
 
 - `IssuanceLog` present → the entity committed; promote `staged → committed` and deliver. (This
-  recovers the LDAP/Couchbase crash between step 3 and step 4.)
+  recovers a crash between step 3 and step 4 on any backend.)
 - `IssuanceLog` absent → the entity write did not commit; the `staged` entry is a record for an
   action that never happened. It is **discarded** (moved to `voided`, retained for audit), never
   delivered. No compensating "provisioned" record is emitted, because nothing was provisioned.
@@ -2439,7 +2455,7 @@ above helpers, no section-divider comments. Third parties never appear in unit t
 | `IdJagServiceTest` (extend) | `txn` minted; continuation only with the flag; **human-assurance gate (§10.9):** ID-JAG refused (`human_assurance_insufficient`) when `idJagRequirePhishingResistant=true` and the subject `amr` has no phishing-resistant method, or when `acr` is below `idJagMinAcr`, or `amr` is outside `idJagAllowedAmr`; `acr`/`amr`/`auth_time`/`sid`/`sessionIssuer` copied from the subject token onto the ID-JAG and the execution registry |
 | `TraceRecordBuilderTest` | envelope; **canonicalization, signature, and `content_digest` are byte-identical to `jans-trace-core`'s normative vectors** (run the shared vectors through this producer's path and assert equality with the Rust/Lock output — the cross-language conformance bar); signature verifies; **role→key selection** (`CREDENTIAL_PROVISIONED` signed with the `jans-svid-issuer` key, `EXECUTION_STARTED` with the `jans-auth` key; a `CREDENTIAL_PROVISIONED` is never signed with the `jans-auth` key); records carry `eat_profile: tag:jans.io,2026:trace-v1` only; no token material in `tokens[]`; `bundle_hash` changes when any listed input changes (server config, verifier profile or its JWKS, script revision / source / attributes, client overrides) and is stable otherwise; `verifier_api_key` appears only as a digest |
 | `TraceChainStateTest` | **append protocol (§11.3):** two concurrent writers computing the same sequence — exactly one unique-insert survives, the loser re-reads the tail and retries at the next position (no duplicate `(producer_id, chain_id, sequence_number)`, no fork); tail CAS loser that already inserted keeps its valid record; `prev_record_hash` links; zero hash first; **fence:** a stale-`epoch` writer's tail CAS is rejected, not forked onto the chain; tail rebuilt from the outbox's highest sequence after loss and `epoch` bumped; retry cap exhaustion → `evidence_unavailable` / `fail-open` path; the `jans-svid-issuer` and `jans-auth` chains advance **independently** and never share a chain position |
-| `TraceEmitterTest` | **hold-until-commit (§11.3):** a `staged` entry is **never posted**; only `committed` entries are delivered; on SQL the entry is born `committed` in the shared transaction, on LDAP/Couchbase the `staged → committed` flip follows a confirmed entity write; **crash recovery:** a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an **absent** `IssuanceLog` is `voided` and never delivered (no false success); inline mode posts after the commit point, never before; outbox retry; `202` and idempotent-replay both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
+| `TraceEmitterTest` | **hold-until-commit (§11.3):** a `staged` entry is **never posted**; only `committed` entries are delivered; the `staged → committed` flip follows a confirmed entity + `IssuanceLog` write on every backend (and, where a deployment wraps steps 2–4 in a native SQL/Couchbase transaction, the flip coincides with commit); **crash recovery:** a `staged` entry with a present `IssuanceLog` is promoted and delivered, one with an **absent** `IssuanceLog` is `voided` and never delivered (no false success); inline mode posts after the commit point, never before; outbox retry; `202` and idempotent-replay both mark delivered; a `409` (same `record_id`, different content) surfaces as an error and is **not** treated as delivered; full-outbox `fail-closed` / `fail-open`; `coverage_gap` marker |
 | `IssuanceReconciliationTest` | token **absence is not treated as failed issuance** — an SVID whose `IssuanceLog` is present but whose `TokenEntity` has expired/been deleted is **not** flagged (it was issued and aged out); only a `committed`/`delivered` record with a **missing** `IssuanceLog` is an orphan and draws a compensating `CREDENTIAL_PROVISIONED` (`not_persisted`, `supersedes_credential_fingerprint`, `parent_record_ids`); the `IssuanceLog` outlives the SVID TTL by `issuanceLogRetentionSeconds` |
 
 Integration tests (`jans-auth-server/client`, disabled by default in `testng.xml` like the SPIFFE
@@ -2664,9 +2680,11 @@ lost.
 The CAS/lease mechanisms (challenge state 9.3c, the single-row `KeyAttestationState` revision CAS
 for supersession and issuance 9.7/10.4) and the outbox-before-action commit (11.3) MUST be
 validated on **every supported backend** — SQL, LDAP, Couchbase, and clustered deployments —
-because their transactional semantics differ (SQL has multi-entry transactions; LDAP/Couchbase use
-single-entry CAS, which is all this design needs because all attestation state for a key lives in
-one row). Fault tests MUST cover: a node crash between the outbox write and entity persistence
+because what the datastores natively support and what the Jans `PersistenceEntryManager` abstraction
+portably exposes differ. The abstraction surfaces only single-entry CAS uniformly (even though SQL
+and Couchbase both have native multi-item transactions), so the design assumes single-entry CAS
+everywhere — which is all it needs, because all attestation state for a key lives in one row and the
+outbox relies on the staging commit point rather than a cross-entry transaction (11.3). Fault tests MUST cover: a node crash between the outbox write and entity persistence
 (reconciliation emits the compensating record, 11.3); the **rejection-vs-in-flight-issuance race**
 — a `contraindicated` and a concurrent `/token` contending for the same `(client_id, jkt)` row,
 asserting the issuance's `revision` CAS fails when the rejection commits first and that no
@@ -3092,8 +3110,10 @@ Accepted, and specified in full in section 11.3 along three axes the first draft
   lost-CAS / lost-insert both **retry** at the re-read tail up to `traceOutboxAppendMaxRetries`,
   after which the write fails like any outbox-write failure.
 - **Hold delivery until commit.** The signed record is **staged**, not published, until the
-  credential's entity write is confirmed committed (one transaction on SQL; a `staged → committed`
-  CAS flip after the entity write on LDAP/Couchbase). The emitter **never** posts a `staged` entry,
+  credential's entity write is confirmed committed (a `staged → committed` CAS flip after the entity
+  write on every backend, since the `PersistenceEntryManager` abstraction exposes only single-entry
+  CAS portably even though SQL and Couchbase have native multi-item transactions). The emitter
+  **never** posts a `staged` entry,
   so a record is never delivered for a credential that was not persisted — closing the
   **false-success-evidence** hole where a signed "provisioned" record could reach Lock after the
   entity write failed. "Persisted credential" and "response received by the client" are explicitly
