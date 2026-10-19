@@ -125,11 +125,14 @@ back atomically, never partially).
   - **Enrollment (§9.5):** steps 1–6 are one SQL transaction (`KeyEnrollmentClaim` insert →
     `KeyEnrollment` → `KeyAttestationState` init → client attribute). Inject a crash after each
     write and assert the transaction **rolls back atomically** — none of the entities exist and the
-    client can re-register cleanly; a crash after commit leaves the full enrollment and a re-register
-    finds the claim with its own `operationId` and is an idempotent no-op. **Concurrency:** two
-    enrollments with the same `attestation_id` for different clients run concurrently; the first to
-    commit wins and the second's claim insert violates the unique constraint and its whole
-    transaction rolls back (`assessment_already_enrolled`) — exactly one binding exists.
+    client can re-register cleanly; a crash after commit leaves the full enrollment, and a
+    **client-visible-idempotency** retry (same `attestation_id`, same `client_id`, DPoP proof over
+    the same `K` == the claim's `claimedJkt`) **replays** the committed enrollment result without
+    re-running the transaction — asserted *without* the client knowing the server-internal
+    `operationId`. **Concurrency:** two enrollments with the same `attestation_id` for different
+    clients run concurrently; the first to commit wins and the second's claim insert violates the
+    unique constraint and its whole transaction rolls back (`assessment_already_enrolled`) — exactly
+    one binding exists.
   - **Issuance / enrollment / appraisal (§11.3 transitions):** crash after **Intake**, after **Stage**
     (the journal insert, `staged`), after the **Commit** entity transaction (entity carrying its `operation_id` commit
     receipt + `operation_id`-keyed `IssuanceLog` + `staged → committed` flip, all one SQL
@@ -191,7 +194,20 @@ back atomically, never partially).
   `KeyEnrollment` binding and an initialized `KeyAttestationState`) and the other is refused
   `assessment_already_enrolled` — interleaving the two at the claim insert, so the
   guarantee holds by the conflicting write and not by a lookup that can be stale. A retry of the
-  winner (same `operationId`) is an idempotent no-op; a retry of the loser stays refused.
+  winner — re-presenting the same `(attestation_id, K)`, **not** any server-internal `operationId` —
+  **replays** the committed enrollment; a retry of the loser (different `client_id`, same
+  `attestation_id`) stays refused `assessment_already_enrolled`; a request presenting the winner's
+  `attestation_id` but a proof key ≠ the claim's `claimedJkt` is refused (a party that only learned
+  the `attestation_id` cannot drive the idempotent path).
+- **Enrollment HTTP-retry idempotency (§9.5).** Simulate a **lost `/register` response**: run the
+  enrollment to commit, discard the response, and re-send the **identical** request — same
+  `attestation_id`, same `client_id`, DPoP proof over the same `K`. Assert the retry **replays** the
+  committed enrollment (same `client_id` registration returned, no second `KeyEnrollment` /
+  `KeyAttestationState`, no second TRACE record), **without** the client supplying the internal
+  `operationId`. Assert the idempotency key is `(attestation_id, K)`: a retry with the same
+  `attestation_id` but a **different** proof key is refused, and a retry after the claim's retention
+  window (which spans the enrollment's life, so effectively always) still replays. Assert a retry of
+  a transaction that **crashed before commit** (no claim persisted) re-runs fresh and commits.
 - **Plural in-flight after rejection (flag off).** Several concurrent `/token` calls that pass
   `stillCurrent(r)` before a rejection commits all complete; assert the count is bounded by
   concurrency (not unbounded re-issuance), that every subsequent call is refused, and that with

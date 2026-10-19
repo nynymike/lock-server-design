@@ -1290,7 +1290,7 @@ The claim replaces the lookup with a write that one and only one enroller can wi
 
 | Step | What | Property |
 |------|------|----------|
-| 1 | **Claim the assessment atomically by `attestation_id`.** Insert a `KeyEnrollmentClaim` entity (`ou=keyEnrollmentClaims`, `jansEnrollClaim`; **key `attestationId`**) recording `{ attestationId, claimingClientId, operationId, claimedAt }` as an **insert conditioned on absence** (a unique constraint on `attestationId`), as the first write of the enrollment transaction. It makes "this assessment is bound to exactly one enrollment" a uniqueness guarantee the transaction cannot violate: if a row already exists for this `attestation_id`, the insert fails the constraint, the whole transaction rolls back, and enrollment is refused (`invalid_client_metadata`, `assessment_already_enrolled`) — *unless* the existing claim names this same `operationId`, in which case this is an idempotent retry of our own committed enrollment. Two concurrent enrollers naming the same `attestation_id` therefore race on this one insert; exactly one transaction commits | Uniqueness is enforced by the write that conflicts, not by a lookup that can be stale under concurrency — the race cannot produce two bindings |
+| 1 | **Claim the assessment atomically by `attestation_id`.** Insert a `KeyEnrollmentClaim` entity (`ou=keyEnrollmentClaims`, `jansEnrollClaim`; **key `attestationId`**) recording `{ attestationId, claimingClientId, claimedJkt, operationId, claimedAt }` as an **insert conditioned on absence** (a unique constraint on `attestationId`), as the first write of the enrollment transaction. It makes "this assessment is bound to exactly one enrollment" a uniqueness guarantee the transaction cannot violate: if a row already exists for this `attestation_id`, the insert fails the constraint, the whole transaction rolls back, and the request is resolved by the **client-visible idempotency rule** below — the same client re-presenting the same `(attestation_id, K)` gets its committed enrollment back; a *different* client is refused (`invalid_client_metadata`, `assessment_already_enrolled`). Two concurrent enrollers naming the same `attestation_id` therefore race on this one insert; exactly one transaction commits. (`operationId` is a server-internal id for cross-table recovery matching only — it is **not** the idempotency key the client presents.) | Uniqueness is enforced by the write that conflicts, not by a lookup that can be stale under concurrency — the race cannot produce two bindings |
 | 2 | **Verify the registration proof against the assessed key.** `validateAttestation()` has already checked `status=affirming`, unexpired, `purpose=enroll`, `attested_jkt ∈ jwks`, and the `/register` **DPoP proof key == `attested_jkt`**. This proof — not the assessment's `supersedesEligible` — is the authorization to initialize state for this key | The registrant demonstrably holds `K`; a third party who merely learned an `attestation_id` cannot enroll around it |
 | 3 | **Preserve the original assessment unchanged.** The `AttestationAssessment` is **immutable** (§9.7); `clientId` is **not** written back onto it | The evidence log stays append-only and re-verifiable exactly as appraised |
 | 4 | **Create a separate enrollment binding.** A new `KeyEnrollment` entity (`ou=keyEnrollments`, `jansKeyEnroll`; key `(clientId, jkt)`) records `{ clientId, jkt, attestationId, operationId, enrolledAt, enrolledByProofJti }` — the durable link from this client+key to the assessment that justified it, kept **outside** the immutable assessment. It carries the same `operationId` as the claim so recovery can match binding to claim | The client↔key↔assessment binding lives in its own mutable-by-append record, not by mutating evidence |
@@ -1311,10 +1311,44 @@ state to reconcile. The two concerns the transaction keeps separate are:
   wins, and the second's insert violates the unique constraint and its whole transaction rolls back
   (`invalid_client_metadata`, `assessment_already_enrolled`). Uniqueness is decided by the
   conflicting write, not by a lookup.
-- **Idempotence** on retry: because the claim carries the `operationId`, a client that re-registers
-  after a committed enrollment finds the claim already present with its own `operationId` and the
-  transaction is a no-op success; a crash before commit left nothing, so the client simply
-  re-registers and the transaction runs fresh.
+- **Idempotence on an HTTP retry — keyed by what the client actually holds, not the internal
+  `operationId`.** After a lost `/register` response the client has **no** way to know the
+  server-allocated `operationId` (it is a fresh internal UUID the client never saw), so idempotency
+  cannot hinge on it. The client *does* hold a stable, authenticated key for this enrollment: the
+  **`attestation_id`** it received from `/attestation`, together with possession of **`K`**. These
+  are the idempotency key, and a retry re-presents exactly the same request:
+  - **Authenticated idempotency key:** the `attestation_id` (the `attestation` DCR parameter). It is
+    *authenticated* because the same request carries the **DPoP proof over `K`** (step 2), and the
+    claim records the `claimedJkt` it was first enrolled under; a retry is honoured only when the
+    presented proof key equals the claim's `claimedJkt`, so a party that merely learned an
+    `attestation_id` cannot drive the idempotent path. (This is the same key-possession binding the
+    enrollment already requires, reused as the idempotency binding — no new secret.)
+  - **Request binding:** the retry MUST name the same `attestation_id`, resolve to the same
+    `client_id`, and prove possession of the same `K`. The server compares the incoming request
+    against the existing `KeyEnrollmentClaim`:
+    - same `attestation_id` + same `claimingClientId` + proof key == `claimedJkt` → **replay**:
+      return the already-committed enrollment result (`200`/`201` with the same `client_id`
+      registration) without re-running the transaction. A no-op success.
+    - same `attestation_id` but a **different** `claimingClientId` (or a proof key ≠ `claimedJkt`) →
+      **conflict**: `400 invalid_client_metadata`, `assessment_already_enrolled` — the assessment is
+      already spoken for by another client; this is not a retry.
+  - **Crash before commit** left no claim at all (the transaction rolled back atomically), so a
+    retry simply re-runs the enrollment transaction fresh under the same `(attestation_id, K)` and
+    commits — the first attempt that reaches commit wins, later retries replay it.
+  - **Retention and replay window:** the `KeyEnrollmentClaim` is retained for the life of the
+    enrollment it records (it is the durable record that the assessment was consumed, §9.5), so the
+    idempotent-replay answer is available for as long as the client could meaningfully retry and
+    well beyond — there is no short idempotency-key TTL to miss. Because the key is the
+    client-held `(attestation_id, K)` and the claim is permanent, a retry is deterministic whether it
+    arrives seconds or days after the lost response. An `attestation_id` whose assessment expired
+    before any enrollment committed never produced a claim; the client re-attests (cheap, §9.5) and
+    enrolls with a fresh `attestation_id`.
+
+  An optional client-chosen **`Idempotency-Key` request header** MAY additionally be accepted and
+  stored on the claim for deployments that prefer an explicit key; when present it must agree with
+  the `(attestation_id, client_id, K)` binding above, and it does not replace it (a client that
+  omits the header still gets correct idempotency from `(attestation_id, K)`). v1 relies on
+  `(attestation_id, K)` alone.
 
 Existing `ClientRegistrationType` scripts still run after the gate and can read
 `context.getAttestationAssessment()`.
@@ -3689,7 +3723,7 @@ This plan spans six vocabularies. The short definitions below are scoped to how 
 | **`AttestationAssessment` (`attestation_id`)** | An immutable, append-only evidence-log entry: one attestation verdict as appraised at a point in time. Never mutated; not read for issuance (§9.7). |
 | **`KeyAttestationState`** | The **single authoritative row per `(client_id, jkt)`**, carrying the current verdict and a monotonic `revision`. **Initialized** by the enrollment transaction (authorized by the DCR proof over `K`); thereafter **overwritten** only by a supersession-eligible verdict under CAS; issuance reads it, and the `revision` CAS serializes rejection against in-flight issuance (§9.5, §9.7, §10.4). |
 | **`KeyEnrollment`** | The separate binding `(clientId, jkt) → attestationId` created at enrollment, recording which client+key the assessment justified — kept outside the immutable `AttestationAssessment` so evidence is never mutated (§9.5). |
-| **`KeyEnrollmentClaim`** | The **atomic uniqueness mechanism** for enrollment: a row keyed by `attestation_id` (not `(clientId, jkt)`), inserted conditioned on absence as step 1 of the enrollment transaction. It is the single serialization point that makes "this assessment is spoken for" a write that one and only one enroller can win, so concurrent registrations naming the same `attestation_id` for different clients cannot both succeed (the second's insert violates the unique constraint and its transaction rolls back). Carries `operationId` so a crash-free retry of the same committed enrollment is an idempotent no-op (§9.5). |
+| **`KeyEnrollmentClaim`** | The **atomic uniqueness mechanism** for enrollment: a row keyed by `attestation_id` (not `(clientId, jkt)`), inserted conditioned on absence as step 1 of the enrollment transaction. It is the single serialization point that makes "this assessment is spoken for" a write that one and only one enroller can win, so concurrent registrations naming the same `attestation_id` for different clients cannot both succeed (the second's insert violates the unique constraint and its transaction rolls back). Records `claimingClientId` and `claimedJkt`; the **client-visible idempotency key is `(attestation_id, K)`** — a lost-response retry presenting the same `attestation_id` and proving possession of the same `K` **replays** the committed enrollment, a different client is refused `assessment_already_enrolled`. `operationId` is a server-internal id for cross-table recovery matching only, never the client's idempotency key (§9.5). |
 | **`supersedesEligible`** | Whether a verdict may **overwrite** an existing client's authoritative `KeyAttestationState` — true only with proof of possession of `K`. It does **not** govern enrollment **initialization** of a key's first state, which the DCR proof authorizes instead; a non-eligible verdict is evidence only and can never overwrite state or block issuance (§9.3, §9.5, §10.4). |
 | **`appraisalGeneration`** | A strictly monotonic per-key number stamped on each challenge, carried to the assessment and state row. It orders *evidence* (which appraisal is newer), as distinct from `revision` which orders *writes*. A state overwrite lands only with a strictly newer generation, so a slow stale appraisal cannot restore approval over a newer rejection (§9.3, §10.4). |
 | **`revision` vs `appraisalGeneration`** | Two orders on `KeyAttestationState`: `revision` serializes concurrent *writes* (the CAS token); `appraisalGeneration` is the precedence of the *evidence* a write carries. Both are needed — CAS alone orders writes but not which evidence should win (§10.4). |

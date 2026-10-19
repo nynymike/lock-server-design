@@ -38,6 +38,7 @@ non-**resolved** guarantee as proven.
 | Q17 / Q21 — outcome wire contract | outcome records validate per **event kind × operation subtype × outcome**; bootstrap aborts under the right key | per-(subtype × outcome) schema fixtures; identifying artifact per the matrix (fingerprint only for SVID issuance/enrollment; appraisal and bootstrap carry none); bootstrap abort as `EXECUTION_STARTED`/`jans-auth`, rejected as `CREDENTIAL_PROVISIONED`; Lock-schema compatibility confirmed |
 | Q13 / Q22 — appraisal single-transaction commit | assessment + state write-through + `completed` + evidence commit atomically; no window where a negative verdict is durable while issuance reads the old positive state | single-transaction fault test (crash during verifier call / mid-transaction leaves nothing durable; fenced worker aborts at the lease re-check; superseded-generation skips write-through; `none`-outage writes evidence only) |
 | Q15 / Q23 — key-replacement wire format | the key change is an RFC 7592 `PUT`; old-key auth, new-key possession, and the signed mutation occupy distinct, defined locations | `RegisterValidatorTest` (`htm=PUT` accepted, `POST` rejected; `attested_key_pop` body member; `change_digest` on both proofs matches the body, mismatch → `key_change_not_signed`) |
+| Q15 / Q24 — enrollment HTTP-retry idempotency | a lost-response retry keyed by client-held `(attestation_id, K)` replays the committed enrollment; a different client or wrong key is refused | enrollment HTTP-retry idempotency (lost-response replay without the internal `operationId`; `attestation_id` + proof-key == `claimedJkt` binding; crash-before-commit re-runs fresh) |
 
 These become **resolved** when the named tests pass. The entries below describe the raised question
 and the change; the status marker on each says whether verification is complete.
@@ -373,6 +374,14 @@ key (`htm=POST`/`htu`/`iat`/`jti`, `jwk` thumbprint = `attested_jkt`, carried as
 > a `change_digest` on both so the exact mutation is signed (DPoP/`private_key_jwt` do not sign the
 > body).
 
+> **Retry-idempotency mechanism superseded by Q24.** This round made the retry hinge on the claim's
+> `operationId`, but that is a server-internal id the client never sees — after a lost `/register`
+> response the caller cannot present it. Q24 replaced it with a client-visible authenticated
+> idempotency key, `(attestation_id, K)`: a retry re-presents the same `attestation_id` and proves
+> possession of the same `K`, which replays the committed enrollment. (`operationId` remains an
+> internal cross-table recovery id only. The `pending`/`committed` claim lifecycle this round
+> described was separately removed by the SQL-only single-transaction change, Q18.)
+
 ## Q16. Recovery conflated "an entity exists" with "this operation committed"
 
 **Status: partially resolved** — operation-receipt rule specified (§11.3); guarantee pending the
@@ -629,6 +638,38 @@ key change, an **RFC 7592 `PUT`** (`htm=PUT`, not `POST`):
 (including a test that `htm=PUT` is required and that a valid authentication with a `change_digest`
 naming a different `target_jkt` than the body is refused).
 
+## Q24. Enrollment retry idempotency had no client-visible key
+
+**Status: resolved** — the idempotency key is the client-held `(attestation_id, K)`, with request
+binding, retention, and replay behaviour defined (§9.5).
+
+**Raised.** Q15 made an enrollment retry idempotent "because the claim carries the `operationId`" —
+a retry would "find the claim already present with its own `operationId`." But `operationId` is a
+**server-internal fresh UUID** the client never sees; after a lost `/register` response the caller
+has no way to present its original `operationId`, and a fresh registration would allocate a new one.
+A stored `operationId` makes server-internal cross-table recovery idempotent but does **not** make
+an HTTP retry idempotent.
+
+**Change (§9.5, appendix).** Defined a **client-visible, authenticated idempotency key**: the
+**`attestation_id`** the client already received from `/attestation`, bound to **possession of `K`**.
+
+- **Authentication / request binding.** The retry re-presents the same `attestation_id`, resolves to
+  the same `client_id`, and carries the **DPoP proof over `K`** the enrollment already requires; the
+  `KeyEnrollmentClaim` records the `claimedJkt` it was first enrolled under, and the idempotent path
+  is taken only when the presented proof key equals `claimedJkt`. So a party that merely learned an
+  `attestation_id` cannot drive it — the idempotency binding reuses the existing key-possession
+  proof, no new secret.
+- **Replay behaviour.** Same `attestation_id` + same `client_id` + proof key == `claimedJkt` →
+  **replay** the committed enrollment result without re-running the transaction; same
+  `attestation_id` but a different `client_id` (or wrong key) → `assessment_already_enrolled`; no
+  claim (crash before commit) → re-run fresh.
+- **Retention.** The `KeyEnrollmentClaim` persists for the life of the enrollment, so the
+  replay answer outlives any plausible retry — there is no short idempotency-key TTL to miss.
+
+An optional client-chosen `Idempotency-Key` header MAY be stored on the claim and must agree with the
+`(attestation_id, client_id, K)` binding; v1 relies on `(attestation_id, K)` alone. The internal
+`operationId` is retained only as a cross-table recovery-matching id, never the client's key.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
@@ -650,5 +691,7 @@ operation subtype × outcome with the field renamed `operation_outcome` (Q21, wh
 too-coarse "committed ⇒ fingerprint" rule), the §9.3c/§11.3 unified appraisal commit (Q22), the
 §9.5 key-replacement RFC 7592 `PUT` wire format (old-key auth in the `DPoP` header, new-key
 `attested_key_pop` body member, `change_digest` signing the mutation; Q23, which corrected the
-two-proofs-one-header / hard-coded-`POST` defects), and the §16.1 key-revocation delay). This history
-preserves the original questions that drove them; for current behaviour, read the main document.
+two-proofs-one-header / hard-coded-`POST` defects), the §9.5 enrollment-retry idempotency key
+`(attestation_id, K)` (Q24, which replaced the client-invisible `operationId` retry rule), and the
+§16.1 key-revocation delay). This history preserves the original questions that drove them; for
+current behaviour, read the main document.
