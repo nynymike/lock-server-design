@@ -123,12 +123,15 @@ exhaustion.
 
 **Change.** §11.3 specifies three axes:
 
-- **Append protocol.** Each `(producer_id, chain_id)` is one serial chain per node; a unique index
-  on `(producer_id, chain_id, sequence_number)` makes a position un-double-writable; a per-chain
-  tail pointer carrying `{ next_sequence, epoch }` is advanced by CAS with the outbox unique-insert
-  as the authority; `epoch` fences a stale thread after an operator repair; lost-CAS / lost-insert
-  retry up to `traceOutboxAppendMaxRetries`. (A later round removed the cached `tail_record_hash`;
-  see the gapless-chain note below.)
+- **Append protocol.** The first answer used a multi-writer unique-index + tail-CAS scheme. Two
+  further rounds found it unsound — the fence was checked *after* the authoritative insert (a stale
+  writer could commit a record then merely fail its tail update), and a writer that lost the insert
+  "adopted" a colliding record without proving it belonged to the same operation. The current
+  design (§11.3) replaces it with a **per-chain single-writer journal**: issuance threads write
+  unordered `operation_id`-keyed intake rows and never contend for a chain position; one
+  fenced-lease journal writer per chain assigns sequence numbers serially; the `epoch` fence is
+  enforced *in* the authoritative guarded insert (a stale writer cannot create a row at all); and a
+  record is matched to its operation by stored `operation_id`, never adopted.
 - **Hold delivery until commit.** The signed record is `staged`, not published, until the
   credential's entity write is confirmed committed (a `staged → committed` CAS flip), closing the
   false-success-evidence hole. "Persisted credential" and "response received by the client" are
