@@ -18,7 +18,7 @@ its guarantee as proven until its tests pass on every backend.
 | Item | Guarantee awaiting test | Tests |
 |------|-------------------------|-------|
 | Q3 — single-row attestation state | a rejection is authoritative; no issuance resurrects an overwritten approval | delayed-positive-after-rejection; crash-point on the state write |
-| Q8 — staged-commit evidence durability | no persisted credential lacks evidence; no false-success record | crash-point between every durable write (issuance steps 2–5) |
+| Q8 — staged-commit evidence durability | no persisted credential lacks evidence; no false-success record; absence never classified as abort; a paused writer cannot commit after recovery | crash-point between every durable write (issuance steps 2–5); paused-writer-resume-after-cancel; LDAP committed-then-token-deleted → `indeterminate` |
 | Q10 — enrollment transaction | first-enrollment state initialization; idempotent redo | first-enrollment init; crash between `KeyEnrollment` and state init |
 | Q11 — evidence precedence / plural in-flight | stale positive never restores approval; bounded in-flight exposure | delayed-positive-after-rejection; plural-in-flight |
 | Q6 (chain), Q8 — gapless chain under abort | voided/aborted middle position leaves no gap | voided/aborted middle-record chain test |
@@ -140,8 +140,10 @@ concurrent claim gets `challenge_in_progress` without a fresh nonce; `completed`
 
 ## Q8. Evidence durability was only partially specified
 
-**Status: partially resolved** — algorithm and failure behaviour specified (§11.3); guarantee
-pending the crash-point-between-every-durable-write and voided/aborted-middle-record tests.
+**Status: partially resolved** — algorithm and failure behaviour specified (§11.3), including the
+embedded issuance fact, the `indeterminate` outcome, and writer cancellation/fencing; guarantee
+pending the crash-point-between-every-durable-write, voided/aborted-middle-record, and
+paused-writer-resume-after-cancel tests.
 
 **Raised.** Updating chain state and the outbox together prevents some chain failures but does not
 ensure every successful issuance has an evidence record unless issuance and evidence persistence
@@ -163,14 +165,16 @@ exhaustion.
   credential's entity write is confirmed committed (a `staged → committed` CAS flip), closing the
   false-success-evidence hole. "Persisted credential" and "response received by the client" are
   distinguished; the record attests only the former.
-- **Reconciliation on the entity, not token absence.** A later review round found that treating a
-  separate marker's *absence* as proof of non-commit introduced a new crash gap (entity committed,
-  marker not yet written → evidence wrongly voided). The current design (§11.3) makes the `staged`
-  outbox entry a **three-valued** operation journal (committed / not-committed / unresolved) and
-  resolves it by probing the **authoritative entity** the record names, binding the entity write
-  and the commit flip in one native transaction on SQL/Couchbase. A missing marker means
-  *unresolved* (retry), never *nothing happened*; retention covers unresolved operations and
-  downtime.
+- **Reconciliation witness, embedded in the entity; indeterminate when undecidable.** Successive
+  rounds found that any *separate* marker could be lost after the entity committed, so absence of
+  the marker was mistaken for non-commit. The current design (§11.3) embeds the issuance fact
+  **inside the `TokenEntity`** (one atomic write, no separate marker to miss), retains a
+  token-outliving witness (`IssuanceLog` in the entity transaction on SQL/Couchbase; optionally the
+  retained entity on LDAP), and **classifies the still-ambiguous LDAP case as `indeterminate`, never
+  `aborted`** — absence never proves non-commit. A paused writer is **fenced by cancellation**
+  before recovery records any terminal outcome, so it cannot commit after recovery acts. A longer
+  wait is explicitly *not* a disambiguator. Outcomes are four-valued: committed / aborted
+  (decidable non-commit only) / indeterminate / unresolved.
 - **Gapless chain: aborted positions are delivered, not dropped.** A further round noted that a
   sequence number is allocated at stage time, so a never-committed position that was simply voided
   would leave a hole in the chain Lock receives. The design now chooses the **"chain the operation

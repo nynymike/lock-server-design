@@ -2681,8 +2681,9 @@ has these states:
 |-------|---------|------------------------------------|
 | `staged` | Outbox row inserted (sequence number taken, append protocol above); the credential entity's commit is **not yet confirmed** — the outcome is **unresolved**, not "failed" | **Not yet.** The emitter never posts a `staged` entry; it resolves it first |
 | `committed` | The entity commit is confirmed (by atomic flip, or by probing the entity in recovery); the position will carry the success `CREDENTIAL_PROVISIONED` | **Yes** — the success record |
-| `aborted` | Resolution found **positive evidence of non-commit** (no entity, no `IssuanceLog`, past the resolution-wait bound); nothing was provisioned, **but the sequence position was already allocated** | **Yes** — a signed **aborted-outcome record** at the same `sequence_number`/`prev_record_hash`, so the chain has no gap |
-| `delivered` | Lock accepted whichever record (success or aborted) occupies the position (`202` or idempotent replay) | terminal |
+| `aborted` | Resolution found **decidable non-commit** — both witnesses absent on a backend whose retained witness would have proved a commit (SQL/Couchbase), after fencing the writer | **Yes** — a signed **aborted-outcome record** at the same `sequence_number`/`prev_record_hash`, so the chain has no gap |
+| `indeterminate` | Resolution could **not decide** — both witnesses absent on a backend that cannot guarantee a token-outliving witness (LDAP, marker possibly never written, token possibly deleted); the writer is fenced so it cannot commit afterward, but absence does **not** prove non-commit | **Yes** — a signed **indeterminate-outcome record** (`provisioning_outcome=indeterminate`, reason `witness_unavailable`) at the position, so the chain is gapless and honest; neither success nor abort is asserted |
+| `delivered` | Lock accepted whichever record (success / aborted / indeterminate) occupies the position (`202` or idempotent replay) | terminal |
 
 The **intake row** (written before the credential, keyed by `operation_id`) and the chain entry the
 journal writer derives from it together *are* the operation journal: the intake records that an
@@ -2696,8 +2697,8 @@ outcome means **unresolved**, never "nothing happened."
 | 1 | issuance thread | Allocate `operation_id`; build the record *as if the action succeeds* (`credential_fingerprint` is the SVID `jti`, known because `tokenReferenceId` is generated before persistence) and sign it | The record content must not depend on anything written later; signing early does **not** publish it. The success record is one of the two possible contents the position may finally carry (the other is the aborted record, built at resolution) |
 | 2 | issuance thread | Write the **intake row** `jansTraceIntake` keyed by `operation_id`, carrying the entity locator (`jti`/`client_id`/`jkt`/`kind`), producer role, and the signed success content | Records that an issuance was attempted, **without** touching the chain — so no two issuances contend for a position. If this write fails the action is refused `503 evidence_unavailable` and nothing else is written |
 | 3 | journal writer | Under its fenced lease, drain the intake row: assign the next `sequence_number` and insert the outbox entry `state=staged` with the guarded (epoch-checked) write; stamp its `operation_id` | The single writer assigns positions serially, so uniqueness is structural; the fence is enforced *in* this insert, so a stale writer never creates an authoritative row |
-| 4 | issuance thread | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`). **Where the backend offers native multi-item atomicity (SQL, Couchbase), write the entity and the `staged → committed` flip in one transaction.** On LDAP the entity is a single durable write and the flip is separate | The entity is the ground truth the invariant is about. (Steps 3 and 4 are independent and may overlap; neither waits on the other except that delivery waits on both) |
-| 5 | journal writer / resolver | **Promote the entry `staged → committed`** once the entity commit is confirmed — atomic with step 4 where possible, otherwise a flip after the entity write returns success | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves the entry `staged` = **unresolved**, resolved by probing the entity (below), never dropped |
+| 4 | issuance thread | Persist the action's own entity (`TokenEntity` / `Client` / `AttestationAssessment`+`KeyAttestationState`), **carrying the issuance fact (`record_id` + `operation_id`) as a field of the entity itself, written in the same single-entity write** — not as a separate marker. The write also carries the issuance thread's `fenceToken` (below). **Where the backend offers native multi-item atomicity (SQL, Couchbase), also write the durable `IssuanceLog` and the `staged → committed` flip in the same transaction.** On LDAP the entity (with its embedded fact) is one durable write, and `IssuanceLog` + the flip follow | The issuance fact lives **inside** the entity, so "entity present ⇒ its issuance fact present" is a single atomic truth with no second write to miss. The entity is the ground truth the invariant is about |
+| 5 | journal writer / resolver | **Promote the entry `staged → committed`** once the entity commit is confirmed — atomic with step 4 where possible, otherwise a flip after the entity write returns success. The flip records the writer's `fenceToken` | **This is the commit point for delivery.** Only now may the record reach Lock. A crash before this leaves the entry `staged` = **unresolved**, resolved below, never dropped. The `fenceToken` is what lets resolution later *cancel* a paused writer rather than race it |
 | 6 | issuance thread | Return the HTTP response | The client may or may not receive it; the record already says only "persisted," so a lost response changes nothing |
 | 7 | emitter | Post `committed`/`aborted` positions to Lock in sequence order, mark `delivered` on `202` **or** idempotent-replay acceptance | At-least-once; Lock is keyed by `record_id`, so duplicates are idempotent. A `409` (same `record_id`, different content) is surfaced as an error, not treated as delivered |
 
@@ -2708,40 +2709,70 @@ dropped, so Lock never sees a gap where sequence *n* was allocated. If the issua
 step 2 (no intake row), no position is ever allocated and nothing is owed to the chain; once the
 intake row exists, the journal writer guarantees a position and an outcome for it.
 
-**Atomicity across the writes, and where a native transaction is used.** The outbox insert
-(step 2) and the entity commit (step 3) cannot always be one atomic unit, because the Jans
-`PersistenceEntryManager` abstraction does not expose a portable multi-entry transaction spanning
-LDAP, SQL, and Couchbase (the datastores differ: SQL has transactions, **Couchbase has supported
-distributed multi-document ACID transactions since 6.5**, LDAP has no general multi-entry
-transaction). The design therefore does not *depend* on one — but it **does use the native
-transaction where the backend has it**, binding the entity write and the `staged → committed` flip
-(step 3 + step 4) atomically on SQL and Couchbase, which eliminates the crash window on those
-backends. Only LDAP falls back to two ordered writes, and there the unresolved-state recovery below
-closes the gap. Correctness rests on the three-valued journal, not on any single backend's
-transaction.
+**The issuance fact is atomic with the entity, so "committed" always has a surviving witness.**
+The failure to avoid is: the entity commits, a *separate* marker write is lost to a crash, and
+recovery later — with the short-lived token already gone — reads "entity absent, marker absent" and
+wrongly concludes non-commit. The design removes the separate write from the decision: the issuance
+fact (`record_id` + `operation_id`) is a **field of the `TokenEntity`**, written in the same
+single-entity write, on **every** backend. There is therefore no backend on which the entity can
+commit without its fact; "entity present" and "fact present" are the same atomic event. On SQL and
+Couchbase the native transaction additionally binds the `IssuanceLog`, the entity, and the flip
+together, so all of commit is one atomic unit.
 
-**Crash recovery resolves three outcomes, by probing the entity — never two.** On startup, and on a
-periodic sweep, the emitter resolves every `staged` entry *before* delivering anything. The `staged`
-state is explicitly **unresolved**: the attempt is recorded (the journal entry exists) but its
-outcome is not yet known. For each, it looks up the **authoritative entity** named by the entry's
-locator — the `TokenEntity`/enrolled key/assessment by `jti`/`client_id`/`jkt` — and also a
-long-lived **`IssuanceLog`** row (keyed by `record_id`, written in the same step-3 transaction on
-capable backends; written immediately after the entity on LDAP). The two together give three
-distinguishable outcomes:
+**What still varies by backend is how long the witness survives — and that decides whether
+non-commit is *provable* or merely *unknown*.** The token can be deleted by its own TTL/revocation
+before recovery runs. So a durable witness that **outlives the token** is needed, and it must be
+retained **until reconciliation completes**, not for the token's lifetime:
+
+- **SQL / Couchbase:** the `IssuanceLog`, the entity, and the flip are one transaction. "Committed"
+  therefore always leaves the `IssuanceLog` (retained `issuanceLogRetentionSeconds`, independent of
+  token TTL), and "not committed" leaves nothing. Absence of both is **decidable non-commit** →
+  `aborted`.
+- **LDAP (no multi-entry transaction):** the entity carries its fact atomically, but the separate
+  `IssuanceLog` write can be lost after the entity committed. If, by the time recovery runs, the
+  token has also been deleted, **both witnesses can be absent for a credential that did commit** —
+  the marker was never written, not deleted. This is genuinely **indeterminate**, and recovery
+  MUST classify it as such, **never** as `aborted` (see the resolution table). A longer
+  `resolutionWaitSeconds` does **not** help here — it only makes token disappearance *more* likely —
+  so it is bounded, not extended, and the ambiguity is resolved by fencing plus the indeterminate
+  outcome, not by waiting.
+
+**Cancellation fences a paused writer; a timeout alone does not.** A timeout cannot distinguish a
+dead writer from a *paused* one that will resume and commit the entity after recovery has already
+acted. Before recovery records any terminal outcome for a `staged` entry (`aborted` **or**
+`indeterminate`), it first **cancels** the entry: it CASes a `fence` on the `staged` row to a new
+value, which **invalidates the issuance thread's `fenceToken`**. The step-4 entity write and the
+step-5 flip are **conditioned on the entry's fence still matching the writer's `fenceToken`** (the
+same guarded-write mechanism as the journal lease, §11.3): once recovery has cancelled the entry, a
+resumed writer's entity commit is **rejected**, so it cannot commit behind recovery's back. The
+order is therefore: cancel (fence) → confirm no entity/witness exists → record the terminal outcome.
+A writer that committed *before* cancellation leaves a witness recovery sees (→ `committed`); a
+writer cancelled before it committed can never commit afterward (→ safe to classify).
+
+**Crash recovery: fence the writer, then probe for a witness.** On startup, and on a periodic
+sweep, the emitter resolves every `staged` entry *before* delivering anything. The `staged` state is
+explicitly **unresolved**: the attempt is recorded but its outcome is not yet known. For each entry,
+recovery looks up the **authoritative entity** named by the locator — the `TokenEntity` (carrying
+its embedded issuance fact) by `jti`/`client_id`/`jkt` — and the token-outliving **`IssuanceLog`**
+(keyed by `record_id`, written in the step-4 transaction on SQL/Couchbase). Either present means the
+credential committed. The outcomes:
+
+Resolution first **cancels** the entry (fences its writer, above), then probes, with these
+outcomes:
 
 | Probe result | Meaning | Action |
 |--------------|---------|--------|
-| Entity present, **or** `IssuanceLog` present | The credential committed (the entity may since have expired/been revoked, but the `IssuanceLog` proves it existed) | Promote `staged → committed`; the position carries the success record; deliver |
-| Entity absent **and** `IssuanceLog` absent **and** the entry is older than the **resolution-wait bound** (below) | The credential never committed — a crash between step 2 and a durable step 3 | Transition to `aborted`: **build and sign an aborted-outcome record at this entry's `sequence_number`**, with `prev_record_hash` chained over the delivered predecessor, and **deliver it** so position *n* is not a gap. Nothing was provisioned |
-| Entity absent **and** `IssuanceLog` absent **but** within the resolution-wait bound | **Unresolved** — the write may still be in flight, or this node is mid-recovery | Leave `staged`; retry on the next sweep. Never aborted while unresolved |
+| Entity present, **or** `IssuanceLog` present | The credential committed (the entity carries its issuance fact; the `IssuanceLog`, where the backend wrote it, proves commit even after the token is gone) | Promote `staged → committed`; the position carries the success record; deliver |
+| Within the resolution-wait bound, entity + `IssuanceLog` still absent | **Unresolved** — the write may still be landing, or this node is mid-recovery. (The writer is already fenced, so it cannot commit *behind* recovery, but recovery waits before declaring terminal) | Leave `staged`; retry on the next sweep |
+| Past the bound; **both absent**; and the backend provides a **retained witness that survives the token** (SQL/Couchbase `IssuanceLog` in the entity transaction) | **Decidable non-commit** — a committed credential would have left the retained `IssuanceLog` | Transition to `aborted`: build, sign, and **deliver an aborted-outcome record** at this `sequence_number` (chained over the delivered predecessor) so position *n* is not a gap |
+| Past the bound; **both absent**; and the backend **cannot** guarantee a token-outliving witness was written (LDAP, where the `IssuanceLog` write can be lost after the entity committed and the token may since have vanished) | **Indeterminate** — absence does **not** prove non-commit; the marker may never have been written | Transition to `indeterminate`: deliver an **indeterminate-outcome record** (`provisioning_outcome=indeterminate`, reason `witness_unavailable`) at this `sequence_number` — the chain stays gapless and the record states honestly that the outcome could not be determined, **neither** asserting success **nor** fabricating an abort for an operation that may have committed |
 
-The `IssuanceLog` is no longer the *decider* — the entity is — but it remains valuable precisely
-because a short-lived `TokenEntity` can be issued, persist, and then **expire or be revoked** before
-recovery runs: once the entity is gone, the `IssuanceLog` is the durable positive proof that it
-*did* commit, so "entity absent" alone never forces an abort. Token **absence is never read as
-failed issuance.** The only path to `aborted` is "no entity **and** no `IssuanceLog` **and** past
-the resolution-wait bound" — positive evidence of non-commit plus enough elapsed time that an
-in-flight write cannot still be pending.
+`aborted` and `indeterminate` are distinct outcomes: `aborted` is a positive claim that nothing was
+provisioned (only made when a retained witness would have proved otherwise); `indeterminate` is the
+honest record that recovery could not decide. **Absence of the token is never read as failed
+issuance.** `resolutionWaitSeconds` only governs the unresolved→terminal transition; it is **not** a
+substitute for a witness and is not lengthened to try to disambiguate (a longer wait makes the token
+more likely to have vanished, not less).
 
 **The aborted record, so the chain is honest about what happened.** It is a signed record at the
 allocated position whose event states the operation did not complete — a `CREDENTIAL_PROVISIONED`
@@ -2754,28 +2785,27 @@ aborted record's digest — so Lock receives an unbroken chain in which position
 whose outcome is known *before* first delivery — and the orphan-compensation case below, which
 repairs an *already-delivered* success record found inconsistent later.
 
-One residual edge is closed by ordering and bounds rather than left silent: on LDAP (the only
-non-transactional backend), the `IssuanceLog` is written **immediately after** the entity and
-**before** the flip, and both are durable before step 4 returns. The only way to reach "entity
-absent **and** `IssuanceLog` absent" after a real commit is if *both* the token and the marker were
-deleted before recovery read them — which cannot happen inside `resolutionWaitSeconds`, because that
-bound is minutes while the token TTL and `issuanceLogRetentionSeconds` are far longer, and recovery
-runs at startup immediately after a crash. So within the wait window a committed credential always
-presents at least one of the two; "both absent past the wait" is therefore sound evidence of
-non-commit. (On SQL/Couchbase the entity, `IssuanceLog`, and flip are one transaction, so the window
-does not exist.)
+The `indeterminate` outcome is a genuine difference between the backends, stated rather than hidden:
+SQL and Couchbase can always decide (their transaction guarantees a token-outliving witness for
+every commit), so they never produce `indeterminate`; LDAP can produce it for the narrow case where
+the `IssuanceLog` write was lost after the entity committed *and* the token has since been deleted.
+A deployment that requires every outcome to be decidable (no `indeterminate`) runs on a
+transactional backend, or configures LDAP to retain the token entity itself until reconciliation
+completes (so the entity — which always carries its atomic issuance fact — is the surviving
+witness). `indeterminate` is never silently converted to `aborted`; an auditor sees exactly which
+positions could not be decided and why.
 
-**Retention must cover unresolved operations and downtime, not just the reconciliation interval.**
-`issuanceLogRetentionSeconds` and the `staged`-entry retention MUST be `≥ resolutionWaitSeconds +
-maxExpectedDowntimeSeconds + reconciliationIntervalSeconds`, so that a marker or journal entry is
-never garbage-collected while its operation is still unresolved or while the node that could resolve
-it is down. A `staged` entry is **never** expired by TTL — only transitioned to `committed` or
-`aborted` by resolution, and in both cases delivered — so an unresolved operation can neither be
-silently dropped by the retention sweep nor leave a gap in the chain Lock receives.
-`resolutionWaitSeconds` (default a few minutes, ≥ the longest entity-write + replication latency) is
-the window in the third row above: it must exceed the time a durable entity write can lag its outbox
-entry on the slowest backend, so that "still absent after the wait" genuinely means "never
-committed," not "not yet visible."
+**Retention preserves witnesses until reconciliation completes.** The `IssuanceLog`, the
+`staged`-entry, and — on a deployment that elects decidability on LDAP — the token entity itself are
+retained `≥ resolutionWaitSeconds + maxExpectedDowntimeSeconds + reconciliationIntervalSeconds`, so
+a witness is never garbage-collected while its operation is unresolved or while the node that could
+resolve it is down. A `staged` entry is **never** expired by TTL — only transitioned to `committed`,
+`aborted`, or `indeterminate` by resolution, and in every case delivered — so an unresolved
+operation can neither be silently dropped nor leave a gap in the chain. `resolutionWaitSeconds`
+(default a few minutes, ≥ the longest entity-write + replication latency) bounds only the
+unresolved→terminal wait; it is deliberately **not** lengthened to disambiguate the LDAP both-absent
+case, because waiting longer makes the token more likely to vanish — that case is handled by the
+`indeterminate` classification and the fence, not by the clock.
 
 A genuine orphan — a `committed`/`delivered` record whose entity and `IssuanceLog` are *both* later
 found missing when one should exist (a partial write that slipped past step 4 on a non-transactional
@@ -2819,7 +2849,8 @@ later — inline is a latency optimization, never a weakening of the hold-until-
 | `traceEmitIssuanceDecision` | `false` | Also emit a separate `AUTHORIZATION_DECISION` (real `(action, resource_type)`) alongside the `CREDENTIAL_PROVISIONED`, for deployments that want an explicit issuance-policy decision record |
 | `traceChainLeaseSeconds` | 30 | Per-chain single-writer lease duration; the journal writer renews within it, a failover holder may acquire (bumping `epoch`) once it expires (11.3) |
 | `traceIntakeMaxAgeSeconds` | 604800 (7 d) | How long an unprocessed `jansTraceIntake` row is retained so a failover writer can still assign it a position; MUST exceed `maxExpectedDowntimeSeconds` (11.3) |
-| `resolutionWaitSeconds` | 300 | Minimum age before an unresolved `staged` entry with no entity and no `IssuanceLog` may be resolved to `aborted` (and an aborted-outcome record delivered at its position); MUST exceed the slowest backend's durable entity-write + replication lag, so "still absent after the wait" means "never committed," not "not yet visible" (11.3) |
+| `resolutionWaitSeconds` | 300 | Minimum age before an unresolved `staged` entry (writer already fenced) is given a terminal outcome — `aborted` where a token-outliving witness would have proved commit, else `indeterminate`. Bounds only the unresolved→terminal wait; **not** lengthened to disambiguate (a longer wait makes the token more likely to vanish) (11.3) |
+| `ldapRetainTokenUntilReconciled` | `false` | On LDAP, retain the `TokenEntity` (with its embedded issuance fact) until reconciliation completes, so commit is always decidable and `indeterminate` is never produced; costs extra storage. Ignored on SQL/Couchbase (their transaction already guarantees a retained witness) (11.3) |
 | `issuanceLogRetentionSeconds` | 2592000 (30 d) | How long the TTL-independent `IssuanceLog` marker is kept, independent of SVID lifetime; MUST be ≥ `resolutionWaitSeconds + maxExpectedDowntimeSeconds + reconciliationIntervalSeconds` so a marker is never collected while its operation is unresolved or its resolver is down (11.3) |
 | `maxExpectedDowntimeSeconds` | 86400 (1 d) | Planning input to the retention lower bound above — the longest outage after which a node must still be able to resolve its `staged` entries from surviving entities/markers (11.3) |
 
@@ -3003,7 +3034,7 @@ under that key. Until an instance-bound producer-key registration and that Lock-
 | Attestation script accepts everything | Core verifies the `AttestationResultJWT` against the server-configured verifier profile, extracts nonce and key itself, verifies the `TPM2_Certify` chain, and caps the status at its own binding verdict (9.3b); a permissive script can only make policy looser, never name a different key or skip the nonce |
 | ID-JAG stolen | Audience- and client-bound, short-lived (existing); the SVID carries `delegation.credential_id` and the records show which agent used it |
 | Outbox full or evidence store unavailable | `JWT-SVID` issuance refused with `503 evidence_unavailable` (`fail-closed`); other traffic per `traceOutboxFullPolicy`, with a `coverage_gap` marker on the next record so the chain is visibly incomplete rather than silently short |
-| Crash between record staging and credential persistence | The outbox entry is `staged` = **unresolved** and already owns a sequence position. Recovery resolves it by **probing the entity**, not by a marker's absence: if the `TokenEntity` (or `IssuanceLog`) is present the record is `committed` and the success record is **delivered** at its position — so a credential that *did* persist never loses its evidence; if neither exists past `resolutionWaitSeconds` the position is resolved to `aborted` and an **aborted-outcome record is delivered at that same position**, so the chain Lock receives has no gap; if neither exists but still within the wait it stays unresolved and is retried. On SQL/Couchbase the entity write and the flip are one native transaction, so this window does not exist there (11.3) |
+| Crash between record staging and credential persistence | The outbox entry is `staged` = **unresolved** and owns a sequence position. Recovery **fences the writer**, then probes: if the `TokenEntity` (carrying its embedded issuance fact) or the `IssuanceLog` is present → `committed`, success record delivered — a credential that persisted never loses its evidence; both absent within the wait → stays unresolved, retried; both absent past the wait → `aborted` **only on a backend whose retained witness would have proved commit** (SQL/Couchbase), otherwise `indeterminate` (LDAP, where the marker may never have been written and the token may have vanished) — absence is never read as abort. Every position is delivered (success / aborted / indeterminate), so the chain has no gap (11.3) |
 | Crash **after** the credential persisted but **before** the commit flip | Resolved to `committed` and delivered: recovery finds the committed `TokenEntity` by the `staged` entry's locator and promotes it. A `staged` entry with no probeable entity is *unresolved* and retried, never silently treated as "nothing happened" (11.3) |
 | SVID issued, persisted, then expired or revoked before reconciliation | **Not** flagged as a failed issuance. Token absence is not failure evidence; the TTL-independent `IssuanceLog` marker (retained `issuanceLogRetentionSeconds`) records the commit, so reconciliation sees a real past issuance that simply aged out, not an orphan (11.3) |
 | Auditor doubts jans itself | Every claim is a signed record in a hash chain with Lock receipts (**once Lock ships the TRACE subsystem — see section 11.1**); the appraisal is traceable to the platform verifier's own signature (the stored `AttestationResultJWT`, its digest in the record), and with `attestationStoreEvidence=true` the raw evidence can be re-submitted to the verifier independently. The chain proves integrity and order of what Lock holds and, via checkpoints, that the tail is not silently withheld for longer than one interval; it does not prove that a dishonest producer emitted every event (11.1) |
