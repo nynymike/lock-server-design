@@ -896,10 +896,18 @@ vendor-neutral binding contract** (section 9.3a): it names the verifier trust an
 per-vendor claim paths, declares the `keyBindingStrength` it achieves (`certified` /
 `measured_guest`), and carries a `maturity` (`experimental` default, `validated` only once the
 profile has vendor citations and passing positive/negative conformance vectors — section 9.3a). A
-deployment MAY refuse `experimental` profiles for a high-risk capability. **Adding a cloud is a new
-profile entry plus its claim-path map and vectors — not a core change**; prefer the standards-based
-`eat+jwt` / `eat+cwt` envelope where a platform can emit one, so only the trust anchor and claim
-paths are per-deployment.
+deployment MAY refuse `experimental` profiles for a high-risk capability. **How much work a new
+platform is depends on whether it reuses a verification mechanism core already has.** A platform
+whose evidence core can already verify — a JWT verifier result under a profile, a `TPM2_Certify`
+chain, the EAT envelope — may need only a new profile entry (trust anchor, claim-path map) plus
+conformance fixtures: configuration, not core code. A platform that introduces a mechanism core
+does not implement — an unfamiliar evidence format, a different certificate-chain or
+key-certification scheme, COSE/CBOR verification (as AWS Nitro needs), a new signature algorithm —
+requires a **verifier adapter**: real code in `io.jans.as.server.attestation` that parses and
+cryptographically checks that format, sitting behind the same binding contract. Claim paths are a
+projection over *already-verified* material; they cannot stand in for the verification itself.
+Prefer the standards-based `eat+jwt` / `eat+cwt` envelope where a platform can emit one, precisely
+because it keeps a new platform on the configuration-only path rather than needing an adapter.
 
 ```json
 [
@@ -957,8 +965,12 @@ paths are per-deployment.
 `measurementClaimPath` / `debugClaimPath` / `akClaimPath` / `keyClaimPath` / `nonceClaimPath` are
 the contract's three obligations expressed as this vendor's claim paths; `trustAnchor` names a
 pinned root for in-process (`local` / `aws-nitro`) appraisal where there is no JWKS to fetch. Core
-reads only these declared paths — a script cannot redirect them (9.3b) — so a new cloud is onboarded
-by configuration and fixtures, not by editing core.
+reads only these declared paths — a script cannot redirect them (9.3b). A new platform that reuses
+an existing verification mechanism (a profile-verified JWT result, a `TPM2_Certify` chain, an EAT)
+is onboarded by configuration and fixtures alone; a platform whose evidence needs a verification
+mechanism core does not yet have (e.g. the COSE/CBOR path behind `aws-nitro`, a novel cert chain or
+key-certification scheme) needs a verifier adapter in core first, after which its profile is again
+declarative.
 
 The script's `verifier_kind` must name a profile; a script result whose `AttestationResultJWT`
 does not verify under that profile is `contraindicated` with `untrusted_verifier` regardless of
@@ -1045,7 +1057,7 @@ Reference script `docs/script-catalog/attestation/AgentAttestation.py` (+ `.md`)
 | Attribute | Purpose |
 |-----------|---------|
 | `formats` | Comma list of `evidence_format` values handled, e.g. `azure-cvm-sev-snp+json` |
-| `verifier_kind` | Names an `attestationVerifierProfiles` entry and selects how `verifyEvidence` appraises: `azure-maa` / `intel-ta` / `gcp-cs` (call the cloud's attestation service), `aws-nitro` / `local` (verify in-process against a pinned root or trusted JWKS). Adding a cloud adds a backend here and a profile entry (9.3b) — not a core change |
+| `verifier_kind` | Names an `attestationVerifierProfiles` entry and selects how `verifyEvidence` appraises: `azure-maa` / `intel-ta` / `gcp-cs` (call the cloud's attestation service), `aws-nitro` / `local` (verify in-process against a pinned root or trusted JWKS). A platform reusing an existing mechanism adds only a profile entry (9.3b); one needing a new verification mechanism (unfamiliar format, COSE/CBOR, a new cert chain) also needs a verifier adapter in core |
 | `verifier_url` | Attestation endpoint of the platform verifier, for the delegated kinds (e.g. `https://<tenant>.attest.azure.net/attest/SevSnpVm?api-version=…`, `https://api.trustauthority.intel.com/appraisal/v1/attest`, the GCP Confidential Space attestation endpoint); unused for in-process kinds (`local`, `aws-nitro`), which verify against a pinned `trustAnchor` |
 | `verifier_api_key` | Credential for verifiers that need one (Intel TA). Stored as an encrypted script property; never logged, never returned, redacted in TRACE records |
 | `verifier_timeout_ms` | Outbound call timeout; default `5000` |
@@ -1060,8 +1072,11 @@ Delegate, don't parse: v1 ships `verifier_kind=azure-maa` and `intel-ta`, which 
 evidence and verify the returned `AttestationResultJWT`, plus `verifier_kind=local` for `eat+jwt`
 (used in CI). In-process TPM 2.0 quote verification (`tpm2-quote+json` under `local`) is a second
 script, after v1. Additional cloud backends (`gcp-cs`, `aws-nitro`, OCI) are **further profile
-instances of the same contract** (section 9.3a), added as configuration + fixtures without a core
-change and shipping `experimental` until their vectors exist. In all cases the script runs inside
+instances of the same contract** (section 9.3a). Those whose evidence reuses a mechanism core
+already has (e.g. `gcp-cs`, a profile-verified JWT) are configuration + fixtures; those introducing
+a new mechanism are not — `aws-nitro`'s COSE_Sign1/CBOR attestation document needs a verifier
+adapter in core before its profile is declarative. All ship `experimental` until their vectors
+exist. In all cases the script runs inside
 jans-auth-server during `POST /attestation`; the agent is never on the path to the verifier.
 
 ### 9.5 Where the gate is enforced
@@ -2919,8 +2934,12 @@ resolution.
   satisfies the same three obligations — platform authenticity + measurement, freshness, and key
   certification — and a verifier profile (9.3b) declares that vendor's claim paths; core checks the
   obligations abstractly. Azure, generic TPM 2.0, GCP Confidential Space, AWS Nitro, OCI, and the
-  preferred standards-based EAT envelope are profile instances, so adding a cloud is configuration
-  + fixtures, not a core change (section 9.3a).
+  preferred standards-based EAT envelope are profile instances. A platform that reuses a
+  verification mechanism core already has may require only configuration and fixtures; a platform
+  that introduces a new mechanism (an unfamiliar evidence format, a different certificate chain or
+  key-certification scheme, COSE/CBOR as AWS Nitro needs) requires a verifier adapter in core. Claim
+  paths project over already-verified material; they cannot implement the verification (section
+  9.3a/9.3b).
 - **Platform claim paths are unverified until cited and vectored.** The exact vendor claim paths
   (Azure `x-ms-*`/HCL/AK, and the GCP/AWS/OCI equivalents) are documented best-effort and are
   **not** substantiated by captured vectors in this repository. A profile ships `maturity:
