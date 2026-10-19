@@ -169,10 +169,29 @@ lookup, relying parties from the SVID's `attestation` claim, auditors from the
 `AttestationResultJWT`. §9.6 notes the one case that would justify a portable token later and the
 EAT shape it would take.
 
+## Q10. Enrollment had no complete transition into authoritative state
+
+**Raised.** A pre-enrollment attestation has no `client_id` and requires no DPoP, so it is
+`supersedesEligible=false`; but only a `supersedesEligible=true` assessment could populate
+`KeyAttestationState`, and issuance requires that state — so a freshly enrolled client could never
+issue. Separately, DCR said to set `clientId` on the assessment while §9.7 said assessments are
+immutable (a direct contradiction).
+
+**Change (§§9.5, 9.7, 10.4).** Enrollment is now an explicit, idempotent **enrollment transaction**:
+(1) verify the `/register` DPoP proof against the assessed key; (2) leave the assessment
+**immutable** — no `clientId` back-fill; (3) create a separate **`KeyEnrollment`** binding
+`(clientId, jkt) → attestationId`; (4) **initialize** `KeyAttestationState(clientId, jkt)` at
+`revision = 0`, authorized by the DCR proof rather than by `supersedesEligible`; (5) record the
+client attribute and emit the enrollment TRACE record. `supersedesEligible` now governs only
+*overwriting* an existing client's state, not *initializing* a key's first state; the write-side CAS
+table gained a distinct enrollment-initialization row. One assessment enrolls exactly one client
+(`assessment_already_enrolled` otherwise), and adding a replacement key reuses the same transaction.
+
 ## Later review rounds
 
 Subsequent review rounds refined the above into the current design; the material changes are already
-folded into the numbered sections of the main document (notably the §9.7/§10.4 single-row state
-model, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap, the §10.8–§10.9
-execution-binding and human-assurance rules, and the §16.1 key-revocation delay). This history
-preserves the original questions that drove them; for current behaviour, read the main document.
+folded into the numbered sections of the main document (notably the §9.5 enrollment transaction, the
+§9.7/§10.4 single-row state model, the §11.3 append/commit protocol, the §9.3a Azure AK-binding gap,
+the §10.8–§10.9 execution-binding and human-assurance rules, and the §16.1 key-revocation delay).
+This history preserves the original questions that drove them; for current behaviour, read the main
+document.
