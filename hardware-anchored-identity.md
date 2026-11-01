@@ -257,7 +257,7 @@ sequenceDiagram
     Agent->>TEE: fresh DPoP proof for the PEP
     TEE-->>Agent: proof
     Agent->>PEP: request + JWT-SVID + DPoP proof
-    Note over PEP: Authorization: DPoP <SVID> + DPoP: <proof><br/>local: signature via bundle, sub, aud, exp<br/>full RFC 9449 DPoP proof (htm, htu, iat/age, jti-replay,<br/>required ath==hash(SVID), nonce when used) · proof key ↔ cnf.jkt<br/>· PDP decision · copy the pair (trace_execution_id + execution_authority)
+    Note over PEP: Authorization: DPoP #lt;SVID#gt; + DPoP: #lt;proof#gt;<br/>local: signature via bundle, sub, aud, exp<br/>full RFC 9449 DPoP proof (htm, htu, iat/age, jti-replay,<br/>required ath==hash(SVID), nonce when used) · proof key ↔ cnf.jkt<br/>· PDP decision · copy the pair (trace_execution_id + execution_authority)
     PEP-->>Lock: CAPABILITY_INVOKED / RUNTIME_EFFECT
     PEP-->>Agent: 200
 ```
