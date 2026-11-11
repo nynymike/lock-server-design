@@ -38,7 +38,8 @@ The authorization decision and capability invocation should come from different 
 
 - OAuth-protected single-record ingestion.
 - OAuth-protected bulk ingestion (`POST /api/v1/audit/trace/bulk`), one producer per batch, with per-record accept/reject — required because a high-throughput producer such as Cedarling cannot scale with one request per record (see §11.2).
-- Per-evidence-domain producer-key registration through an administrative path (configuration or an admin API under a separate scope), never implicitly from a submitted record.
+- Per-evidence-domain producer-key registration through an admin API under a separate scope (`trace.admin`), never implicitly from a submitted record.
+- Producer-chain registration, either through the admin API (`pre_registered_genesis`) or from a chain's genesis record (`first_observed_genesis`), selected by Lock configuration (§8).
 - Ed25519 signatures selected by signed `kid`.
 - RFC 8785 JSON Canonicalization Scheme (JCS).
 - Immutable storage of accepted producer assertions.
@@ -48,8 +49,9 @@ The authorization decision and capability invocation should come from different 
 - Producer-local sequence and predecessor-hash checking.
 - A Lock receipt hash chain.
 - Multiple token references per record, identified by issuer plus `jti`, or by fingerprint when `jti` is absent.
-- Retrieval by record and execution.
-- Coverage-gap, chain-link-failure, equivocation, and late-arrival flagging.
+- Retrieval by record, by execution, and by policy store release.
+- Coverage-gap, chain-link-failure, equivocation, and late-arrival flagging, plus two Lock-specific findings: `policy_mismatch_flag` (the record names a policy store release Lock did not serve) and `reserved_member_flag` (the producer signed a member Lock derives itself, §10).
+- The same API over gRPC, next to REST (§11.6).
 - Structured errors and idempotent replay.
 
 ### Explicitly deferred
@@ -70,7 +72,9 @@ The MVP does not implement:
 - signed receipt checkpoints or external transparency anchoring;
 - Evidence Packet export;
 - Lock emitting TRACE records for access to **its own** endpoints (Lock-as-PEP self-emission — Lock embeds Cedarling, so it *could* be a producer, but self-reference/recursion and settlement-key-vs-producer-key hygiene must be resolved first; see `design.md`: Lock as a TRACE producer for its own endpoints); or
-- graph traversal beyond direct execution membership.
+- graph traversal beyond direct execution membership;
+- a quarantine store for rejected records (rejected records are not stored); or
+- an administrative operation that gives a record whose receipt entry is `VOID` a new receipt position (§9).
 
 The MVP also defers the AIMS/WIMSE identity and lifecycle features the full design specifies:
 
@@ -116,7 +120,7 @@ Before doing record-dependent work, Lock MUST validate that the OAuth client may
 
 After the API caller is accepted, Lock verifies the signed `producer` and `kid` against a producer key registered in the derived evidence domain. This establishes record authorship independently of the transport credential.
 
-Normally the submitting OAuth client and signed producer represent the same component. They may differ only when Lock configuration explicitly allows the client to forward records for that producer. A forwarding client cannot replace the producer signature or select a different evidence domain in the record body.
+Normally the submitting OAuth client and signed producer represent the same component. Lock does not compare the two: a client may submit a record only when its domain binding lists the signed `producer` (or `"*"`) in `allowedProducerIds`, whether it submits its own records or forwards another producer's; otherwise the request fails with `403 producer_not_allowed`. A client without its own binding falls back to `defaultEvidenceDomainId` and to `defaultAllowedProducerIds`, which is empty by default, so with Lock's defaults such a client cannot submit until an operator lists its producer. A forwarding client cannot replace the producer signature or select a different evidence domain in the record body.
 
 ## 5. Minimal architecture
 
@@ -128,19 +132,20 @@ The MVP has five logical components:
 | Verification service | Validate schema, resolve `(evidence_domain_id, producer_id, kid)`, canonicalize, and verify the signature. |
 | Producer key registry | Store trusted Ed25519 public keys and validity/revocation metadata per evidence domain. |
 | Correlation service | Validate producer-chain position and create direct execution, capability, producer, and token indexes. |
-| TRACE store | Atomically persist the assertion, verification metadata, ingestion metadata, and receipt-chain entry. |
+| TRACE store | Persist the assertion, verification metadata, and ingestion metadata, and claim and settle the receipt-chain entry (§9). |
 
 Processing order is fixed:
 
 1. Validate the OAuth client and its permission to use the TRACE endpoint.
 2. Derive `evidence_domain_id`.
 3. Validate the JSON structure and limits.
-4. Resolve the signed producer and `kid` within that domain.
-5. Verify the Ed25519 signature over the JCS form of every assertion field except `signature`.
-6. Compute `content_digest` over the JCS form of the complete assertion, including `signature`.
-7. Apply idempotency, conflict, chain-gap, and equivocation checks.
-8. Atomically store the record and append its Lock receipt entry.
-9. Return the acceptance result.
+4. Check that the client may submit for the signed `producer` (§4.2).
+5. Resolve the signed producer and `kid` within that domain: the key's validity window, then its `authorized_event_kinds`.
+6. Verify the Ed25519 signature over the JCS form of every assertion field except `signature`.
+7. Compute `content_digest` over the JCS form of the complete assertion, including `signature`.
+8. Apply idempotency, conflict, chain-registration (§8), chain-gap, and equivocation checks.
+9. Claim a Lock receipt position, store the record, then settle the receipt entry (§9).
+10. Return the acceptance result.
 
 Unverified records MUST NOT enter the normal TRACE store or any retrieval index. An implementation may place them in a separately access-controlled quarantine.
 
@@ -170,9 +175,21 @@ The minimum key record is:
 
 `producer_id` is the **stable logical producer** (`cedarling-fleet-1`), not a `name/semver` string — software version is separate signed metadata (see §7.1), so a software upgrade does not force a new producer identity, key, or chain. `authorized_event_kinds` scopes which event kinds this key may sign; a record whose `event_kind` is outside the key's authorized set is **rejected**, exactly like an unknown key (the full design elaborates this as the `producer_authorized_for_claim` check). The full design additionally scopes a key by `authorized_measurement_points` (which collection points the key may claim); the MVP defers that finer scoping and enforces only `authorized_event_kinds`.
 
-**Keys are provisioned administratively, never implicitly.** Lock registers producer keys through configuration or an **administrative API protected by a separate scope** (e.g. `trace.producers.manage`, distinct from `trace.write`). Lock MUST NOT accept a public key merely because it accompanied the first record — that would make the signature self-authenticating. Possession of a signing key must not let the holder define its own producer identity or claim scope; those come only from the administrative registration. Authorization rests on that independently provisioned registration, **not** on the mere fact that a key was found at the lookup index `(evidence_domain_id, producer_id, kid)` — the index locates a candidate key; the administrative registration is what grants authority. (The full design expresses this registration as a portable, administratively-signed **Producer-Key Authorization Statement** that binds the key by thumbprint for offline verification; the MVP relies on Lock's live registry and defers that artifact along with Evidence Packets — see §3.)
+**Keys are provisioned administratively, never implicitly.** Lock registers producer keys only through an **administrative API protected by a separate scope**, `https://jans.io/oauth/lock/trace.admin`, distinct from `trace.write`. Lock MUST NOT accept a public key merely because it accompanied the first record — that would make the signature self-authenticating. Possession of a signing key must not let the holder define its own producer identity or claim scope; those come only from the administrative registration. Authorization rests on that independently provisioned registration, **not** on the mere fact that a key was found at the lookup index `(evidence_domain_id, producer_id, kid)` — the index locates a candidate key; the administrative registration is what grants authority. (The full design expresses this registration as a portable, administratively-signed **Producer-Key Authorization Statement** that binds the key by thumbprint for offline verification; the MVP relies on Lock's live registry and defers that artifact along with Evidence Packets — see §3.)
 
 The assertion MUST carry `kid` inside the signed scope. Lock selects the key by `kid`; it must not guess the key from the record timestamp. Key rotation may leave old keys available for historical verification. Revoking a key later must not rewrite a verification result recorded before the revocation.
+
+The admin API (scope `trace.admin`; `producer_id` travels in request bodies and query parameters, never in path segments, because it may contain `/`):
+
+| Operation | Endpoint | Notes |
+|---|---|---|
+| Register a key | `POST /api/v1/audit/trace/admin/producer-keys` | Body as above. `authorized_event_kinds` is required, non-empty, and immutable. Keys are create-only: a duplicate `(producer_id, kid)` is `409 key_already_exists`; rotate by registering a new `kid`. |
+| List keys | `GET /api/v1/audit/trace/admin/producer-keys?producer_id=...` | The filter is optional. |
+| Revoke a key | `POST /api/v1/audit/trace/admin/producer-keys/revoke` | Body `{producer_id, kid}`. Idempotent. |
+| Register a chain | `POST /api/v1/audit/trace/admin/producer-chains` | Body `{producer_id, producer_instance_id, producer_chain_id}`; the chain gets `genesis_kind: pre_registered_genesis` (§8). |
+| List chains | `GET /api/v1/audit/trace/admin/producer-chains` | Each entry carries `registered_by` and `genesis_kind`. |
+
+A record whose `event_kind` is outside the key's `authorized_event_kinds` is rejected with the same error as an unknown key (`unknown_producer_key`, reason `event_kind_not_authorized`), before any signature work.
 
 ## 7. Minimal TRACE assertion
 
@@ -240,15 +257,16 @@ The following is the MVP wire shape. Fields shown as `null` may be omitted unles
 
 | Field | MVP rule |
 |---|---|
-| `producer` | Required. **Stable logical producer identifier** (e.g. `cedarling-fleet-1`), not a `name/semver` string. Must equal `producer_chain.producer_id` byte-for-byte. Software version/build/runtime, when carried, travel as separate signed metadata (e.g. `producer_version`), never folded into `producer_id`. |
+| `producer` | Required. **Stable logical producer identifier** (e.g. `cedarling-fleet-1`), not a `name/semver` string: 1 to 255 characters, a letter or digit followed by letters, digits, and `. _ : / -`, compared byte for byte and never normalized. Must equal `producer_chain.producer_id` byte-for-byte. Software version/build/runtime, when carried, travel as separate signed metadata, never folded into `producer_id`. |
+| `producer_version` | Optional top-level string of 1 to 255 characters. A build label: signed and stored unchanged, never interpreted by Lock. The record format is versioned by `trace.eat_profile`, not by this member. |
 | `kid` | Required and signed. Selects the registered verification key. |
 | `record_id` | Required and producer-generated UUID or ULID. |
 | `trace.eat_profile` | Required and fixed to the supported TRACE profile version. |
 | `trace.event_kind` | Required and limited to the MVP event catalog below. |
-| `trace.signed_at` | Required NumericDate. Producer time; not treated as receipt time. |
-| `trace.trace_execution_id` | Required for the MVP. |
-| `trace.execution_authority` | Required. Scopes the execution ID. Distinct from `subject.workload_id` (see below): the authority scopes the execution identifier, the workload is the subject participating in it. |
-| `trace.subject.workload_id` | **Event-specific.** Required for `AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED` (these records identify the workload requesting or exercising the capability); not required for event kinds where no workload is known or relevant. |
+| `trace.signed_at` | Required NumericDate. Producer time; not treated as receipt time. A value more than a configurable skew (default 300 s) ahead of Lock's clock is rejected; a past value never is (lateness only sets `late_flag`). |
+| `trace.trace_execution_id` | Required for the MVP; at most 255 characters. |
+| `trace.execution_authority` | Required; at most 255 characters. Scopes the execution ID. Distinct from `subject.workload_id` (see below): the authority scopes the execution identifier, the workload is the subject participating in it. |
+| `trace.subject.workload_id` | **Event-specific.** Required (non-empty, at most 255 characters) for `AUTHORIZATION_DECISION` and `CAPABILITY_INVOKED` (these records identify the workload requesting or exercising the capability); not required for event kinds where no workload is known or relevant. |
 | `trace.subject.workload_instance_id` | Optional. Some deployments cannot reliably identify a particular process, pod, or runtime instance. |
 | `trace.event` | Required; shape depends on `event_kind`. |
 | `producer_chain` | Required. Identifies the producer-local chain and position. |
@@ -298,7 +316,12 @@ The MVP recognizes only the three event kinds needed for the capability-evidence
 
 These requirements intentionally match the corresponding event-kind schemas in the full design. The MVP narrows the catalog; it does not define weaker versions of the retained event kinds. **Producers sign the capability *facts*, not the governance label.** An `AUTHORIZATION_DECISION` signs a singular `decision` (`{action, resource_type, outcome}`) and a `CAPABILITY_INVOKED` signs a singular `invocation` (`{action, resource_type, outcome}`) — the concrete Cedar action and resource *type* (never a resource id), one record per call. An atomic batch evaluation MAY instead carry `decisions[]`/`invocations[]`, each entry bearing its own `decision_id`/`invocation_id` and `outcome` with no record-level `outcome`. The governance label **`capability_id` is Lock-derived in the full design** (resolved from the signed `(action, resource_type)` plus `policy_store_id`/`policy_store_version` against a versioned mapping in the policy store, stored as `capability_resolution` outside the signed assertion — see `design.md`: Capability Resolution). The **MVP defers that resolution and the capability index** (see §13): the MVP records the signed facts so they are forward-compatible, but does not require Lock to resolve `capability_id` or to serve capability-keyed retrieval. `RUNTIME_EFFECT` carries neither a `decision`/`decisions[]` nor an `invocation`/`invocations[]`; its causal link to the invocation is expressed by `parent_record_ids`.
 
-Lock MUST validate the schema for the declared `event_kind` and reject fields that contradict that kind. Lock records evidence; it does not infer that an authorization caused an invocation merely because their timestamps are close. Producers express causal relationships with `parent_record_ids`.
+Lock MUST validate the schema for the declared `event_kind` and reject fields that contradict that kind. The fact rules Lock applies:
+
+- `action` and `resource_type` are non-empty strings of at most 512 characters; a `resource_id` inside a fact is rejected.
+- A decision `outcome` is `ALLOW` or `DENY`; an invocation `outcome` is `SUCCESS` or `FAILURE`. The vocabularies are distinct.
+- The plural form carries a unique `decision_id`/`invocation_id` (at most 256 characters) per entry. A decision or invocation record with both the singular and the plural member, or with a record-level `trace.event.outcome`, is rejected.
+- A signed `capability_ids` is a Lock-derived member: ignored and flagged with `reserved_member_flag` (§10), never used. Lock records evidence; it does not infer that an authorization caused an invocation merely because their timestamps are close. Producers express causal relationships with `parent_record_ids`.
 
 #### What each record establishes (and does not)
 
@@ -317,11 +340,11 @@ This mirrors the full design's per-record-kind claim boundaries, narrowed to the
 
 `tokens[]` is an array because one decision or action may use several tokens. Each entry MUST contain:
 
-- canonical `issuer` URI;
-- `token_type`; and
-- either `jti` or `fingerprint`.
+- canonical `issuer`: an `https` URI, an `http` URI whose host is `localhost`, or, for a credential whose issuer has no URI (such as a non-JWT token handled by a custom processor), the URN `urn:jans:cedarling:custom-issuer:<name>`;
+- `token_type` (the token's role; a producer-defined type such as a Cedar entity type is allowed); and
+- either `jti` or `fingerprint`. Cedarling and `jans-trace-core` derive `fingerprint` as `sha256:` plus lowercase hex SHA-256 of the token exactly as received; Lock also accepts an opaque base64url value of 16–128 characters.
 
-The external token identity is `(evidence_domain_id, issuer, jti)`, never bare `jti`. When no `jti` exists, Lock uses `(evidence_domain_id, issuer, fingerprint)`. Raw bearer tokens MUST NOT be stored.
+The external token identity is `(evidence_domain_id, issuer, jti)`, never bare `jti`. When no `jti` exists, Lock uses `(evidence_domain_id, issuer, fingerprint)`. Raw bearer tokens MUST NOT be stored: Lock rejects a token reference whose values look like a compact JWS or JWE.
 
 Token claims, decision-time validation details, revocation freshness, token lineage, and later Lock enrichment are deferred. Their omission must be reported as “not captured,” never as “valid.”
 
@@ -335,13 +358,22 @@ Each producer instance maintains one or more chains. Lock does not impose a glob
 - `prev_record_hash` is the prior position's `content_digest`.
 - The genesis record uses `sequence_number: 1` and the configured all-zero predecessor sentinel.
 
-**Genesis authentication.** The signing **key** is always administratively registered first (§6); genesis authentication is a separate question about the *chain*. For deployments needing stronger lineage assurance, a chain genesis is **pre-registered** with Lock (`pre_registered_genesis`). Otherwise an already-registered key MAY open a new chain simply by submitting its first signed record, which Lock anchors at first sight as `first_observed_genesis`. A first-observed chain establishes tamper-evident history from the moment Lock sees it, but cannot establish complete producer history before that point.
+**Genesis authentication.** The signing **key** is always administratively registered first (§6); genesis authentication is a separate question about the *chain*. For deployments needing stronger lineage assurance, a chain genesis is **pre-registered** with Lock (`pre_registered_genesis`). Otherwise, when Lock runs in `FIRST_OBSERVED` mode (below), an already-registered key MAY open a new chain simply by submitting its first signed record, which Lock anchors at first sight as `first_observed_genesis`. A first-observed chain establishes tamper-evident history from the moment Lock sees it, but cannot establish complete producer history before that point.
 
-**Restart does not automatically mean a new chain.** A producer that has **durably retained** its `producer_chain_id`, last `sequence_number`, and previous record hash SHOULD **continue its existing chain** across a restart. A new chain is necessary only when that state is unavailable, when a new independently-sequenced writer is created, or when the producer deliberately rotates to another chain. Where a new chain is unavoidable, its genesis SHOULD reference the previous chain head where known (the full design specifies the signed `chain_link`; the MVP records the reference and defers full link validation).
+Lock selects the genesis rule with one setting, `chainRegistrationMode`:
+
+| Mode | Behavior |
+|---|---|
+| `PRE_REGISTERED` (Lock default) | A chain exists only after an administrator registers it (§6). A record on an unregistered chain is rejected with `400 chain_not_registered`, at every sequence position. |
+| `FIRST_OBSERVED` | A genesis record (`sequence_number: 1` with the all-zero sentinel) on an unregistered chain registers the chain, after the key, event-kind, and signature checks succeed. Admin-registered chains keep working. |
+
+In both modes a **non-genesis record on an unregistered chain is rejected** with `400 chain_not_registered`: Lock never registers a chain from a later position. A producer that opens a new chain at every start (such as Cedarling in the MVP, `cedarling-trace-design-MVP.md` §4) therefore needs `FIRST_OBSERVED`, and must get its genesis record accepted before the rest of that chain. Each chain records how it came to exist in `genesis_kind` (`pre_registered_genesis` or `first_observed_genesis`).
+
+**Restart does not automatically mean a new chain.** A producer that has **durably retained** its `producer_chain_id`, last `sequence_number`, and previous record hash SHOULD **continue its existing chain** across a restart. A new chain is necessary only when that state is unavailable, when a new independently-sequenced writer is created, or when the producer deliberately rotates to another chain. Where a new chain is unavoidable, its genesis SHOULD reference the previous chain head where known (the full design specifies the signed `chain_link`; the MVP records the reference and defers full link validation). Lock accepts `producer_chain.chain_link` only on a genesis record (`400 invalid_genesis` with reason `chain_link_on_non_genesis` otherwise), checks only its shape, and keeps it unchanged.
 
 **Cedarling deployment patterns.** The MVP recognizes that the producer's longevity and key custody vary by deployment: **embedded/server Cedarling** — the host supplies the key and durable chain state; **sidecar Cedarling** — the sidecar owns the key and one or more chain writers; **ephemeral pod** — uses a fleet or workload-provisioned key and opens a `first_observed_genesis` chain for that pod/writer; **WASM Cedarling** — preferably returns the assertion to a trusted host for signing, since a browser-held key provides weaker producer assurance and is classified accordingly. The rule throughout: keys identify trusted producers, chains identify independently-sequenced record streams, and versions describe software — they are not the same identifier.
 
-Records may arrive out of order. A missing predecessor does not cause rejection: Lock accepts the record with `coverage_gap_flag: true` and clears that derived condition when the missing position arrives and links correctly. A present but nonmatching predecessor is a different case: Lock accepts the record with `chain_link_failure_flag: true`, a genuine chain-link break rather than a pending gap. Unlike a coverage gap, this flag is **not** self-clearing — the conflicting predecessor is already present, so later arrival cannot resolve it — and it remains visible as an integrity finding.
+Within a registered chain, records may arrive out of order. A missing predecessor does not cause rejection: Lock accepts the record with `coverage_gap_flag: true` and clears that derived condition when the missing position arrives and links correctly. A present but nonmatching predecessor is a different case: Lock accepts the record with `chain_link_failure_flag: true`, a genuine chain-link break rather than a pending gap. Unlike a coverage gap, this flag is **not** self-clearing — the conflicting predecessor is already present, so later arrival cannot resolve it — and it remains visible as an integrity finding.
 
 If independently valid records with different `record_id` values claim the same `(evidence_domain_id, producer_id, producer_instance_id, producer_chain_id, sequence_number)`, Lock stores and flags both records as equivocation. It never silently selects a winner. This differs from reuse of the same `record_id`, which is a content conflict and cannot create two records under one primary key.
 
@@ -355,7 +387,7 @@ None is a global event clock.
 
 ## 9. Lock receipt chain
 
-For every accepted record, Lock atomically assigns:
+For every accepted record, Lock assigns:
 
 - `receipt_sequence`: monotonically increasing within the evidence domain's Lock receipt chain;
 - `received_at`: Lock's receipt timestamp — an RFC 3339 UTC timestamp normalized to `Z` with **millisecond precision** (e.g. `2026-06-11T00:41:02.123Z`), matching the receipt-commitment profile (`jans-trace-core` §7.1). Because `received_at` is part of the receipt-hash input, a value stored or displayed without millisecond precision would not reproduce the receipt hash; the stored value and any example MUST carry milliseconds; and
@@ -364,6 +396,10 @@ For every accepted record, Lock atomically assigns:
 The receipt-entry hash MUST bind at least:
 
 `evidence_domain_id`, `receipt_sequence`, `received_at`, `producer_id`, `record_id`, `content_digest`, and `prev_receipt_hash`.
+
+The list is closed for the receipt profile `tag:jans.io,2026:lock-trace-receipt-v1`: the hash is `sha256:` plus lowercase hex SHA-256 of the JCS form of exactly these members and `receipt_profile`, nothing else.
+
+**Receipt entries are not written atomically with the record.** The storage layer offers per-entry compare-and-swap and unique inserts, but no multi-entry transaction. Lock therefore claims a receipt position as a `PENDING` entry, stores the record, and settles the entry as `COMMITTED`; a failed request settles it `VOID`, and a repair timer settles entries left `PENDING` by a stopped node. The entry state is not part of the receipt hash, so a `VOID` entry keeps the chain dense and verifiable: it is a position Lock allocated and abandoned, not a gap. A failed request leaves no stored record and no index entry, but may leave a `VOID` receipt entry. In one rare race (a worker that stalls past its deadline) a record is stored under a `VOID` entry; Lock keeps the record, fails the request, and its identity stays blocked until an operator acts.
 
 This chain makes local insertion, deletion, and rewriting detectable during verification. Without signed checkpoints or an independent external anchor, it does not prove integrity against a Lock operator able to rewrite the entire chain. The API and documentation must not overstate that guarantee.
 
@@ -392,10 +428,19 @@ Lock stores three clearly separated parts:
     "coverage_gap_flag": false,
     "chain_link_failure_flag": false,
     "equivocation_flag": false,
-    "late_flag": false
+    "late_flag": false,
+    "policy_mismatch_flag": false,
+    "reserved_member_flag": false,
+    "reserved_members": [],
+    "receipt_state": "COMMITTED"
   }
 }
 ```
+
+Lock also keeps the exact accepted request text as `assertion_raw` and returns it on retrieval next to the parsed `assertion`; when the two differ, `assertion_raw` decides. Two flags extend the MVP set:
+
+- `policy_mismatch_flag`: the record's `trace.policy` names a policy store that Lock serves, with a `bundle_hash` (SHA-256 of the archive bytes Lock serves) that no Lock node served at the time the record is judged, within a grace window; or a matching release whose known `policy_store_version` differs from the record's. Lock still accepts the record; a store Lock does not serve is never compared.
+- `reserved_member_flag`: the producer signed a member Lock derives itself (such as `evidence_domain_id`, `capability_ids`, or a flag). Lock ignores it, uses its own value, and lists the paths in `reserved_members`.
 
 `assertion` is byte-immutable after acceptance. Lock MUST NOT insert resolved claims, status, trust, corrections, or receipt data into it. Future assessments must be stored beside the assertion as new Lock-authored artifacts.
 
@@ -426,15 +471,43 @@ Success response:
   "record_id": "9f3e9e2a-6b0e-4b2c-9f6e-3a2f7b0c9d41",
   "content_digest": "sha256:...",
   "receipt_sequence": 108422,
+  "received_at": "2026-06-11T00:41:02.123Z",
   "idempotent_replay": false,
   "coverage_gap_flag": false,
   "chain_link_failure_flag": false,
   "equivocation_flag": false,
-  "late_flag": false
+  "late_flag": false,
+  "policy_mismatch_flag": false,
+  "reserved_member_flag": false,
+  "reserved_members": []
 }
 ```
 
-Return `202 Accepted` only after verification and atomic persistence succeed. Use `400` for malformed or invalid signed content, `401`/`403` for OAuth failures, `409` for reuse of the same record identity with different content, and `500` when durable storage cannot complete. A deployment may use `503` instead when it deliberately exposes a retryable service-unavailable condition, but the OpenAPI contract must choose one behavior consistently.
+Return `202 Accepted` only after verification and persistence succeed. Use `400` for malformed or invalid signed content, `401`/`403` for OAuth failures, `409` for reuse of the same record identity with different content, and `500` when durable storage cannot complete. Lock uses `500` (not `503`) for storage failures and for an unavailable crypto provider.
+
+**OAuth failures** follow RFC 6750: an expired, inactive, or invalid token is `401` with `WWW-Authenticate: Bearer error="invalid_token"`; a token without the required scope is `403` with `error="insufficient_scope"`. A producer can therefore renew its token on `401` and treat `403` as final.
+
+**Error body.** Every TRACE error uses `{"error": "<id>", "error_description": "<text>", "reason": "<detail>"}`. `reason` names the offending field or check (for example `missing:trace.policy`, `event_kind_not_authorized`, `signed_at_in_future`) and is present only when Lock's `errorReasonEnabled` is on (off by default). The ids:
+
+| Error id | HTTP | When |
+|---|---|---|
+| `invalid_request` | 400 | Malformed JSON, a limit exceeded, a bulk envelope problem, or TRACE disabled (`trace_disabled`). |
+| `invalid_assertion` | 400 | A schema violation; `reason` names the field. |
+| `unsupported_profile` | 400 | `trace.eat_profile` is not `tag:jans.io,2026:trace-v1`. |
+| `producer_mismatch` | 400 | `producer` differs from `producer_chain.producer_id`, or does not match the `producer` format (§7.1, reason `producer_format`). |
+| `unknown_producer_key` | 400 | No key for `(evidence_domain_id, producer, kid)`, or `event_kind` outside its `authorized_event_kinds`. |
+| `key_not_valid` | 400 | The key is outside its validity window or revoked. |
+| `invalid_signature` | 400 | Ed25519 verification failed, or the signature is not valid unpadded base64url. |
+| `chain_not_registered` | 400 | The record's chain is not registered (§8). |
+| `invalid_genesis` | 400 | The genesis position and `prev_record_hash` disagree, or `chain_link` on a non-genesis record. |
+| `client_not_bound` | 403 | The client resolves to no evidence domain. |
+| `producer_not_allowed` | 403 | The client may not submit for the signed producer. |
+| `record_not_found`, `execution_not_found` | 404 | Retrieval found nothing in the domain. |
+| `record_conflict` | 409 | Same record identity, different `content_digest`. |
+| `ambiguous_identifier` | 409 | An unscoped lookup matches several producers or authorities. |
+| `key_already_exists`, `chain_already_exists`, `invalid_key` | 409 / 409 / 400 | Admin API (§6). |
+| `storage_failure` | 500 | Persistence or receipt allocation failed (§9); `reason` names the case. |
+| `crypto_unavailable` | 500 | The configured crypto implementation is unavailable (§14); Lock fails closed. |
 
 ### 11.2 Submit a batch of records
 
@@ -448,22 +521,22 @@ Required scope:
 
 `https://jans.io/oauth/lock/trace.write`
 
-Bulk ingestion is **in the MVP** because a high-throughput producer such as Cedarling can make thousands of decisions per second, and one HTTP request per record (§11.1) does not scale to that. The batch amortizes transport and lets a producer reuse its existing buffered, periodic shipping channel. The batch body is an array of signed TRACE records, **one producer per batch** (every record shares the same signed `producer`/`producer_chain.producer_id`; a batch mixing producers is rejected). A configurable maximum batch size applies (see §14).
+Bulk ingestion is **in the MVP** because a high-throughput producer such as Cedarling can make thousands of decisions per second, and one HTTP request per record (§11.1) does not scale to that. The batch amortizes transport and lets a producer reuse its existing buffered, periodic shipping channel. The batch body is an array of signed TRACE records, **one producer per batch** (every record shares the same signed `producer`/`producer_chain.producer_id`; a batch mixing producers is rejected). A configurable maximum batch size applies: `maxBulkRecords` (default 100) and `maxBulkRequestBytes` (default 4 MiB, never above 16 MiB); each record is still bounded by the single-record limit (see §14).
 
-**Per-record, not all-or-nothing.** Lock verifies, correlates, persists, and applies the ingestion-integrity flags (coverage-gap, chain-link-failure, equivocation, late-arrival) to **each record independently**, exactly as for a single submission — a batch is N independent §11.1 ingestions sharing one request and one atomic-per-record write, not one transaction over the whole batch. A failure on one record (bad signature, unknown/unauthorized key, `409` identity conflict, storage failure) does **not** reject the other, independently-valid records. There is no cross-record coupling; each record is admitted and flagged on its own. (The MVP runs no settlement — settlement assessments and receipts are a later phase, see §3 and §16 — so there is no settlement pass, per-record or batch-level, to run here.)
+**Per-record, not all-or-nothing.** Lock verifies, correlates, persists, and applies the ingestion-integrity flags (coverage-gap, chain-link-failure, equivocation, late-arrival) to **each record independently**, exactly as for a single submission — a batch is N independent §11.1 ingestions sharing one request, each stored as in §9, not one transaction over the whole batch. A failure on one record (bad signature, unknown/unauthorized key, `409` identity conflict, storage failure) does **not** reject the other, independently-valid records. There is no cross-record coupling; each record is admitted and flagged on its own. (The MVP runs no settlement — settlement assessments and receipts are a later phase, see §3 and §16 — so there is no settlement pass, per-record or batch-level, to run here.)
 
 Success response is a per-record result array in submission order:
 
 ```json
 {
   "results": [
-    { "accepted": true,  "producer_id": "cedarling-fleet-1", "record_id": "9f3e9e2a-...", "content_digest": "sha256:...", "receipt_sequence": 108422, "idempotent_replay": false, "coverage_gap_flag": false, "chain_link_failure_flag": false, "equivocation_flag": false, "late_flag": false },
-    { "accepted": false, "record_id": "1b2c3d4e-...", "error": { "code": "SIGNATURE_INVALID", "message": "..." } }
+    { "index": 0, "accepted": true,  "producer_id": "cedarling-fleet-1", "record_id": "9f3e9e2a-...", "content_digest": "sha256:...", "receipt_sequence": 108422, "received_at": "2026-06-11T00:41:02.123Z", "idempotent_replay": false, "coverage_gap_flag": false, "chain_link_failure_flag": false, "equivocation_flag": false, "late_flag": false, "policy_mismatch_flag": false, "reserved_member_flag": false, "reserved_members": [] },
+    { "index": 1, "accepted": false, "producer_id": "cedarling-fleet-1", "record_id": "1b2c3d4e-...", "error": { "error": "invalid_signature", "error_description": "...", "reason": "signature_mismatch" } }
   ]
 }
 ```
 
-Return `207 Multi-Status` (or `200` with an all-accepted result array, per a consistently-chosen OpenAPI contract) when the batch was processed and each record carries its own result; `400` only when the **batch envelope** itself is malformed (not JSON, exceeds the size limit, or mixes producers), `401`/`403` for OAuth failures, and `500`/`503` only when Lock could not process the batch at all. Each accepted record's receipt is assigned exactly as in §11.1, and replay/`409`/gap/equivocation semantics are per-record and identical to the single-record path. Records within one batch MAY advance the producer chain across several `producer_chain_id` lanes (see §8), so batching never forces one serialized sequence allocator.
+Lock returns `207 Multi-Status` whenever the batch was processed, whatever the per-record results; `index` is the position in the submitted array, and a per-record `error` uses the §11.1 error body. For the batch as a whole, `400 invalid_request` is returned only when TRACE is disabled (`trace_disabled`, §11.7) or the **batch envelope** itself is malformed, with a `reason`: not JSON, not an array (`not_array`), empty (`empty_bulk_records`), too many records (`max_bulk_records_exceeded`), too large (`bulk_body_too_large`), or mixed producers (`bulk_mixed_producers`); `401`/`403` for OAuth failures, `403 client_not_bound` when the client resolves to no evidence domain, and `500` only when Lock could not process the batch at all. Each accepted record's receipt is assigned exactly as in §11.1, and replay/`409`/gap/equivocation semantics are per-record and identical to the single-record path. Records within one batch MAY advance the producer chain across several `producer_chain_id` lanes (see §8), so batching never forces one serialized sequence allocator.
 
 
 ### 11.3 Retrieve one record
@@ -488,22 +561,44 @@ The MVP response contains the execution identity and its directly associated rec
 
 `execution_authority` SHOULD be supplied. If omitted, Lock may return the execution only when the bare ID resolves uniquely within the authenticated evidence domain.
 
+A record response carries `assertion_raw` (the exact accepted text), `assertion` (the same text parsed), `content_digest`, `verification`, and `ingestion` (§10). An execution response carries `"ordering": "receipt_sequence"` and `"completeness": "not_assessed"`, and pages with `start` (default 0) and `count` (default 100, at most 1000).
+
+### 11.5 Search by policy store release
+
+```http
+GET /api/v1/audit/trace/records?policy_store_id=...&policy_store_version=...&bundle_hash=...&received_from=...&received_to=...
+```
+
+Required scope: `https://jans.io/oauth/lock/trace.readonly`. Returns, in receipt order, the records of the caller's domain whose `trace.policy` matches; at least one of `policy_store_id` or `bundle_hash` is required. It answers "which decisions were made with release X".
+
+### 11.6 gRPC transport
+
+The same operations are served over gRPC by `io.jans.lock.trace.TraceService` (`SubmitRecord`, `SubmitBulkRecords`, `GetRecord`, `SearchRecords`, `GetExecution`) and `io.jans.lock.trace.TraceAdminService` (the §6 admin operations). They run the same code as REST, with the same scopes, evidence domains, receipts, and error ids. Assertions travel as the exact signed bytes, never re-serialized. A REST status maps to the matching gRPC status (`400` → `INVALID_ARGUMENT`, `401` → `UNAUTHENTICATED`, `403` → `PERMISSION_DENIED`, `404` → `NOT_FOUND`, `409` → `ALREADY_EXISTS`, `500` → `INTERNAL`; `ambiguous_identifier` → `FAILED_PRECONDITION`), with the §11.1 error body as the status description.
+
+### 11.7 Discovery
+
+When TRACE is enabled, Lock's configuration document (`/.well-known/lock-server-configuration`) publishes `trace_endpoint`, `trace_bulk_endpoint`, `trace_record_endpoint`, and `trace_execution_endpoint`. When TRACE is disabled, they are absent and every TRACE endpoint returns `400 invalid_request` with reason `trace_disabled`.
+
 ## 12. Idempotency and errors
 
 | Condition | Required behavior |
 |---|---|
 | Same composite record identity and same `content_digest` | Return the original acceptance result with `idempotent_replay: true`; do not append a second receipt. |
 | Same composite record identity and different `content_digest` | Return `409`; never overwrite the first record. |
-| Unknown producer or `kid` | Reject or quarantine; do not index. |
+| Unknown producer or `kid` | Reject (`unknown_producer_key`); nothing is stored or indexed. The MVP has no quarantine store. |
 | `event_kind` outside the key's `authorized_event_kinds` | Reject; a key authorized for one event kind cannot sign another. |
-| Invalid signature | Reject or quarantine; do not index. |
+| Invalid signature | Reject (`invalid_signature`); nothing is stored or indexed. |
 | `producer` differs from `producer_chain.producer_id` | Reject. |
 | Missing required execution scope | Reject in the MVP. |
-| Missing predecessor | Accept and flag a coverage gap. |
+| Missing predecessor in a registered chain | Accept and flag a coverage gap. |
+| Non-genesis record on an unregistered chain | Reject (`chain_not_registered`, §8). |
+| Client not allowed to submit for the signed producer | Reject (`403 producer_not_allowed`). |
+| `signed_at` too far ahead of Lock's clock | Reject (`invalid_assertion`, reason `signed_at_in_future`). |
+| Signed member that Lock derives itself | Accept; ignore the member and set `reserved_member_flag`. |
 | Present predecessor with wrong digest | Accept and flag the chain-link failure; never report the chain as intact. |
 | Same chain position, different `record_id`, and valid signatures | Store and flag both records as equivocation; never select one silently. |
 | Record received substantially later than `signed_at` | Accept and set `late_flag: true` under a configurable lateness policy; lateness alone is not a rejection reason. |
-| Storage or receipt append failure | Fail the request with the storage-failure status chosen in §11.1 (`500`, or `503` if the deployment exposes a retryable condition); no partial record, receipt entry, or index entry may remain visible. |
+| Storage or receipt append failure | Fail the request with `500 storage_failure`; no record or index entry may remain visible, except in the rare race described in §9. An allocated receipt position is settled `VOID` and stays in the receipt chain (§9). |
 
 ## 13. Minimum storage keys and indexes
 
@@ -513,7 +608,8 @@ The implementation needs only these keys and indexes:
 - execution index: `(evidence_domain_id, execution_authority, trace_execution_id)`;
 - producer-chain position: `(evidence_domain_id, producer_id, producer_instance_id, producer_chain_id, sequence_number)`;
 - token index: `(evidence_domain_id, issuer, jti-or-fingerprint)`; and
-- receipt-chain position: `(evidence_domain_id, receipt_sequence)`.
+- receipt-chain position: `(evidence_domain_id, receipt_sequence)`; and
+- policy store release: `(evidence_domain_id, policy_store_id, policy_store_version, bundle_hash)` for §11.5.
 
 Capability resolution and the capability index (`(evidence_domain_id, capability_id)`), and session, workload, transaction, assessment, checkpoint, and graph-traversal indexes, may be added in later phases. The signed `(action, resource_type)` facts the MVP records make the capability index addable later without re-emitting records.
 
@@ -521,9 +617,9 @@ Capability resolution and the capability index (`(evidence_domain_id, capability
 
 - Enforce TLS and OAuth on every TRACE endpoint.
 - Derive the evidence domain before any key lookup or content-based routing.
-- Apply maximum request size, nesting depth, string length, and array length before expensive cryptographic processing.
+- Apply maximum request size, nesting depth, string length, array length, and object member count before expensive cryptographic processing. Lock defaults: 256 KiB per record, depth 32, strings of 8192 characters, 256 array elements, 256 object members.
 - Apply a maximum **batch size** (record count) and a maximum batch body size to `POST /api/v1/audit/trace/bulk` before cryptographic processing; a batch exceeding either is rejected with `400` at the envelope level, never partially processed past the limit.
-- Use constant-time cryptographic implementations and approved Ed25519 libraries.
+- Use constant-time cryptographic implementations and approved Ed25519 libraries. Lock has two interchangeable implementations, selected by `cryptoProvider`: `JAVA` (BouncyCastle, the default) and `NATIVE` (`jans-trace-core` through its `jans-trace-java` binding, `jans-trace-core-mvp-design.md` §9). Both produce the same `content_digest`, key thumbprint, and receipt hash. The selected one must load and pass its self-test; otherwise every submission fails with `500 crypto_unavailable`, with no fallback to the other.
 - Never log raw bearer tokens or sensitive token claims.
 - Preserve the original assertion and the exact verifying `kid` for historical verification.
 - Treat producer timestamps as claims. Use `received_at` for Lock receipt order.
@@ -542,11 +638,11 @@ The MVP is complete when all of the following tests pass:
 5. Two producers may use the same `record_id` without collision because `producer_id` scopes identity.
 6. Two issuers may use the same `jti` without collision because `issuer` scopes token identity.
 7. A record may reference multiple tokens and all references are indexed.
-8. A producer-chain gap is visible, and out-of-order arrival can resolve the gap without rewriting assertions.
+8. A producer-chain gap is visible, and out-of-order arrival within a registered chain can resolve the gap without rewriting assertions.
 9. Equivocation at one producer-chain position is visible and no conflicting record is silently preferred.
 10. Execution retrieval never crosses an evidence domain and never silently guesses among ambiguous authorities.
 11. The authorization decision and enforcement-point invocation can be retrieved under the same execution.
-12. A failed atomic write leaves neither a visible record, receipt entry, nor index entry.
+12. A failed write leaves neither a visible record nor an index entry (except the rare race in §9); a receipt position it allocated is settled `VOID` and the receipt chain still verifies.
 13. A record lookup never returns a matching identifier from another evidence domain.
 14. An unscoped record or execution lookup with several in-domain matches returns an ambiguity error rather than selecting one.
 15. A record signed by a key not authorized for its `producer_id`, or whose `event_kind` is outside the key's `authorized_event_kinds`, is rejected and never appears in normal retrieval — exactly as an unknown key is.
@@ -554,6 +650,8 @@ The MVP is complete when all of the following tests pass:
 17. A `POST /api/v1/audit/trace/bulk` batch with a mix of valid and invalid records accepts every valid record and rejects every invalid one on its own merits, each with its own per-record result and receipt; one record's failure never rejects an independently-valid record in the same batch, and a batch mixing producers is rejected at the envelope level.
 
 ## 16. Later phases
+
+The concrete items the Jans MVP implementation deferred, with the condition for returning to each, are listed in `trace-mvp-post-mvp.md`.
 
 Phase 2 can add signed settlement assessments, receipt checkpoints, richer retrieval, token claims captured at decision time, and operation-binding commitments (including proof-of-possession binding). Phase 3 can add completeness and assurance profiles, delegation and authorization-state analysis, lineage validation, external transparency, and Evidence Packets for offline verification.
 
