@@ -23,6 +23,7 @@ This repository is **design documentation only** — there is no implementation 
 | [phased-implementation-plan.md](phased-implementation-plan.md) | How the full design is delivered incrementally. Phase 1 = the MVP; later phases add settlement, completeness/context, and full cross-domain assurance. |
 | [govops-trace-profile.md](govops-trace-profile.md) | The **GovOps schema-change profile** — the record-schema delta the Lock Server deployment requires on top of the base TRACE v0.2 Trust Record (the nested `trace` envelope, the `event_kind` catalog, producer-chain and causal-edge fields, signed capability facts), and what is deliberately *not* a signed-schema change (Lock-derived fields). |
 | [jans-trace-core-mvp-design.md](jans-trace-core-mvp-design.md) | The reusable **`jans-trace-core`** Rust library for the deterministic cryptographic operations (JCS canonicalization, Ed25519 signing/verification, content-digest, receipt-chain hashing) shared by producers, Lock, and independent verifiers. |
+| [trace-mvp-post-mvp.md](trace-mvp-post-mvp.md) | What the Jans MVP implementation (Lock, Cedarling, `jans-trace-core`) deferred, why, and when to return to each item. |
 
 ## Producer integrations
 
@@ -51,6 +52,7 @@ Lock-Server-TRACE-MVP-Design.md    MVP profile (Phase 1)
 phased-implementation-plan.md      Phased delivery plan
 govops-trace-profile.md            GovOps schema-change profile (delta from TRACE v0.2)
 jans-trace-core-mvp-design.md      Shared Rust crypto library design
+trace-mvp-post-mvp.md              Post-MVP backlog from the implementation
 cedarling-trace-design*.md         Cedarling producer (full + MVP)
 auth-server-trace-design*.md       Auth Server producer (full + MVP)
 fido-trace-design*.md              FIDO Server producer (full + MVP)

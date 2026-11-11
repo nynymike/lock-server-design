@@ -21,7 +21,7 @@ The MVP must provide:
 3. Ed25519 signing and verification using the record's signed `kid`.
 4. Deterministic `content_digest` calculation over a complete signed assertion.
 5. Deterministic Lock receipt-entry hashing for a per-evidence-domain chain.
-6. APIs suitable for native Rust callers and a narrow Java/JNI binding for Lock Server.
+6. APIs suitable for native Rust callers and a narrow Java binding for Lock Server.
 7. Stable error codes that do not expose secrets or depend on Rust implementation details.
 8. Normative test vectors usable by Rust, Java, and third-party implementations.
 9. Fuzzing and property tests for parser, canonicalization, signature, and receipt-chain behavior.
@@ -62,7 +62,7 @@ Lock Server ingestion transaction
     │   ├── verify producer signature
     │   ├── compute content_digest
     │   └── compute receipt hash
-    └── atomically persist record, receipt, indexes, and chain head
+    └── persist record, receipt entry, and indexes (Lock MVP §9)
 
 Independent verifier
     └── jans-trace-core
@@ -79,46 +79,30 @@ Cedarling decides whether a capability is authorized and produces the resulting 
 
 ### 4.3 No network boundary in the ingestion path
 
-The core is an in-process library. A Rust sidecar or remote cryptographic service would introduce availability problems and a distributed transaction into Lock's atomic ingestion path. External anchoring, when added, may run asynchronously because it operates on already-persisted Lock checkpoints.
+The core is an in-process library. A Rust sidecar or remote cryptographic service would introduce availability problems and a distributed transaction into Lock's ingestion path. External anchoring, when added, may run asynchronously because it operates on already-persisted Lock checkpoints.
 
 ## 5. Workspace structure
 
-The initial Rust workspace contains:
+The crate lives in the `jans-cedarling` Cargo workspace of the Janssen monorepo, next to Cedarling, its first producer:
 
 ```text
-jans-trace/
-├── Cargo.toml
-├── crates/
-│   ├── jans-trace-core/
-│   │   ├── src/
-│   │   │   ├── canonical.rs
-│   │   │   ├── digest.rs
-│   │   │   ├── error.rs
-│   │   │   ├── json.rs
-│   │   │   ├── receipt.rs
-│   │   │   ├── signature.rs
-│   │   │   ├── types.rs
-│   │   │   └── lib.rs
-│   │   └── Cargo.toml
-│   ├── jans-trace-jni/
-│   │   ├── src/lib.rs
-│   │   └── Cargo.toml
-│   └── jans-trace-cli/
-│       ├── src/main.rs
-│       └── Cargo.toml
-├── test-vectors/
-│   ├── assertions/
-│   ├── receipts/
-│   └── manifest.json
-└── fuzz/
+jans-cedarling/
+├── Cargo.toml                    # workspace; shared dependency versions
+├── jans-trace-core/              # the library
+│   ├── src/                      # assertion, signature, key, receipt, inputs, json, self_test
+│   ├── tests/rfc8785/            # RFC 8785 reference vectors
+│   └── README.md                 # use cases, API, error codes (also the crate docs)
+└── bindings/
+    ├── jans_trace_uniffi/        # UniFFI export of the core (replaces jans-trace-jni)
+    └── jans-trace-java/          # Java facade and Maven module used by Lock
 ```
 
 Responsibilities:
 
-- **`jans-trace-core`** is the production Rust API. It contains no JNI, CLI, filesystem, database, or network code.
-- **`jans-trace-jni`** exposes the small set of stateless operations Lock requires.
-- **`jans-trace-cli`** is a development and conformance utility. It is not part of Lock's runtime architecture.
-- **`test-vectors`** is normative interoperability data shared with Java and external implementations.
+- **`jans-trace-core`** is the production Rust API. It contains no FFI, CLI, filesystem, database, or network code.
+- **`jans_trace_uniffi`** exports the core to the JVM through UniFFI (generated bindings, panics caught at the boundary), so no hand-written JNI or `unsafe` code exists.
+- **`jans-trace-java`** is the Java API Lock uses (§9).
+- The conformance CLI, the normative **`test-vectors/`**, and **`fuzz/`** are not built yet (§16, `trace-mvp-post-mvp.md` §5.1).
 
 Future anchoring code should be a separate Lock-owned crate or module, not added to `jans-trace-core` unless it is a protocol-neutral verification primitive.
 
@@ -204,7 +188,7 @@ Consequences:
 
 ### 6.6 Raw input preservation
 
-The library accepts raw JSON bytes but returns computed values; it does not retain the bytes. Lock remains responsible for preserving the exact received serialization when required for future `as-transmitted` external anchoring. JCS bytes cannot reconstruct the original whitespace or member ordering.
+The library takes JSON text. A `SignedAssertion` keeps the exact text it was parsed from (`as_str`) and offers no way to serialize the record again, but storing it is not the library's job: Lock remains responsible for preserving the exact received serialization when required for future `as-transmitted` external anchoring. JCS bytes cannot reconstruct the original whitespace or member ordering.
 
 ## 7. Receipt-chain profile
 
@@ -251,139 +235,66 @@ prev_receipt_hash = sha256:00000000000000000000000000000000000000000000000000000
 
 The genesis sentinel is a protocol constant, not the SHA-256 hash of an empty byte string.
 
-### 7.4 Atomicity remains in Lock
+### 7.4 Receipt allocation remains in Lock
 
 `jans-trace-core` computes a hash from inputs supplied by Lock. It does not allocate the next sequence or determine the chain head.
 
-Lock must perform these steps in one database transaction:
-
-1. Lock the evidence-domain chain-head row.
-2. Read the current sequence and receipt hash.
-3. Assign the next sequence and `received_at`.
-4. Call `jans-trace-core` to compute the next receipt hash.
-5. Insert the immutable assertion, envelope, receipt entry, and indexes.
-6. Update the chain-head row.
-7. Commit.
-
-On failure, none of these writes may become visible. Retrying the same record must return its original receipt and must not append a new receipt.
+The original design had Lock lock the chain-head row, assign the sequence, insert the record and its receipt entry, and update the head in one database transaction. Lock's storage has no multi-entry transaction, so Lock claims a receipt position as a `PENDING` entry, stores the record, and settles the entry `COMMITTED`, or `VOID` when the request fails (`Lock-Server-TRACE-MVP-Design.md` §9). Retrying the same record returns its original receipt and does not append a new one.
 
 ## 8. Rust API
 
-The public API should operate on byte slices and small explicit context structures. It must not expose `serde_json::Value` as the stable external API because doing so would couple callers to implementation-specific parsing behavior.
+The public API does not expose `serde_json::Value`. It takes JSON as text (`&str`, the exact bytes received as UTF-8) and encodes each processing state as a type, so a record is parsed once and an operation cannot be applied in the wrong state:
 
-Illustrative API:
+| Module | Items |
+|---|---|
+| `assertion` | `UnsignedAssertion::parse(text, &Limits)` → `sign(&dyn TraceSigner)` → `SignedAssertion`; `SignedAssertion::parse(text, &Limits)` → `verify(&VerificationContext)` → `VerifiedAssertion`; `as_str`, `signing_input`, `content_digest`, `identity` (`producer`, `kid`, `record_id`, read strictly before verification); `parse_batch` (split a bulk body into per-record results, keeping each record's exact text) and `batch_body` (join signed records without re-serialization) |
+| `signature` | `TraceSigner`, `Ed25519Signer` (`from_pkcs8_pem`, `from_secret_bytes`, `public_key`), `SignatureValue` |
+| `key` | `PublicKey` (`from_jwk` for an OKP/Ed25519 JWK, `from_bytes`, `thumbprint` = RFC 7638 `sha256:` + hex) |
+| `receipt` | `ReceivedAt`, `ReceiptPosition`, `ReceiptCommitment` (`for_assertion`, `from_stored`, `receipt_hash`, `verify_link`), `StoredReceipt`, `ChainHead`, profile constants |
+| `inputs` | `compute_bundle_hash(archive bytes)`, `token_fingerprint(token text)`, so every producer derives these values the same way |
+| `json` | `canonicalize_json` |
+| `self_test` | `self_test()`: known-answer tests for start-up |
 
-```rust
-pub struct VerificationContext<'a> {
-    pub expected_producer: &'a str,
-    pub expected_kid: &'a str,
-    pub public_key: &'a [u8; 32],
-}
-
-pub struct VerifiedAssertion {
-    pub producer: String,
-    pub kid: String,
-    pub record_id: String,
-    pub signature_input_sha256: Digest,
-    pub content_digest: Digest,
-}
-
-pub struct ReceiptCommitment<'a> {
-    pub receipt_profile: &'a str,
-    pub evidence_domain_id: &'a str,
-    pub receipt_sequence: u64,
-    pub received_at: &'a str,
-    pub producer_id: &'a str,
-    pub record_id: &'a str,
-    pub content_digest: &'a Digest,
-    pub prev_receipt_hash: &'a Digest,
-}
-
-pub fn canonicalize_json(input: &[u8]) -> Result<Vec<u8>, TraceError>;
-
-pub fn assertion_signing_input(
-    unsigned_or_signed_assertion: &[u8],
-) -> Result<Vec<u8>, TraceError>;
-
-pub fn sign_assertion(
-    unsigned_assertion: &[u8],
-    signer: &dyn TraceSigner,
-) -> Result<SignatureValue, TraceError>;
-
-pub fn verify_assertion(
-    signed_assertion: &[u8],
-    context: &VerificationContext<'_>,
-) -> Result<VerifiedAssertion, TraceError>;
-
-pub fn compute_content_digest(
-    signed_assertion: &[u8],
-) -> Result<Digest, TraceError>;
-
-pub fn compute_receipt_hash(
-    receipt: &ReceiptCommitment<'_>,
-) -> Result<Digest, TraceError>;
-
-pub fn verify_receipt_link(
-    previous_receipt_hash: &Digest,
-    current: &ReceiptCommitment<'_>,
-) -> Result<Digest, TraceError>;
-```
+There are no free functions such as `sign_assertion` or `verify_assertion`. Each operation has its own error type holding only the errors it can return, each with a stable `code()` (§10). The crate README documents the API with its use cases.
 
 ### 8.1 Signing behavior
 
-`sign_assertion` requires an object without a `signature` member. It returns the signature value; it does not mutate caller JSON. The producer inserts that value as the top-level `signature` and may then call `compute_content_digest` on the complete assertion.
+`UnsignedAssertion::parse` rejects an object that already has a `signature` member, and checks that the signed record will fit the size limits, so a producer catches a record Lock would refuse for size before signing it. `sign` returns the complete signed record as JCS text: the producer never inserts the signature by hand and its own JSON is never mutated. `SignedAssertion::content_digest` gives the value for the next record's `prev_record_hash`.
 
-`assertion_signing_input` may accept a signed assertion for verification tooling, but it removes exactly one top-level `signature` member after strict duplicate-key validation.
+`SignedAssertion::signing_input` removes exactly one top-level `signature` member after strict duplicate-key validation, for verification tooling.
 
 ### 8.2 Signer abstraction
 
-Private keys should be hidden behind a trait:
-
-```rust
-pub trait TraceSigner: Send + Sync {
-    fn kid(&self) -> &str;
-    fn sign(&self, message: &[u8]) -> Result<[u8; 64], TraceError>;
-}
-```
-
-The core crate may provide an in-memory Ed25519 signer for tests and simple deployments. HSM and KMS adapters belong outside the core and implement the trait. Secret-key buffers must use zeroization where the selected cryptographic backend permits it.
+Private keys are hidden behind the `TraceSigner` trait: `kid()` and `sign(message)`, which returns the 64-byte Ed25519 signature. The core provides `Ed25519Signer`, an in-memory signer whose secret is zeroized on drop. HSM and KMS adapters implement the trait outside the core.
 
 ### 8.3 Thread safety
 
 All verification, digest, and receipt operations are stateless and safe for concurrent use. The core must contain no global mutable chain state, key cache, sequence counter, clock, or random-number generator used by verification.
 
-## 9. Java/JNI API
+## 9. Java API
 
-Lock requires only stateless JNI calls. The Java-facing surface should use byte arrays and JSON result objects rather than exposing Rust object lifetimes.
+The binding is UniFFI-generated (no hand-written JNI) behind a Java facade: package `io.jans.trace` in the `jans-trace-java` Maven module, for server-side Java 11. It mirrors the Rust state types as immutable objects:
 
-Suggested Java interface:
+| Classes | Items |
+|---|---|
+| `JsonBody`, `Limits` | JSON input as a string, read as UTF-8 unchanged; limits with the core defaults (`with…` to change one) |
+| `SignedAssertion` → `VerifiedAssertion` | `parse`, `verify(VerificationContext)`, `text`, `signingInput`, `contentDigest`, `identity` (`AssertionIdentity`) |
+| `UnsignedAssertion`, `Ed25519Signer` | `parse`, `sign` with an in-memory Ed25519 key (`fromPkcs8Pem`, `fromSecretBytes`) |
+| `Batch`, `BatchRecord` | `parse` splits a bulk body inside the core, keeping each record's exact text; `body` joins signed records (Lock splits bulk bodies itself and does not use `Batch`) |
+| `ReceiptCommitment`, `StoredReceipt`, `ReceiptPosition`, `ReceivedAt`, `ChainHead`, `Digest` | `forAssertion`, `fromStored`, `receiptHash`, `verifyLink`; `ChainHead.empty`/`resume`/`append` |
+| `PublicKey`, `Inputs`, `Json`, `Profiles` | `fromJwk`, `fromBytes`, `thumbprint`; `computeBundleHash`, `tokenFingerprint`; `canonicalize`; profile constants |
+| `SelfTest` | `run()`: the known-answer tests, at start-up |
 
-```java
-public final class JansTraceCore {
-    public static VerificationResult verifyAssertion(
-        byte[] assertion,
-        String expectedProducer,
-        String expectedKid,
-        byte[] ed25519PublicKey);
+Binding rules as implemented:
 
-    public static String computeContentDigest(byte[] assertion);
+- Rust panics are caught at the UniFFI boundary and never cross into the JVM.
+- Each operation throws its own checked exception, all under `TraceException`; `code()` returns the core's stable error code (§10).
+- Inputs are checked against `Limits` inside the core.
+- The state objects hold native resources between calls (the original rule was "not retained between calls"), so a record's state is visible in its Java type and the record is parsed once.
+- The module is published to the Janssen GitHub Packages Maven repository. The published jar carries the native library for linux x86-64 (glibc) only, since the binding exists for Lock; a jar built from source carries the library of its build platform (x86-64 or aarch64).
+- Lock uses the binding as its `NATIVE` crypto provider, which fails closed if the library does not load or `SelfTest.run()` fails (`Lock-Server-TRACE-MVP-Design.md` §14). Lock's default provider is its own Java implementation (BouncyCastle); the normative vectors are meant to keep the two identical.
 
-    public static String computeReceiptHash(ReceiptCommitment receipt);
-
-    public static byte[] canonicalizeJson(byte[] input);
-}
-```
-
-JNI requirements:
-
-- No Rust panic may cross the JNI boundary; all entry points use panic containment.
-- Java receives stable error codes plus safe diagnostic text.
-- The wrapper places explicit maximum sizes on byte-array inputs before allocation.
-- Native resources are not retained between calls.
-- Platform artifacts are published for every supported Lock runtime and verified during startup.
-- Lock fails closed for TRACE ingestion if the native library cannot load or its self-test fails.
-
-If native packaging proves unacceptable for an initial Lock deployment, the normative test vectors permit a Java implementation to reproduce the profile. A remote cryptographic sidecar is not the fallback for the atomic ingestion path.
+A remote cryptographic sidecar is not the fallback for Lock's ingestion path.
 
 ## 10. Error model
 
@@ -407,9 +318,14 @@ Errors have a stable machine-readable code and a non-sensitive description. Sugg
 | `RECEIPT_LINK_MISMATCH` | The current receipt does not name the expected predecessor hash. |
 | `SIZE_LIMIT_EXCEEDED` | Input exceeds the caller-configured limit. |
 | `SIGNER_FAILURE` | The configured signer could not create a signature. |
-| `INTERNAL_ERROR` | Unexpected implementation failure; no secret details returned. |
+| `INVALID_PRIVATE_KEY` | *(added)* Not an unencrypted PKCS#8 PEM Ed25519 key, or a raw secret that is not 32 bytes. |
+| `SELF_TEST_FAILED` | *(added)* A known-answer self-test differed. |
+| `INVALID_BATCH` | *(added)* A bulk body is valid JSON but not an array. |
+| `INTERNAL_ERROR` | Unexpected implementation failure; no secret details returned. *(Not used: every error has a specific code, and the binding catches panics at the boundary.)* |
 
 Errors must never include private-key bytes, raw tokens, full confidential assertions, or native backtraces in production responses.
+
+Lock's HTTP API does not return these codes: it maps failures to its own error ids (`Lock-Server-TRACE-MVP-Design.md` §11.1, e.g. `SIGNATURE_INVALID` → `invalid_signature`).
 
 ## 11. Input limits
 
@@ -423,6 +339,10 @@ The library accepts limits from the embedding application rather than defining d
 - maximum canonicalized output bytes.
 
 Limits are applied before or during parsing so an attacker cannot force an unbounded allocation before rejection. Lock's API limit must be equal to or smaller than the corresponding library limit.
+
+Implemented defaults (`Limits::default()`, generous on purpose; Lock's own defaults are stricter): 256 KiB per assertion, depth 32, 1024 members per object, 1024 elements per array, 64 KiB per string, 512 KiB canonical output, and for bulk bodies 8 MiB and 500 records.
+
+Strict JSON as implemented: duplicate members are rejected at any depth (`DUPLICATE_MEMBER`); a byte-order mark or trailing data is `INVALID_JSON`; every number outside ±(2^53−1), however written (`9007199254740993.0`, `1e30`), is rejected (`NON_CANONICALIZABLE_JSON`), because JCS serializes every number as an IEEE-754 double.
 
 ## 12. Dependencies and implementation rules
 
@@ -438,14 +358,16 @@ Required properties include:
 
 Rules:
 
-- `jans-trace-core` should forbid `unsafe` code.
-- Any unavoidable `unsafe` code is isolated in `jans-trace-jni`, documented, and reviewed.
+- `jans-trace-core` forbids `unsafe` code; the UniFFI binding needs none of its own.
+- Selected dependencies: `ed25519-dalek` 3 (pure Rust, `verify_strict`, zeroized secrets; weak and small-order public keys are rejected), `serde_json_canonicalizer` 0.4 (passes the RFC 8785 reference vectors), `sha2` 0.11, `base64` 0.23.
 - Default builds perform no network or filesystem access.
 - Dependency features are pinned narrowly to avoid unused parsers or algorithm suites.
-- Builds produce an SBOM and run license and vulnerability checks.
+- Builds produce an SBOM and run license and vulnerability checks. (`cargo-deny` runs in CI; an SBOM is not produced yet.)
 - The project must not claim FIPS compliance merely because it uses standard algorithms; that requires a separately validated cryptographic module and deployment profile.
 
 ## 13. Test strategy
+
+> **Status:** the RFC 8785 reference vectors and the Java binding's known-answer tests run in CI. The normative TRACE vectors (§13.1), property tests (§13.2), fuzz targets (§13.3), and cross-language CI (§13.4) are not built yet; see `trace-mvp-post-mvp.md`.
 
 ### 13.1 Normative vectors
 
@@ -506,7 +428,7 @@ Fuzz targets cover:
 - signature decoding;
 - content-digest calculation;
 - receipt parsing and hashing; and
-- every JNI entry point.
+- every binding entry point.
 
 The acceptance criterion is no panic, memory-safety violation, unbounded allocation, or inconsistent result for equivalent inputs.
 
@@ -515,7 +437,7 @@ The acceptance criterion is no panic, memory-safety violation, unbounded allocat
 CI runs the same vectors through:
 
 1. the native Rust API;
-2. the Java/JNI API used by Lock; and
+2. the Java API used by Lock; and
 3. any independent Java implementation retained as a packaging fallback.
 
 All implementations must produce byte-identical canonical values, signatures, digests, and receipt hashes.
@@ -543,6 +465,7 @@ The Rust crate follows semantic versioning. Protocol outputs are controlled sepa
 - Any change to signature scope, canonicalization, digest encoding, receipt fields, timestamp normalization, or genesis rules requires a new protocol profile.
 - Readers must reject unknown receipt profiles unless explicitly configured to support them.
 - Test vectors are versioned with the protocol profile and remain available after crate upgrades.
+- The crate is published on crates.io, because the published Cedarling crate depends on it; the crate version (released with the same version as Cedarling; the repository holds `0.0.0`) is independent of the protocol profiles.
 
 The MVP uses:
 
@@ -575,20 +498,24 @@ The assertion profile `tag:jans.io,2026:trace-v1` is a **distinct Jans/Lock prof
 
 ### Phase 3: Bindings and tooling
 
-- Java/JNI wrapper.
+- Java binding.
 - Native artifact packaging and startup self-test.
 - Conformance CLI.
 - Cross-language CI.
 - Fuzzing gates and performance benchmarks.
 
+Status: Phase 1 and Phase 2 are implemented except the normative vectors and receipt-chain property tests; Lock's transaction integration is Lock's own (`Lock-Server-TRACE-MVP-Design.md` §9). Of Phase 3, the binding (UniFFI instead of JNI), Maven packaging (linux x86-64), and the start-up self-test are done; the conformance CLI, cross-language CI, and fuzzing gates are not.
+
 All three phases are part of the TRACE MVP delivery. The order permits Cedarling record production and standalone verification to stabilize before Lock adopts the native binding.
 
 ## 17. MVP acceptance criteria
 
-The library is ready for MVP use when:
+The library is ready for MVP use when the list below holds. Status: criterion 2 (normative vectors through Rust and Java) and criterion 13 (fuzz targets) are not met yet; criterion 12 is Lock's, and Lock's storage writes the record and its receipt entry as separate steps (`Lock-Server-TRACE-MVP-Design.md` §9).
+
+The criteria:
 
 1. All RFC 8785 and selected RFC 8032 vectors pass.
-2. All TRACE normative vectors pass identically through Rust and Java/JNI.
+2. All TRACE normative vectors pass identically through Rust and Java.
 3. A Cedarling-produced assertion verifies in Lock without reserialization requirements.
 4. Formatting-only changes yield the same signature input and `content_digest`.
 5. Any signed semantic change invalidates the signature.

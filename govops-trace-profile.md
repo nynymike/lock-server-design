@@ -409,7 +409,7 @@ The base schema is flat, model-centric, and has no event kind, execution correla
 
 ### B. GovOps `AUTHORIZATION_DECISION` (the profile applied)
 
-The same decision as a GovOps record: claims nested under `trace`, an `event_kind` discriminator, the signed capability **facts** in `decisions[]` (no `capability_id`), execution correlation, the producer-chain envelope, and a typed causal edge to the identity provider's token-issuance record. The signing key is referenced by `kid` and resolved out-of-band — there is no `cnf` in the body.
+The same decision as a GovOps record: claims nested under `trace`, an `event_kind` discriminator, the signed capability **facts** in the singular `decision` (no `capability_id`), execution correlation, the producer-chain envelope, and a typed causal edge to the identity provider's token-issuance record. The signing key is referenced by `kid` and resolved out-of-band — there is no `cnf` in the body.
 
 ```json
 {
